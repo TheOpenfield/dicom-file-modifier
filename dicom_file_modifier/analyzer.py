@@ -22,14 +22,11 @@ Benötigte Packages:
   pip install pydicom numpy scipy shapely matplotlib
 """
 
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Dict, List, Optional
+from __future__ import annotations
 
-# Für Standalone-Ausführung
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import argparse
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pydicom
@@ -50,7 +47,7 @@ def load_rtstruct(filepath: str) -> pydicom.Dataset:
     return ds
 
 
-def get_structure_names(ds: pydicom.Dataset) -> Dict[int, str]:
+def get_structure_names(ds: pydicom.Dataset) -> dict[int, str]:
     """Gibt ein Dictionary {ROI-Nummer: Name} zurück."""
     return {
         roi.ROINumber: roi.ROIName
@@ -58,7 +55,7 @@ def get_structure_names(ds: pydicom.Dataset) -> Dict[int, str]:
     }
 
 
-def get_structure_type(ds: pydicom.Dataset) -> Dict[int, str]:
+def get_structure_type(ds: pydicom.Dataset) -> dict[int, str]:
     """Gibt ein Dictionary {ROI-Nummer: RT ROI Interpreted Type} zurück."""
     type_map = {}
     if hasattr(ds, "RTROIObservationsSequence"):
@@ -73,7 +70,7 @@ def get_structure_type(ds: pydicom.Dataset) -> Dict[int, str]:
 # 2. Konturen extrahieren
 # ---------------------------------------------------------------------------
 
-def extract_contours(ds: pydicom.Dataset, roi_number: int) -> List[np.ndarray]:
+def extract_contours(ds: pydicom.Dataset, roi_number: int) -> list[np.ndarray]:
     """
     Extrahiert die Konturen einer Struktur als Liste von Nx3 Arrays.
     Jedes Array enthält die (x, y, z) Koordinaten einer Kontur-Schicht.
@@ -90,7 +87,7 @@ def extract_contours(ds: pydicom.Dataset, roi_number: int) -> List[np.ndarray]:
     return contours
 
 
-def contours_to_points(contours: List[np.ndarray]) -> np.ndarray:
+def contours_to_points(contours: list[np.ndarray]) -> np.ndarray:
     """Fasst alle Konturpunkte zu einem einzigen Nx3 Array zusammen."""
     if not contours:
         return np.empty((0, 3))
@@ -112,7 +109,7 @@ def polygon_area(pts_2d: np.ndarray) -> float:
         return 0.0
 
 
-def compute_volume(contours: List[np.ndarray]) -> float:
+def compute_volume(contours: list[np.ndarray]) -> float:
     """
     Berechnet das Volumen in cm³.
     Summiert Konturflächen × Schichtabstand.
@@ -144,7 +141,7 @@ def compute_volume(contours: List[np.ndarray]) -> float:
 # 4. Schwerpunkt
 # ---------------------------------------------------------------------------
 
-def compute_centroid(contours: List[np.ndarray]) -> np.ndarray:
+def compute_centroid(contours: list[np.ndarray]) -> np.ndarray:
     """
     Berechnet den flächengewichteten Schwerpunkt (x, y, z) in mm.
     Jede Schicht wird mit ihrer Konturfläche gewichtet.
@@ -173,7 +170,7 @@ def compute_centroid(contours: List[np.ndarray]) -> np.ndarray:
 # 5. Formanalyse
 # ---------------------------------------------------------------------------
 
-def compute_shape_metrics(contours: List[np.ndarray], volume_cm3: float) -> Dict:
+def compute_shape_metrics(contours: list[np.ndarray], volume_cm3: float) -> dict:
     """
     Berechnet Formmetriken:
     - Sphärizität: Verhältnis zur Kugel gleichen Volumens (1.0 = perfekte Kugel)
@@ -305,10 +302,9 @@ def analyze_structure(ds: pydicom.Dataset, roi_number: int,
 
 
 def run_analysis(filepath: str,
-                 target_names: Optional[List[str]] = None,
-                 oar_names: Optional[List[str]] = None,
-                 list_only: bool = False,
-                 output_path: Optional[str] = None) -> Dict:
+                 target_names: Optional[list[str]] = None,
+                 oar_names: Optional[list[str]] = None,
+                 list_only: bool = False) -> dict:
     """
     Hauptfunktion: Lädt RTSTRUCT, analysiert Strukturen, berechnet Abstände.
 
@@ -320,7 +316,6 @@ def run_analysis(filepath: str,
     oar_names : Liste der Risikoorgan-Namen
                 Wenn None, werden alle als "OAR" typisierten verwendet.
     list_only : Nur Strukturnamen auflisten
-    output_path : Pfad zum Output-Ordner, um Ergebnisse zu speichern
 
     Returns
     -------
@@ -435,35 +430,13 @@ def run_analysis(filepath: str,
                 print(f"{name_a:<20} {name_b:<20} {d_min:<12.2f} "
                       f"{d_haus:<16.2f} {d_cent:<14.2f}")
 
-    # Speichere Ergebnisse als JSON, wenn output_path angegeben
-    if output_path:
-        output_dir = Path(output_path)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        filename = Path(filepath).stem + "_analysis.json"
-        output_file = output_dir / filename
-
-        # Entferne große Daten für JSON
-        clean_results = {
-            "targets": {},
-            "oars": {},
-            "distances": results["distances"]
-        }
-        for key, structures in [("targets", results["targets"]), ("oars", results["oars"])]:
-            for name, struct in structures.items():
-                clean_struct = {k: v for k, v in struct.items() if k not in ["contours", "all_points"]}
-                clean_results[key][name] = clean_struct
-
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(clean_results, f, indent=2, ensure_ascii=False)
-        print(f"\nErgebnisse gespeichert in: {output_file}")
-
     return results
 
 
 def _print_structure(r: dict):
     """Gibt die Analyseergebnisse einer Struktur formatiert aus."""
     s = r["shape"]
-    print(f"\n  - {r['name']} (ROI #{r['roi_number']})")
+    print(f"\n  > {r['name']} (ROI #{r['roi_number']})")
     print(f"    Konturen: {r['num_contours']} Schichten, "
           f"{r['num_points']} Punkte")
     print(f"    Volumen:        {r['volume_cm3']:.3f} cm³")
@@ -500,8 +473,6 @@ Beispiele:
                         help="Komma-getrennte Zielgebiet-Namen (z.B. PTV,CTV)")
     parser.add_argument("--oars", type=str, default=None,
                         help="Komma-getrennte Risikoorgan-Namen")
-    parser.add_argument("--output", type=str, default="output",
-                        help="Ausgabeordner für Ergebnisse (Standard: output)")
 
     args = parser.parse_args()
 
@@ -513,7 +484,6 @@ Beispiele:
         target_names=target_list,
         oar_names=oar_list,
         list_only=args.list,
-        output_path=args.output,
     )
 
     print(f"\n{'=' * 60}")

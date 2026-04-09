@@ -1,193 +1,403 @@
-# DICOM File Visualizer
-# Visualisiert die Analyseergebnisse aus der JSON-Datei
+#!/usr/bin/env python3
+"""
+RTSTRUCT Visualizer
+===================
+Erzeugt aussagekraeftige Plots aus RTSTRUCT-Analyseergebnissen.
 
-import json
-import matplotlib.pyplot as plt
-import numpy as np
+Plots:
+  1. Volumen-Balkendiagramm  – alle Strukturen, farbcodiert nach Typ (Target/OAR)
+  2. Formmetriken-Vergleich  – Sphaerizitaet, Kompaktheit, Elongation nebeneinander
+  3. Abstands-Uebersicht     – Min/Hausdorff/Zentroid pro Strukturpaar als Balken
+  4. Schwerpunkt-3D-Karte    – raeumliche Positionen aller Strukturzentren im Patientenraum
+  5. statistics.txt          – Zahlenzusammenfassung aller Metriken
+
+Verwendung:
+  python -m dicom_file_modifier.visualizer <rtstruct.dcm> [Optionen]
+
+Beispiele:
+  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm --output output/
+  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm \\
+      --targets PTV,CTV --oars Parotis,Blase --output output/
+"""
+
+import argparse
 from pathlib import Path
 
-def load_analysis_results(json_path):
-    """Lädt die Analyseergebnisse aus der JSON-Datei."""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+import matplotlib
+matplotlib.use("Agg")          # kein interaktives Fenster notwenig
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
 
-def plot_volume_histogram(data, output_dir):
-    """Erstellt Histogramme der Volumen für targets und oars."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+from dicom_file_modifier.analyzer import run_analysis
 
-    # Targets
-    target_volumes = [struct['volume_cm3'] for struct in data['targets'].values()]
-    ax1.hist(target_volumes, bins=10, alpha=0.7, color='blue', edgecolor='black')
-    ax1.set_title('Volumen-Verteilung der Zielgebiete (Targets)')
-    ax1.set_xlabel('Volumen (cm³)')
-    ax1.set_ylabel('Anzahl')
-    ax1.grid(True, alpha=0.3)
 
-    # OARs
-    oar_volumes = [struct['volume_cm3'] for struct in data['oars'].values()]
-    ax2.hist(oar_volumes, bins=10, alpha=0.7, color='red', edgecolor='black')
-    ax2.set_title('Volumen-Verteilung der Risikoorgane (OARs)')
-    ax2.set_xlabel('Volumen (cm³)')
-    ax2.set_ylabel('Anzahl')
-    ax2.grid(True, alpha=0.3)
+# Farben
+COLOR_TARGET = "#2471A3"   # Blau fuer Zielgebiete
+COLOR_OAR    = "#CB4335"   # Rot fuer Risikoorgane
+COLOR_MIN    = "#27AE60"   # Gruen fuer Minimalabstand
+COLOR_HAUS   = "#E67E22"   # Orange fuer Hausdorff
+COLOR_CENT   = "#8E44AD"   # Lila fuer Schwerpunktabstand
 
-    plt.tight_layout()
-    plt.savefig(output_dir / 'volume_histograms.png', dpi=300, bbox_inches='tight')
-    plt.close()
 
-def plot_distance_scatter(data, output_dir):
-    """Erstellt Scatterplots der Abstände."""
-    if not data['distances']:
+# ---------------------------------------------------------------------------
+# Plot 1: Volumen-Balkendiagramm
+# ---------------------------------------------------------------------------
+
+def plot_volumes(results: dict, output_dir: Path) -> None:
+    """
+    Horizontales Balkendiagramm aller Strukturvolumen.
+    Targets blau, OARs rot. Sortiert nach Volumen (absteigend).
+    Sinnvoller als ein Histogramm, wenn < 20 Strukturen vorliegen.
+    """
+    names, volumes, colors = [], [], []
+
+    for name, s in results["targets"].items():
+        names.append(name)
+        volumes.append(s["volume_cm3"])
+        colors.append(COLOR_TARGET)
+
+    for name, s in results["oars"].items():
+        names.append(name)
+        volumes.append(s["volume_cm3"])
+        colors.append(COLOR_OAR)
+
+    if not names:
         return
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    # Absteigend nach Volumen sortieren
+    order = np.argsort(volumes)[::-1]
+    names   = [names[i]   for i in order]
+    volumes = [volumes[i] for i in order]
+    colors  = [colors[i]  for i in order]
 
-    min_distances = [d['min_distance_mm'] for d in data['distances']]
-    hausdorff_distances = [d['hausdorff_distance_mm'] for d in data['distances']]
-    centroid_distances = [d['centroid_distance_mm'] for d in data['distances']]
+    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.45 + 1)))
+    bars = ax.barh(names, volumes, color=colors, edgecolor="white", linewidth=0.5)
 
-    # Min Distance
-    ax1.scatter(range(len(min_distances)), min_distances, alpha=0.7, color='green')
-    ax1.set_title('Minimale Abstände')
-    ax1.set_xlabel('Paar-Index')
-    ax1.set_ylabel('Abstand (mm)')
-    ax1.grid(True, alpha=0.3)
+    # Werte ans Ende der Balken schreiben
+    for bar, vol in zip(bars, volumes):
+        ax.text(bar.get_width() + 0.01 * max(volumes),
+                bar.get_y() + bar.get_height() / 2,
+                f"{vol:.1f}", va="center", ha="left", fontsize=8)
 
-    # Hausdorff Distance
-    ax2.scatter(range(len(hausdorff_distances)), hausdorff_distances, alpha=0.7, color='orange')
-    ax2.set_title('Hausdorff-Abstände')
-    ax2.set_xlabel('Paar-Index')
-    ax2.set_ylabel('Abstand (mm)')
-    ax2.grid(True, alpha=0.3)
+    ax.set_xlabel("Volumen (cm³)", fontsize=11)
+    ax.set_title("Strukturvolumen (Targets vs. OARs)", fontsize=13, fontweight="bold")
+    ax.set_xlim(0, max(volumes) * 1.15)
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.3, linestyle="--")
 
-    # Centroid Distance
-    ax3.scatter(range(len(centroid_distances)), centroid_distances, alpha=0.7, color='purple')
-    ax3.set_title('Schwerpunkt-Abstände')
-    ax3.set_xlabel('Paar-Index')
-    ax3.set_ylabel('Abstand (mm)')
-    ax3.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / 'distance_scatter.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-def plot_sphericity_vs_volume(data, output_dir):
-    """Erstellt Scatterplot Sphärizität vs Volumen."""
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    all_volumes = []
-    all_sphericities = []
-
-    # Targets
-    for struct in data['targets'].values():
-        all_volumes.append(struct['volume_cm3'])
-        all_sphericities.append(struct['shape']['sphericity'])
-
-    # OARs
-    for struct in data['oars'].values():
-        all_volumes.append(struct['volume_cm3'])
-        all_sphericities.append(struct['shape']['sphericity'])
-
-    ax.scatter(all_volumes, all_sphericities, alpha=0.7, color='teal')
-    ax.set_title('Sphärizität vs Volumen')
-    ax.set_xlabel('Volumen (cm³)')
-    ax.set_ylabel('Sphärizität')
-    ax.grid(True, alpha=0.3)
+    legend = [
+        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet (Target)"),
+        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan (OAR)"),
+    ]
+    ax.legend(handles=legend, loc="lower right", fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'sphericity_vs_volume.png', dpi=300, bbox_inches='tight')
+    path = output_dir / "volumes.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
+    print(f"  Gespeichert: {path}")
 
-def calculate_statistics(data, output_dir):
-    """Berechnet und speichert Statistiken als TXT."""
-    stats = {}
 
-    # Targets
-    target_volumes = [struct['volume_cm3'] for struct in data['targets'].values()]
-    stats['targets'] = {
-        'count': len(target_volumes),
-        'volume_mean': np.mean(target_volumes),
-        'volume_std': np.std(target_volumes),
-        'volume_min': np.min(target_volumes),
-        'volume_max': np.max(target_volumes)
-    }
+# ---------------------------------------------------------------------------
+# Plot 2: Formmetriken-Vergleich
+# ---------------------------------------------------------------------------
 
-    # OARs
-    oar_volumes = [struct['volume_cm3'] for struct in data['oars'].values()]
-    stats['oars'] = {
-        'count': len(oar_volumes),
-        'volume_mean': np.mean(oar_volumes),
-        'volume_std': np.std(oar_volumes),
-        'volume_min': np.min(oar_volumes),
-        'volume_max': np.max(oar_volumes)
-    }
+def plot_shape_metrics(results: dict, output_dir: Path) -> None:
+    """
+    Gruppiertes Balkendiagramm der drei Formmetriken pro Struktur.
+    Ermoeglicht schnellen visuellen Vergleich zwischen Targets und OARs.
+    """
+    all_structs = {**results["targets"], **results["oars"]}
+    if not all_structs:
+        return
 
-    # Distances
-    if data['distances']:
-        min_distances = [d['min_distance_mm'] for d in data['distances']]
-        hausdorff_distances = [d['hausdorff_distance_mm'] for d in data['distances']]
-        centroid_distances = [d['centroid_distance_mm'] for d in data['distances']]
+    names        = list(all_structs.keys())
+    sphericities = [s["shape"]["sphericity"]  for s in all_structs.values()]
+    compactness  = [s["shape"]["compactness"] for s in all_structs.values()]
+    elongations  = [s["shape"]["elongation"]  for s in all_structs.values()]
 
-        stats['distances'] = {
-            'count': len(min_distances),
-            'min_distance_mean': np.mean(min_distances),
-            'min_distance_std': np.std(min_distances),
-            'hausdorff_mean': np.mean(hausdorff_distances),
-            'hausdorff_std': np.std(hausdorff_distances),
-            'centroid_mean': np.mean(centroid_distances),
-            'centroid_std': np.std(centroid_distances)
+    x         = np.arange(len(names))
+    n_targets = len(results["targets"])
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, max(4, len(names) * 0.4 + 2)))
+
+    metric_data = [
+        (axes[0], sphericities, "Sphaerizitaet",
+         "1.0 = perfekte Kugel\n< 1 = unregelmaessig/elongiert"),
+        (axes[1], compactness,  "Kompaktheit",
+         "1.0 = konvex ausgefuellt\n< 1 = konkav/lueckenhaft"),
+        (axes[2], elongations,  "Elongation",
+         "> 1 = gestreckt\n= 1 = isotropisch"),
+    ]
+
+    for ax, values, title, subtitle in metric_data:
+        bar_colors = [COLOR_TARGET if i < n_targets else COLOR_OAR
+                      for i in range(len(names))]
+        bars = ax.bar(x, values, color=bar_colors, edgecolor="white",
+                      linewidth=0.5, width=0.6)
+
+        for bar, val in zip(bars, values):
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.005 * max(values + [1]),
+                        f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=40, ha="right", fontsize=8)
+        ax.set_title(f"{title}\n{subtitle}", fontsize=10, fontweight="bold")
+        ax.set_ylim(0, max(values + [1.05]) * 1.12)
+        ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+        # Referenzlinie bei 1.0 (Sphaerizitaet, Kompaktheit)
+        if title != "Elongation":
+            ax.axhline(1.0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+
+    legend = [
+        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet"),
+        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan"),
+    ]
+    axes[0].legend(handles=legend, fontsize=8)
+
+    fig.suptitle("Formmetriken aller Strukturen", fontsize=13, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    path = output_dir / "shape_metrics.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 3: Abstands-Uebersicht
+# ---------------------------------------------------------------------------
+
+def plot_distances(results: dict, output_dir: Path, max_pairs: int = 25) -> None:
+    """
+    Gruppiertes Balkendiagramm: Min./Hausdorff-/Schwerpunktabstand pro Strukturpaar.
+
+    Zeigt nur Target-OAR-Paare (klinisch relevant), sortiert nach minimalem Abstand
+    (aufsteigend = kritischste zuerst). Auf max_pairs Eintraege begrenzt.
+    Klinisch relevante Schwelle (5 mm) als gestrichelte rote Linie eingezeichnet.
+    """
+    if not results["distances"]:
+        return
+
+    target_names = set(results["targets"].keys())
+    oar_names    = set(results["oars"].keys())
+
+    # Nur Target-OAR-Paare behalten (klinisch relevant)
+    relevant = [
+        d for d in results["distances"]
+        if (d["structure_a"] in target_names and d["structure_b"] in oar_names)
+        or (d["structure_b"] in target_names and d["structure_a"] in oar_names)
+    ]
+
+    # Fallback: alle Paare wenn keine Target-OAR-Kombination vorhanden
+    if not relevant:
+        relevant = results["distances"]
+
+    # Aufsteigend nach Minimalabstand sortieren (kritischste zuerst)
+    relevant = sorted(relevant, key=lambda d: d["min_distance_mm"])[:max_pairs]
+
+    pairs = [f"{d['structure_a']}\nvs\n{d['structure_b']}" for d in relevant]
+    d_min  = [d["min_distance_mm"]       for d in relevant]
+    d_haus = [d["hausdorff_distance_mm"] for d in relevant]
+    d_cent = [d["centroid_distance_mm"]  for d in relevant]
+
+    x     = np.arange(len(pairs))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(max(8, min(len(pairs) * 2.2, 28)), 6))
+
+    ax.bar(x - width, d_min,  width, label="Min. Abstand",        color=COLOR_MIN,  alpha=0.85)
+    ax.bar(x,         d_haus, width, label="Hausdorff-Abstand",   color=COLOR_HAUS, alpha=0.85)
+    ax.bar(x + width, d_cent, width, label="Schwerpunkt-Abstand", color=COLOR_CENT, alpha=0.85)
+
+    # Klinische Schwelle: 5 mm fuer Mindestabstand PTV-OAR
+    ax.axhline(5.0, color="red", linestyle="--", linewidth=1.2, alpha=0.7,
+               label="Klinische Schwelle (5 mm)")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(pairs, fontsize=8)
+    ax.set_ylabel("Abstand (mm)", fontsize=11)
+    ax.set_title("Abstands-Metriken zwischen Strukturpaaren", fontsize=13,
+                 fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.set_ylim(0, max(d_cent + d_haus + [10]) * 1.1)
+
+    plt.tight_layout()
+    path = output_dir / "distances.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 4: Schwerpunkt-3D-Karte
+# ---------------------------------------------------------------------------
+
+def plot_centroids_3d(results: dict, output_dir: Path) -> None:
+    """
+    3D-Streudiagramm der Strukturzentren im DICOM-Patientenkoordinatensystem
+    (X=links, Y=posterior, Z=superior). Setzt Groesse proportional zum Volumen.
+    Gibt raeumliche Lage und Abstands-Verhaeltnisse auf einen Blick wieder.
+    """
+    fig = plt.figure(figsize=(10, 8))
+    ax  = fig.add_subplot(111, projection="3d")
+
+    def _add_group(struct_dict, color, marker):
+        for name, s in struct_dict.items():
+            cx, cy, cz = s["centroid_mm"]
+            vol = s["volume_cm3"]
+            size = max(30, min(600, vol * 8))     # Groesse skaliert mit Volumen
+            ax.scatter(cx, cy, cz, s=size, c=color, marker=marker,
+                       alpha=0.75, edgecolors="white", linewidths=0.5)
+            ax.text(cx, cy, cz + 3, name, fontsize=7, ha="center", color=color)
+
+    _add_group(results["targets"], COLOR_TARGET, "o")
+    _add_group(results["oars"],    COLOR_OAR,    "^")
+
+    ax.set_xlabel("X  [mm]  (Links)", fontsize=9)
+    ax.set_ylabel("Y  [mm]  (Posterior)", fontsize=9)
+    ax.set_zlabel("Z  [mm]  (Superior)", fontsize=9)
+    ax.set_title("Raeumliche Verteilung der Strukturschwerpunkte",
+                 fontsize=12, fontweight="bold")
+
+    legend = [
+        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet (Kreis)"),
+        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan (Dreieck)"),
+    ]
+    ax.legend(handles=legend, fontsize=9, loc="upper left")
+
+    plt.tight_layout()
+    path = output_dir / "centroids_3d.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 5: Statistik-Textdatei
+# ---------------------------------------------------------------------------
+
+def write_statistics(results: dict, output_dir: Path) -> None:
+    """Schreibt eine strukturierte Zusammenfassung aller Metriken als TXT."""
+
+    def _stats(values):
+        if not values:
+            return {"n": 0, "mean": 0, "std": 0, "min": 0, "max": 0}
+        return {
+            "n":    len(values),
+            "mean": float(np.mean(values)),
+            "std":  float(np.std(values)),
+            "min":  float(np.min(values)),
+            "max":  float(np.max(values)),
         }
 
-    # Speichere als TXT
-    with open(output_dir / 'statistics.txt', 'w', encoding='utf-8') as f:
-        f.write("DICOM Analyse Statistiken\n")
-        f.write("=" * 40 + "\n\n")
+    path = output_dir / "statistics.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("RTSTRUCT Analyse – Statistiken\n")
+        f.write("=" * 50 + "\n\n")
 
-        f.write("ZIELGEBIETE (Targets):\n")
-        f.write(f"Anzahl: {stats['targets']['count']}\n")
-        f.write(f"Volumen Mittelwert: {stats['targets']['volume_mean']:.3f} cm³\n")
-        f.write(f"Volumen Standardabweichung: {stats['targets']['volume_std']:.3f} cm³\n")
-        f.write(f"Volumen Minimum: {stats['targets']['volume_min']:.3f} cm³\n")
-        f.write(f"Volumen Maximum: {stats['targets']['volume_max']:.3f} cm³\n\n")
+        for section, struct_dict in [("ZIELGEBIETE", results["targets"]),
+                                      ("RISIKOORGANE", results["oars"])]:
+            f.write(f"{section}\n")
+            f.write("-" * 50 + "\n")
+            for name, s in struct_dict.items():
+                sh = s["shape"]
+                f.write(f"\n  {name}  (ROI #{s['roi_number']})\n")
+                f.write(f"    Konturen  : {s['num_contours']} Schichten, "
+                        f"{s['num_points']} Punkte\n")
+                f.write(f"    Volumen   : {s['volume_cm3']:.3f} cm3\n")
+                cx, cy, cz = s["centroid_mm"]
+                f.write(f"    Schwerpunkt: ({cx:.1f}, {cy:.1f}, {cz:.1f}) mm\n")
+                bx, by, bz = sh["bbox_size_mm"]
+                f.write(f"    BBox Groesse: {bx:.1f} x {by:.1f} x {bz:.1f} mm\n")
+                f.write(f"    Sphaerizitaet : {sh['sphericity']:.4f}\n")
+                f.write(f"    Kompaktheit   : {sh['compactness']:.4f}\n")
+                f.write(f"    Elongation    : {sh['elongation']:.4f}\n")
 
-        f.write("RISIKOORGANE (OARs):\n")
-        f.write(f"Anzahl: {stats['oars']['count']}\n")
-        f.write(f"Volumen Mittelwert: {stats['oars']['volume_mean']:.3f} cm³\n")
-        f.write(f"Volumen Standardabweichung: {stats['oars']['volume_std']:.3f} cm³\n")
-        f.write(f"Volumen Minimum: {stats['oars']['volume_min']:.3f} cm³\n")
-        f.write(f"Volumen Maximum: {stats['oars']['volume_max']:.3f} cm³\n\n")
+        if results["distances"]:
+            f.write("\n\nABSTANDS-STATISTIK\n")
+            f.write("-" * 50 + "\n")
+            st_min  = _stats([d["min_distance_mm"]       for d in results["distances"]])
+            st_haus = _stats([d["hausdorff_distance_mm"] for d in results["distances"]])
+            st_cent = _stats([d["centroid_distance_mm"]  for d in results["distances"]])
 
-        if 'distances' in stats:
-            f.write("ABSTÄNDE:\n")
-            f.write(f"Anzahl Paare: {stats['distances']['count']}\n")
-            f.write(f"Min. Abstand Mittelwert: {stats['distances']['min_distance_mean']:.3f} mm\n")
-            f.write(f"Min. Abstand Std: {stats['distances']['min_distance_std']:.3f} mm\n")
-            f.write(f"Hausdorff Mittelwert: {stats['distances']['hausdorff_mean']:.3f} mm\n")
-            f.write(f"Hausdorff Std: {stats['distances']['hausdorff_std']:.3f} mm\n")
-            f.write(f"Schwerpunkt Mittelwert: {stats['distances']['centroid_mean']:.3f} mm\n")
-            f.write(f"Schwerpunkt Std: {stats['distances']['centroid_std']:.3f} mm\n")
+            f.write(f"Anzahl Paare : {st_min['n']}\n\n")
+            for label, st in [("Min. Abstand (mm)",        st_min),
+                               ("Hausdorff-Abstand (mm)",  st_haus),
+                               ("Schwerpunkt-Abstand (mm)", st_cent)]:
+                f.write(f"  {label}\n")
+                f.write(f"    Mittelwert : {st['mean']:.2f}\n")
+                f.write(f"    Std.abw.   : {st['std']:.2f}\n")
+                f.write(f"    Min        : {st['min']:.2f}\n")
+                f.write(f"    Max        : {st['max']:.2f}\n\n")
 
-def main():
-    # Pfad zur JSON-Datei (angenommen im output/ Ordner)
-    output_dir = Path('output')
-    json_file = output_dir / 'RS.1.3.46.670589.13.8605032.20260409113651.374505_analysis.json'
+            f.write("\nEINZELPAARE\n")
+            f.write(f"{'Paar':<45} {'Min':>8} {'Hausdorff':>12} {'Zentroid':>10}\n")
+            f.write("-" * 78 + "\n")
+            for d in results["distances"]:
+                pair = f"{d['structure_a']} vs {d['structure_b']}"
+                f.write(f"{pair:<45} {d['min_distance_mm']:>8.2f} "
+                        f"{d['hausdorff_distance_mm']:>12.2f} "
+                        f"{d['centroid_distance_mm']:>10.2f}\n")
 
-    if not json_file.exists():
-        print(f"JSON-Datei nicht gefunden: {json_file}")
-        return
+    print(f"  Gespeichert: {path}")
 
-    # Daten laden
-    data = load_analysis_results(json_file)
 
-    # Plots erstellen
-    plot_volume_histogram(data, output_dir)
-    plot_distance_scatter(data, output_dir)
-    plot_sphericity_vs_volume(data, output_dir)
+# ---------------------------------------------------------------------------
+# Haupt-Workflow
+# ---------------------------------------------------------------------------
 
-    # Statistiken berechnen
-    calculate_statistics(data, output_dir)
+def run_visualization(results: dict, output_dir: Path) -> None:
+    """Erstellt alle Plots fuer ein bereits analysiertes results-Dict."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nErstelle Visualisierungen in {output_dir} ...")
+    plot_volumes(results, output_dir)
+    plot_shape_metrics(results, output_dir)
+    plot_distances(results, output_dir)
+    plot_centroids_3d(results, output_dir)
+    write_statistics(results, output_dir)
+    print("Visualisierung abgeschlossen.")
 
-    print("Visualisierung abgeschlossen. Plots und Statistiken in output/ gespeichert.")
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="RTSTRUCT Visualizer – Plots aus DICOM RT Structure Sets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Beispiele:\n"
+            "  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm\n"
+            "  python -m dicom_file_modifier.visualizer data/rtstruct.dcm "
+            "--targets PTV,CTV --oars Parotis --output output/plots\n"
+        ),
+    )
+    parser.add_argument("file", help="Pfad zur RTSTRUCT DICOM Datei")
+    parser.add_argument("--output", "-o", default="output",
+                        help="Ausgabeverzeichnis (Standard: output)")
+    parser.add_argument("--targets", type=str, default=None,
+                        help="Komma-getrennte Zielgebiet-Namen (z.B. PTV,CTV)")
+    parser.add_argument("--oars", type=str, default=None,
+                        help="Komma-getrennte Risikoorgan-Namen")
+    args = parser.parse_args()
+
+    target_list = args.targets.split(",") if args.targets else None
+    oar_list    = args.oars.split(",")    if args.oars    else None
+
+    results = run_analysis(
+        filepath=args.file,
+        target_names=target_list,
+        oar_names=oar_list,
+    )
+
+    run_visualization(results, Path(args.output))
+
 
 if __name__ == "__main__":
     main()

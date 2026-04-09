@@ -47,17 +47,21 @@ This will generate:
 
 ### Visualizer
 
-Generate plots and statistics from analysis results:
+Generate plots and statistics directly from a RTSTRUCT file:
 
 ```bash
-python -m dicom_file_modifier.visualizer output/analysis_results.json --output output/
+python -m dicom_file_modifier.visualizer data/0000000171/RS.dcm --output output/
+# with explicit structure selection:
+python -m dicom_file_modifier.visualizer data/0000000171/RS.dcm \
+    --targets GTV,PTV --oars Hirnstamm,Rueckenmark --output output/
 ```
 
 This creates:
-- `volume_histogram.png`: Volume distribution of structures
-- `distance_scatter.png`: Scatter plot of inter-structure distances
-- `sphericity_vs_volume.png`: Shape analysis plot
-- `statistics.txt`: Summary statistics
+- `volumes.png`: Horizontal bar chart of all structure volumes, colour-coded by type
+- `shape_metrics.png`: Grouped bar chart of sphericity, compactness, elongation per structure
+- `distances.png`: Grouped bar chart of min/Hausdorff/centroid distances for the 25 most critical Target–OAR pairs
+- `centroids_3d.png`: 3D scatter of structure centroids in patient space, marker size ∝ volume
+- `statistics.txt`: Full numerical summary of all metrics
 
 ### Modifier – CT Rigid Body Transformer
 
@@ -492,3 +496,81 @@ The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-s
 8. Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm.* ACM SIGGRAPH Computer Graphics, 21(4), 163–169.
 9. Thévenaz, P., Blu, T., & Unser, M. (2000). *Interpolation revisited.* IEEE Transactions on Medical Imaging, 19(7), 739–758.
 10. Sled, J. G., Zijdenbos, A. P., & Evans, A. C. (1998). *A nonparametric method for automatic correction of intensity nonuniformity in MRI data.* IEEE Transactions on Medical Imaging, 17(1), 87–97.
+
+---
+
+# RTSTRUCT Visualizer Documentation
+
+## Overview
+
+The **RTSTRUCT Visualizer** (`visualizer.py`) generates a set of purpose-built static plots from the analysis results produced by the RTSTRUCT Analyzer. Each plot is designed to answer a specific clinical question and avoids chart types that are misleading at the typical structure counts encountered in radiotherapy planning (usually 5–30 structures per patient). The visualizer calls `run_analysis` internally, so only the RTSTRUCT file path is required — no intermediate JSON file is needed.
+
+## Output Files and Clinical Motivation
+
+### 1. `volumes.png` – Structure Volume Bar Chart
+
+**Chart type:** Horizontal bar chart, sorted descending by volume.
+
+A histogram (the previous implementation) is only meaningful when many samples are drawn from an unknown distribution, which is never the case here: each bar represents one named anatomical structure. A sorted bar chart makes it immediately apparent which structures are largest, how Targets and OARs compare in size, and whether any structure has an unexpectedly small or large volume (which can indicate a contouring error). Targets are shown in blue, OARs in red. Volume values are annotated on each bar.
+
+**Clinical relevance:** Volume is the primary metric for Target coverage (PTV volume drives monitor unit calculation) and OAR sparing (e.g., mean brain dose correlates with brain volume irradiated). Unexpected outliers in volume are a common QA flag.
+
+### 2. `shape_metrics.png` – Shape Metrics Comparison
+
+**Chart type:** Three grouped bar charts side by side (one panel per metric).
+
+Plotting all three shape metrics (sphericity, compactness, elongation) in a single figure with a consistent structure ordering allows direct visual comparison. A reference line at 1.0 is drawn for sphericity and compactness, since 1.0 is the theoretical maximum for a convex, sphere-like structure.
+
+**Sphericity** quantifies how closely the structure resembles a sphere: values near 1 indicate round, regular shapes; values well below 1 indicate irregular or elongated structures. Clinically, low sphericity in a PTV may indicate a complex shape requiring more beam arrangements.
+
+**Compactness** (volume / convex hull volume) detects concavity: a value below ~0.85 suggests the structure wraps around other anatomy (e.g., a C-shaped PTV around the brainstem). This is important when choosing between conformal arc and IMRT/VMAT techniques.
+
+**Elongation** (sqrt of largest-to-smallest PCA eigenvalue ratio) measures directional stretching. High elongation combined with low sphericity in an OAR such as the spinal cord confirms its cylindrical nature, which is expected. Unexpectedly high elongation in a GTV may indicate a drawing artefact.
+
+### 3. `distances.png` – Target–OAR Distance Bar Chart
+
+**Chart type:** Grouped bar chart with three distance types per pair, limited to the 25 Target–OAR pairs with the smallest minimum distance (most critical first).
+
+**Design decisions:**
+- **Only Target–OAR pairs** are shown. Target–Target and OAR–OAR distances are less clinically meaningful for plan optimisation; they can always be retrieved from `statistics.txt`.
+- **Sorted ascending by minimum distance**: the most critical proximity relationships appear on the left.
+- **Cap at 25 pairs**: prevents figure overflow. With 65 structures, all pairwise combinations produce over 2000 entries — a bar chart of that size is unreadable (198,660 × 600 px) and clinically useless.
+- **5 mm threshold line**: AAPM TG-218 and most institutional protocols flag structures within 5 mm of a Target boundary as requiring explicit dose–volume constraint review. This line immediately highlights which OARs fall into the critical zone.
+
+**Three distance types** are shown simultaneously per pair:
+- *Minimum distance*: the closest point between two contour surfaces; 0 mm means overlap.
+- *Hausdorff distance*: the worst-case separation; indicates maximum excursion of one structure towards the other.
+- *Centroid distance*: robust gross separation; useful as a sanity check (should always exceed minimum distance).
+
+### 4. `centroids_3d.png` – Spatial Centroid Map
+
+**Chart type:** 3D scatter plot using matplotlib's mpl_toolkits.mplot3d.
+
+All structure centroids are plotted in the DICOM patient coordinate system (X=left, Y=posterior, Z=superior). Marker size scales with the square root of structure volume, so large structures are visually prominent without dominating. Targets use filled circles, OARs use triangles.
+
+**Clinical relevance:** This plot answers the question "where is everything relative to everything else?" at a glance. It is particularly useful for multi-metastasis cases (e.g., the example dataset has 7 brain metastases): one can verify that all GTV/PTV pairs are spatially co-located and that the OARs (brainstem, optic chiasm, cochleae) are in the expected positions.
+
+**Limitation:** The 3D scatter is static (not interactive). For interactive exploration, the CT Transformer's `visualization_3d.html` (Plotly) is the better tool.
+
+### 5. `statistics.txt` – Numerical Summary
+
+A structured plain-text file with per-structure details (volume, centroid, bounding box, all three shape metrics) and aggregated distance statistics (mean, std, min, max for each distance type, plus a full pairwise table). Suitable for copy-paste into clinical reports or further spreadsheet analysis.
+
+## Implementation Notes
+
+### Structure Filtering and Auto-Detection
+
+If `--targets` or `--oars` are not specified on the CLI, the visualizer relies on the DICOM `RTROIInterpretedType` tag to classify structures. Recognised target types: `PTV`, `CTV`, `GTV`, `TV`. Recognised OAR types: `OAR`, `ORGAN`, `AVOIDANCE`. Structures of type `MARKER`, `EXTERNAL`, or `SUPPORT` are silently ignored in all plots (they appear in the structure list but are not analysed unless explicitly named).
+
+### Scalability
+
+The plots are designed to remain readable up to approximately 30 structures. Above that, the shape metrics panel becomes crowded and the 3D centroid map overlapping labels may need manual adjustment. The distance plot is always limited to 25 pairs regardless of total structure count.
+
+### Matplotlib Backend
+
+`matplotlib.use("Agg")` is set at module level so the visualizer can run on headless servers (e.g., CI pipelines, remote compute nodes) without an X display. All output is written to files; no interactive window is opened.
+
+## Literature
+
+11. **AAPM Task Group 218** (2021). *Tolerance limits and methodologies for IMRT measurement-based verification QA.* Medical Physics, 48(10).
+12. Taha, A. A., & Hanbury, A. (2015). *Metrics for evaluating 3D medical image segmentation: analysis, selection, and tool.* BMC Medical Imaging, 15(1), 29.
