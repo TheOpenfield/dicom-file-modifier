@@ -48,6 +48,10 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
+
+# Project specific
+data/
+output/
 .pytest_cache/
 cover/
 
