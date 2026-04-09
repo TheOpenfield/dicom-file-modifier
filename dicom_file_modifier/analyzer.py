@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RTSTRUCT Analyzer – Analyse von Zielgebieten und Risikoorganen
+Analyzer Analyse von Zielgebieten und Risikoorganen
 aus DICOM RT Structure Set Dateien.
 
 Berechnet pro Struktur:

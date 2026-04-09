@@ -52,6 +52,7 @@ coverage.xml
 # Project specific
 data/
 output/
+.claude/
 .pytest_cache/
 cover/
 
