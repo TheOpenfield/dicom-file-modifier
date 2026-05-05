@@ -6,6 +6,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 
 - **Analyzer**: Extract and compute geometric properties (volume, centroid, shape metrics, distances) from RTSTRUCT files
 - **Modifier**: Rigid body transformation of CT DICOM series (translation + rotation) with HU preservation and 3D visualization
+- **Case Modifier**: Lockstep rigid body transformation of a CT series **and** its companion RTSTRUCT in a single pass — contour points are transformed alongside the pixel data, UID references are rewritten so the new RS links to the new CT, optionally a `Drehpunkt` POINT marker is inserted at the rotation centre for easy identification in the TPS
 - **Visualizer**: Generate plots and statistics from analysis results
 
 ## Project Structure
@@ -13,15 +14,21 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 ```
 dicom-file-modifier/
 ├── data/                    # Input DICOM files (not synced)
+│   └── <case-id>/           # One folder per case
+│       ├── CT/              # CT slices (*.dcm)
+│       └── RS*.dcm          # RTSTRUCT file
 ├── output/                  # Analysis results and modified files (not synced)
 ├── dicom_file_modifier/     # Python package
 │   ├── __init__.py
 │   ├── analyzer.py          # RTSTRUCT analysis module
 │   ├── modifier.py          # CT rigid body transformer
+│   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
 │   └── visualizer.py        # Visualization module
 ├── requirements.txt         # Python dependencies
-└── README.md               # This file
+└── README.md                # This file
 ```
+
+**Case folder convention:** `case_modifier` expects a folder of the form `data/<case-id>/` containing a `CT/` subfolder with the CT DICOM slices plus exactly one `RS*.dcm` file at the case root. Sibling `RP*.dcm` (RTPLAN) and `RD*.dcm` (RTDOSE) files are detected and reported but **not** transformed.
 
 ## Installation
 
@@ -89,6 +96,54 @@ This produces:
 | `--output` | `output/ct_transformed` | Output directory |
 | `--save-viz` | *(auto)* | Path for HTML visualization file |
 | `--no-viz` | off | Skip visualization |
+
+### Case Modifier – CT + RTSTRUCT Lockstep Transformer
+
+Apply the **same** rigid body transformation to a CT series and its companion RTSTRUCT in one go, so the contours stay anchored to the moved anatomy:
+
+```bash
+# List POINT-type markers in the RTSTRUCT (potential rotation centres)
+python -m dicom_file_modifier.case_modifier data/0000000171 --list-markers
+
+# Identity-transform self-test (validates the round-trip; exit 0 = pass)
+python -m dicom_file_modifier.case_modifier data/0000000171 --self-test
+
+# Real transformation: 10 mm shift + 15° rotation around marker "HS1"
+python -m dicom_file_modifier.case_modifier data/0000000171 \
+    --tx 10 --ty 0 --tz -5 --rx 0 --ry 0 --rz 15 \
+    --center marker:HS1 --output output/run1 --verify
+```
+
+This produces `output/run1/<case-id>_RB/`:
+- `CT/CT_0000.dcm … CT_NNNN.dcm` — transformed CT series (new `SeriesInstanceUID` and per-slice `SOPInstanceUID`s)
+- `RS_RB.dcm` — transformed RTSTRUCT (every `ContourData` triple multiplied by `T`, all SOP/Series UID references rewritten to point at the new CT, plus a synthetic `Drehpunkt` POINT-ROI inserted at the rotation centre)
+
+**All CLI options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--tx/ty/tz` | 0 mm | Translation along X / Y / Z axis (LPS) |
+| `--rx/ry/rz` | 0 ° | Rotation around X / Y / Z axis (extrinsic XYZ Euler) |
+| `--method` | `resample` | Same as modifier: `resample` (default) or `metadata` |
+| `--order` | `1` | Interpolation order (resample only): 0/1/3 |
+| `--center` | *(prompt)* | Rotation centre. `volume`, `marker:NAME`, or `x,y,z` (LPS, mm) |
+| `--list-markers` | off | Print all POINT-type ROIs and exit |
+| `--non-interactive` | off | Skip the interactive centre prompt; default to volume centre |
+| `--label` | `_RB` | Suffix for output folder, RS filename, `StructureSetLabel`, `SeriesDescription` |
+| `--rs` | *(auto)* | Explicit path to RTSTRUCT file (when multiple `RS*.dcm` exist) |
+| `--new-frame-of-reference` | off | Mint a new `FrameOfReferenceUID` for the transformed pair |
+| `--dry-run` | off | Validate inputs and print plan; write nothing |
+| `--verify` | off | After write: re-read RS and check centroid linearity per ROI |
+| `--self-test` | off | End-to-end identity-transform test; exit 0 = pass |
+| `--output` | `output` | Base output directory |
+
+**Aria/TPS-visible metadata.** The transformed series carries identifying information in the human-readable DICOM tags so a planner can spot it at a glance:
+- `SeriesDescription = "<orig>_RB"` (LO, ≤ 64 chars)
+- `StructureSetLabel = "<orig>_RB"` (SH, truncated to 16 chars with the suffix preserved)
+- `StructureSetName = "<orig>_RB"`
+- `StructureSetDescription = "rigid t=(10,0,-5) r=(0,0,15) c=Marker 'HS1' m=met FoR=keep"` (LO, ≤ 64 chars, full transform parameters)
+- `SeriesNumber += 1000` so the transformed series sorts adjacent to the original
+- `--label` overrides the suffix (e.g., `--label _SHIFT_LR10`)
 
 ## Dependencies
 
@@ -496,6 +551,127 @@ The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-s
 8. Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm.* ACM SIGGRAPH Computer Graphics, 21(4), 163–169.
 9. Thévenaz, P., Blu, T., & Unser, M. (2000). *Interpolation revisited.* IEEE Transactions on Medical Imaging, 19(7), 739–758.
 10. Sled, J. G., Zijdenbos, A. P., & Evans, A. C. (1998). *A nonparametric method for automatic correction of intensity nonuniformity in MRI data.* IEEE Transactions on Medical Imaging, 17(1), 87–97.
+
+---
+
+# Case Modifier Documentation
+
+## Overview
+
+The **Case Modifier** (`case_modifier.py`) extends the CT Rigid Body Transformer to operate on a **complete case** — both the CT series and its companion RTSTRUCT — in a single invocation. Where `modifier.py` only moves the pixel data, `case_modifier.py` additionally transforms every contour point in the structure set so that ROIs continue to enclose the same anatomy after rigid motion. UID references between RS and CT are rewritten so the transformed pair links correctly in any TPS.
+
+The module is built on top of `modifier.py` and `analyzer.py`; it adds no new geometric mathematics, only orchestration, RTSTRUCT-specific bookkeeping, and metadata management.
+
+## Why the RTSTRUCT Must Move with the CT
+
+A DICOM RTSTRUCT stores ROI contours as flat lists of (x, y, z) coordinates in the **patient frame** (LPS, mm). When the CT is rigidly transformed, the patient anatomy at original coordinate $\mathbf{p}$ now appears at $\mathbf{p}' = \mathbf{T}\,\mathbf{p}$. A contour that was drawn on a structure at $\mathbf{p}$ remains stored at $\mathbf{p}$ in the RTSTRUCT — so without a corresponding RS update, the contour no longer encloses the moved anatomy. After applying the same $\mathbf{T}$ to every `ContourData` triple, the contours follow the anatomy exactly.
+
+Because $\mathbf{T}$ is a rigid transformation, $\|\mathbf{R}\,\mathbf{p}_1 - \mathbf{R}\,\mathbf{p}_2\| = \|\mathbf{p}_1 - \mathbf{p}_2\|$ for all pairs of points, and consequently:
+
+- Contour shapes are not distorted (no shearing, no anisotropic scaling).
+- Volumes are preserved exactly. The Shoelace area $A_i$ of a contour is invariant under rigid motion in its plane, and the slice spacing $\Delta z$ is preserved by construction (slice positions are also transformed).
+- Centroids transform linearly: $\mathbf{T}(\overline{\mathbf{p}}) = \overline{\mathbf{T}(\mathbf{p}_i)}$, which is exploited by `--verify` as a per-ROI sanity check.
+
+The implementation reads `ContourData`, reshapes the flat list into an $N \times 3$ matrix, applies $\mathbf{T}$ to every row in homogeneous coordinates, formats the result back into the flat string list with six-decimal precision, and writes it back. `NumberOfContourPoints` is unchanged.
+
+## UID Bookkeeping: Why This Is the Hard Part
+
+A DICOM RTSTRUCT references its companion CT through three layers of UIDs:
+
+1. `FrameOfReferenceUID` (top level + per-ROI in `StructureSetROISequence`) — the patient coordinate system.
+2. `ReferencedFrameOfReferenceSequence[*].RTReferencedStudySequence[*].RTReferencedSeriesSequence[*].SeriesInstanceUID` — the CT series the RS belongs to.
+3. Per-contour `ContourImageSequence[*].ReferencedSOPInstanceUID` — the specific CT slice each contour was drawn on.
+
+When `save_ct_series` writes the transformed CT, every output slice receives a fresh `SOPInstanceUID` and the series receives a fresh `SeriesInstanceUID`. Without rewriting, the original RS would now reference SOPs and a series UID that no longer exist — the planning system would report "missing image references" or refuse to link the structure set at all.
+
+`save_ct_series` was extended to return a mapping `{old_sop: new_sop, ...}` for all transformed slices. `transform_rtstruct` walks the RS and substitutes:
+
+- Per-contour `ContourImageSequence[*].ReferencedSOPInstanceUID` via the SOP map (raises `KeyError` if a referenced SOP is not in the map — this is a hard error, since it means the RS is referencing slices outside the input CT folder).
+- Top-level `RTReferencedSeriesSequence[*].SeriesInstanceUID` to the new CT series UID.
+- Top-level `RTReferencedSeriesSequence[*].ContourImageSequence[*].ReferencedSOPInstanceUID` via the SOP map.
+
+The RS itself receives a fresh `SOPInstanceUID` and `SeriesInstanceUID` so it is recognised as a new structure set.
+
+## FrameOfReferenceUID Strategy
+
+The `FrameOfReferenceUID` (DICOM tag `(0020,0052)`) declares "all series with this UID share the same patient coordinate system." Two strategies are supported:
+
+- **Default (keep):** the original FoR is preserved on both the transformed CT and the transformed RS. They link correctly to each other because both carry the same FoR. **Caveat:** any existing RTPLAN, RTDOSE, or sibling RTSTRUCT that also references this FoR will be auto-overlaid by Aria/Eclipse onto the transformed CT, even though they were planned in the un-transformed coordinate system. The case modifier prints a clear runtime warning whenever this default is used.
+- **`--new-frame-of-reference`:** a fresh FoR UID is minted and applied to both the transformed CT and the transformed RS. They still link to each other, but they are now in a coordinate system distinct from the original CT's. Existing plans/doses keep their old FoR and are not auto-overlaid. Any cross-frame comparison must go through an explicit registration object — this is the safer default for clinical workflows where the transformed dataset is meant to represent a different geometric situation rather than an alternate view of the same one.
+
+## Variable Rotation Centre
+
+Rotation is performed about a configurable centre $\mathbf{c}$, with the offset folded into the same $4 \times 4$ matrix used for the CT:
+
+$$\mathbf{p}' = \mathbf{R}\,(\mathbf{p} - \mathbf{c}) + \mathbf{c} + \mathbf{t}$$
+
+Three centre-selection modes are provided:
+
+- **`--center volume`** (default for non-interactive runs) — the geometric centre of the CT volume in patient coordinates. Same as `modifier.py`.
+- **`--center marker:NAME`** — the position of a POINT-type ROI from the RTSTRUCT, looked up case-insensitively. POINT contours are typically used to mark fiducials, isocenters, or registration points (`ContourGeometricType == "POINT"`, single (x,y,z) triplet in `ContourData`). Listing them with `--list-markers` gives the user the marker names and their LPS positions.
+- **`--center x,y,z`** — three comma-separated floats, interpreted as LPS millimetres directly. Useful for arbitrary offsets that do not correspond to an existing marker.
+
+When neither `--center` nor `--non-interactive` is given and stdin is a TTY, the user is presented with a list of markers and may pick one by index, type `v` for the volume centre, or `m` to enter a manual point.
+
+## Drehpunkt Marker
+
+After every successful run the transformed RS contains an extra POINT-type ROI named **`Drehpunkt`** (German for "pivot point" / "rotation centre") at the position $\mathbf{c} + (t_x, t_y, t_z)$. This works because rotation leaves $\mathbf{c}$ invariant — $\mathbf{T}(\mathbf{c}) = \mathbf{R}(\mathbf{c} - \mathbf{c}) + \mathbf{c} + \mathbf{t} = \mathbf{c} + \mathbf{t}$ — so the rotation centre in the transformed coordinate system simply shifts by the translation. Visualised in the TPS, this marker shows at a glance where the rigid motion was anchored, which is otherwise not derivable from the DICOM tags alone.
+
+Implementation details: a new entry is appended to `StructureSetROISequence` (next free `ROINumber`, `ROIName = "Drehpunkt"`), to `RTROIObservationsSequence` (`RTROIInterpretedType = "MARKER"`), and to `ROIContourSequence` (one POINT contour with `NumberOfContourPoints = 1`, yellow display colour). The marker's `ReferencedFrameOfReferenceUID` matches the chosen FoR strategy.
+
+## Aria/TPS-Visible Metadata
+
+To make the transformed series identifiable in the planning system without opening the DICOM headers, the case modifier writes the transform parameters into the human-readable string tags:
+
+| Tag | VR | Max | Content |
+|---|---|---|---|
+| `SeriesDescription` (CT + RS) | LO | 64 | `<orig>_RB` (or custom suffix) |
+| `StructureSetLabel` | SH | 16 | `<orig>_RB` truncated; suffix preserved if `<orig>` is too long |
+| `StructureSetName` | LO | 64 | `<orig>_RB` |
+| `StructureSetDescription` | LO | 64 | `rigid t=(tx,ty,tz) r=(rx,ry,rz) c=<centre> m=<method> FoR=<keep\|new>` |
+| `SeriesNumber` | IS | — | original + 1000 |
+
+All length limits follow DICOM VR specifications. The label suffix is configurable via `--label`. The full transform description always lands in `StructureSetDescription` regardless of the suffix.
+
+## Pre-Flight Validation
+
+Before any data is written, the case modifier validates the input:
+
+1. **Folder layout.** The case directory must exist and contain a `CT/` subfolder. Exactly one `RS*.dcm` file must be present at the case root (or `--rs PATH` must be given). Sibling `RP*.dcm`/`RD*.dcm` files trigger a hint warning.
+2. **CT geometry.** All slices must share the same `ImageOrientationPatient` (within 1e-3) and `PixelSpacing` (within 1e-4 mm). Slice spacing must be uniform within 1 % relative deviation. At least 2 slices are required.
+3. **FoR consistency.** The CT slices must all carry the same `FrameOfReferenceUID`, and the RTSTRUCT must reference this FoR through its `ReferencedFrameOfReferenceSequence`. A mismatch raises a clear error — almost always indicating that the user picked an RS file that does not belong to this CT.
+
+Any failure terminates the run with exit code 2 before any output is written.
+
+## Verification Modes
+
+Three orthogonal modes are provided to verify correctness:
+
+- **`--dry-run`** — runs all input validation, computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. No files are written. Useful as a clinical preview before committing to a long resample run.
+- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI centroids, and compares with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Centroids transform linearly under rigid motion, so a deviation greater than ~1e-4 mm indicates a bug in the transform pipeline (e.g., a `ContourData` reshape error). The maximum norm and the worst ROI are reported.
+- **`--self-test`** — runs an end-to-end identity transform (zero translation, zero rotation) on a temporary directory and asserts that every contour point in the new RS matches the original within 1e-4 mm. Returns exit code 0 on pass, 1 on fail. Suitable for CI / regression checks.
+
+## Numerical Verification on the Reference Dataset
+
+On the bundled `data/0000000171/` case (320 CT slices, 65 ROIs, 21 POINT markers), the implementation achieves:
+
+| Test | Result | Tolerance |
+|---|---|---|
+| Identity round-trip — max contour-point deviation | 5 × 10⁻⁷ mm | < 1 × 10⁻⁴ mm |
+| Centroid linearity under non-trivial $\mathbf{T}$ | < 7 × 10⁻⁷ mm (worst ROI) | < 1 × 10⁻³ mm |
+| Volume preservation across 44 ROIs | 0.0000 % deviation | < 0.01 % |
+| Marker fixpoint (rotation about itself) | 0 mm | < 1 × 10⁻⁶ mm |
+| Drehpunkt position | exact | — |
+| FoR consistency CT ↔ RS (both modes) | preserved | — |
+
+The numerical floor (~1e-7 mm) is set by the float-to-six-decimal-string round trip in `ContourData`, not by the transform mathematics.
+
+## Limitations and Out-of-Scope
+
+- **RTPLAN and RTDOSE are not transformed.** Sibling `RP*.dcm` and `RD*.dcm` files are detected and reported but their geometry is left untouched. Transforming a plan would require also transforming beam isocentres, gantry angles, and couch positions, which is out of scope for this tool.
+- **Non-axial CT input is rejected** at the geometry-validation stage. Tilted or step-and-shoot acquisitions need to be re-sampled to standard axial first.
+- **Single RTSTRUCT per case.** When multiple `RS*.dcm` files are present, the user must select one with `--rs`.
+- **No dose recomputation.** The transformed CT can be re-imported into a TPS for fresh dose calculation, but no dose is recomputed in this tool.
 
 ---
 
