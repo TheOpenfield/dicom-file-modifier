@@ -25,6 +25,7 @@ Benötigte Packages:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -473,6 +474,8 @@ Beispiele:
                         help="Komma-getrennte Zielgebiet-Namen (z.B. PTV,CTV)")
     parser.add_argument("--oars", type=str, default=None,
                         help="Komma-getrennte Risikoorgan-Namen")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Ausgabeverzeichnis für <stem>_analysis.json")
 
     args = parser.parse_args()
 
@@ -486,9 +489,38 @@ Beispiele:
         list_only=args.list,
     )
 
+    if args.output:
+        out_dir = Path(args.output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{Path(args.file).stem}_analysis.json"
+        with out_path.open("w", encoding="utf-8") as fh:
+            json.dump(_results_to_jsonable(results), fh,
+                      indent=2, ensure_ascii=False)
+        print(f"\nAnalyse-Ergebnisse gespeichert: {out_path}")
+
     print(f"\n{'=' * 60}")
     print("Analyse abgeschlossen.")
     print(f"{'=' * 60}\n")
+
+
+def _results_to_jsonable(obj):
+    """Konvertiert run_analysis-Ergebnisse in JSON-serialisierbare Strukturen.
+
+    Entfernt rohe Punkt-/Konturen-Arrays (zu groß und nicht JSON-tauglich)
+    und wandelt NumPy-Skalare/-Arrays sowie Tuples in native Typen um.
+    """
+    if isinstance(obj, dict):
+        return {k: _results_to_jsonable(v) for k, v in obj.items()
+                if k not in ("contours", "all_points")}
+    if isinstance(obj, (list, tuple)):
+        return [_results_to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    return obj
 
 
 if __name__ == "__main__":
