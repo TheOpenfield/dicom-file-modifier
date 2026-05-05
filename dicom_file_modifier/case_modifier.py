@@ -161,6 +161,78 @@ def validate_for_consistency(ct_for_uid: str, rs_ds: pydicom.Dataset) -> None:
 # CT-Geometrie-Validierung (Stage 5)
 # ---------------------------------------------------------------------------
 
+def check_contour_clipping(
+    new_rs_ds: pydicom.Dataset,
+    geom: dict,
+    method: str,
+) -> list:
+    """
+    Pruef nach der Transformation, ob Konturpunkte ausserhalb des CT-Voxelgrids
+    liegen.  Liefert eine Liste ``[(roi_name, n_outside, n_total, frac), ...]``
+    der betroffenen ROIs.
+
+    Hintergrund:
+      - **resample**:  Output-CT-Grid behaelt das Original-Affine A.  Konturen
+        werden durch T verschoben; ein Punkt p_neu ist nur dann durch das CT
+        abgedeckt, wenn ``A^-1 . p_neu`` innerhalb [0, n-1] liegt.  Andernfalls
+        gibt es keine Bilddaten zur Kontur (im TPS sieht man die Struktur,
+        aber kein darunterliegendes Gewebe).
+      - **metadata**:  Output-Affine ist A_neu = T . A.  Da Punkte ebenfalls mit
+        T transformiert wurden, gilt ``A_neu^-1 . p_neu = A^-1 . p_orig``,
+        also stets im Bild.  Kein Clipping moeglich.
+
+    Wird vom Top-Level-Workflow mit ``method`` aus der Pipeline aufgerufen.
+    """
+    if method != "resample":
+        return []  # in metadata mode geometrisch unmoeglich
+    A_inv = np.linalg.inv(geom["affine"])
+    nz, ny, nx = geom["shape"]
+
+    name_map = {
+        int(r.ROINumber): str(r.ROIName)
+        for r in getattr(new_rs_ds, "StructureSetROISequence", [])
+    }
+
+    issues: list[tuple[str, int, int, float]] = []
+    if not hasattr(new_rs_ds, "ROIContourSequence"):
+        return issues
+
+    for rc in new_rs_ds.ROIContourSequence:
+        if not hasattr(rc, "ContourSequence"):
+            continue
+        roi_num = int(getattr(rc, "ReferencedROINumber", -1))
+        roi_name = name_map.get(roi_num, f"ROI#{roi_num}")
+        # Drehpunkt-Marker selbst muss nicht gepruft werden (1 Punkt am Zentrum)
+        if roi_name == "Drehpunkt":
+            continue
+
+        all_pts = []
+        for c in rc.ContourSequence:
+            if not hasattr(c, "ContourData"):
+                continue
+            pts = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
+            if pts.size:
+                all_pts.append(pts)
+        if not all_pts:
+            continue
+
+        pts = np.vstack(all_pts)
+        n_total = pts.shape[0]
+        homog = np.hstack([pts, np.ones((n_total, 1))])
+        vox = (A_inv @ homog.T).T[:, :3]
+
+        outside = (
+            (vox[:, 0] < 0) | (vox[:, 0] > nz - 1) |
+            (vox[:, 1] < 0) | (vox[:, 1] > ny - 1) |
+            (vox[:, 2] < 0) | (vox[:, 2] > nx - 1)
+        )
+        n_outside = int(outside.sum())
+        if n_outside > 0:
+            issues.append((roi_name, n_outside, n_total, n_outside / n_total))
+
+    return issues
+
+
 def _verify_rs_centroids(orig_ds: pydicom.Dataset,
                          new_rs_path: str,
                          T: np.ndarray) -> dict:
@@ -742,8 +814,19 @@ def run_case_transform(
         for_strategy = "keep"
         print(
             "  FoR-Strategie: KEEP (alte FoR wird beibehalten).\n"
-            "    Hinweis: Vorhandene RTPLAN/RTDOSE mit derselben FoR werden im\n"
-            "    TPS automatisch auch auf das transformierte CT ueberlagert."
+            "  ! WARNUNG ! ----------------------------------------------------------\n"
+            "    Beide Datensaetze (Original + transformiert) tragen DIESELBE\n"
+            "    FrameOfReferenceUID, obwohl sie sich physikalisch unterscheiden.\n"
+            "    Das TPS verlinkt sie automatisch ohne Geometrievalidierung.\n"
+            "    Folgen:\n"
+            "      - Vorhandene RTPLAN/RTDOSE des Originals werden auf das\n"
+            "        transformierte CT geworfen, obwohl sie geometrisch nicht\n"
+            "        mehr dazu passen.  Dosis-Overlays sind dann irrefuehrend.\n"
+            "      - Mischen von Konturen aus Original-RS und transformiertem RS\n"
+            "        in einem Plan ergibt klinisch falsche DVHs.\n"
+            "    Verwende --new-frame-of-reference fuer eine saubere Trennung,\n"
+            "    falls die Datensaetze unabhaengig voneinander geplant werden.\n"
+            "  ----------------------------------------------------------------------"
         )
 
     # ── 4. CT transformieren + speichern ─────────────────────────────────────
@@ -806,7 +889,25 @@ def run_case_transform(
     print(f"  Drehpunkt-Marker eingefuegt bei "
           f"({drehpunkt_pos[0]:.2f}, {drehpunkt_pos[1]:.2f}, {drehpunkt_pos[2]:.2f}) mm")
 
-    # ── 6. Optional: Verifikation der Centroid-Linearitaet ───────────────────
+    # ── 6a. Clipping-Check (nur resample-Mode) ───────────────────────────────
+    clipping_issues = check_contour_clipping(new_rs, geom, method)
+    if clipping_issues:
+        print("\n  ! CLIPPING-WARNUNG ! Konturpunkte ausserhalb des Output-CT-Grids:")
+        print(f"  {'ROI':<28} {'aussen':>8} {'gesamt':>8} {'Anteil':>8}")
+        for roi_name, n_out, n_total, frac in sorted(
+            clipping_issues, key=lambda x: -x[3]
+        ):
+            print(f"    {roi_name:<26} {n_out:>8} {n_total:>8} {frac:>7.1%}")
+        print(
+            "    Diese Strukturen ragen aus dem aufgenommenen Bildvolumen heraus.\n"
+            "    Im TPS sind die Konturen sichtbar, aber das CT zeigt dort -1000 HU\n"
+            "    (Luft) statt Anatomie.  DVH-Auswertungen werden 'kuenstlich besser'\n"
+            "    aussehen, weil Volumenanteile schlicht fehlen.\n"
+            "    Tipp: --method metadata vermeidet das (oblique Slices, exakte\n"
+            "    Geometrie), wird aber von manchen aelteren TPS abgelehnt."
+        )
+
+    # ── 6b. Optional: Verifikation der Centroid-Linearitaet ──────────────────
     verify_report: dict | None = None
     if verify:
         verify_report = _verify_rs_centroids(rs_ds, str(rs_out), T)
@@ -928,50 +1029,128 @@ def _resolve_center_from_args(
 
 def _run_self_test(args: argparse.Namespace) -> int:
     """
-    Identitaets-Transform end-to-end + Pruefung, dass alle ContourData-Werte
-    bis auf Float-Round-Trip-Rauschen mit dem Original uebereinstimmen.
+    Mehrstufiger Self-Test, der typische Bug-Spots abdeckt:
+
+      1. Identitaets-Transform   ->  ContourData byte-aequivalent zum Original.
+      2. Z-Rotation 15 deg       ->  alle Pruef-Metriken muessen identisch zum
+                                     Original sein (Z-Achse ist die Schicht-
+                                     normale, daher trivialerweise erhalten).
+      3. X-Rotation 5 deg        ->  Punktabstaende (nicht Volumina!) muessen
+                                     bis auf Float-Round-Trip exakt erhalten
+                                     bleiben - das ist die echte Rigid-Body-
+                                     Eigenschaft.
+
+    Ergebnis 0 = alle drei PASS, sonst 1.
     """
     import tempfile
+    from .analyzer import load_rtstruct, extract_contours, get_structure_names
 
-    print(f"\n--- Self-Test (Identitaets-Transform) auf '{args.case_dir}' ---")
-    with tempfile.TemporaryDirectory(prefix="case_modifier_selftest_") as tmp:
-        info = run_case_transform(
-            case_dir=args.case_dir,
-            output_dir=tmp,
-            tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
-            method="metadata",
-            label=args.label,
-            rs_override=args.rs_override,
-            new_frame_of_reference=False,
-            verify=True,
-        )
-        # Konturen Original vs. neu vergleichen
-        from .analyzer import (
-            load_rtstruct, extract_contours, get_structure_names,
-        )
-        _, rs_path = discover_case(args.case_dir, rs_override=args.rs_override)
-        orig = load_rtstruct(str(rs_path))
-        new  = load_rtstruct(info["rs_output_path"])
-        names_o = get_structure_names(orig)
+    _, rs_path = discover_case(args.case_dir, rs_override=args.rs_override)
+    orig = load_rtstruct(str(rs_path))
+    names = get_structure_names(orig)
 
-        max_dev = 0.0
-        worst   = None
-        for roi_num, roi_name in names_o.items():
-            c_o = extract_contours(orig, roi_num)
-            c_n = extract_contours(new, roi_num)
-            if not c_o or not c_n or len(c_o) != len(c_n):
+    print(f"\n--- Self-Test auf '{args.case_dir}' ---")
+
+    def _max_point_diff(orig_ds, new_ds) -> tuple[float, str]:
+        max_d = 0.0
+        worst = None
+        for roi_num, roi_name in names.items():
+            co = extract_contours(orig_ds, roi_num)
+            cn = extract_contours(new_ds, roi_num)
+            if not co or not cn or len(co) != len(cn):
                 continue
-            for a, b in zip(c_o, c_n):
+            for a, b in zip(co, cn):
                 if a.shape != b.shape:
                     continue
                 d = float(np.max(np.abs(a - b)))
-                if d > max_dev:
-                    max_dev = d
+                if d > max_d:
+                    max_d = d
                     worst = roi_name
-        print(f"  Max Konturpunkt-Abweichung: {max_dev:.3e} mm  (worst: {worst})")
-        passed = max_dev < 1e-4
-        print(f"  Ergebnis: {'PASS' if passed else 'FAIL'}")
-    return 0 if passed else 1
+        return max_d, worst
+
+    def _max_pairwise_distance_drift(orig_ds, new_ds, n_samples=200) -> float:
+        """
+        Rigid transforms preserve distances.  Wir samplen pro ROI bis zu n_samples
+        Punktepaare und vergleichen ||p_i - p_j|| zwischen Original und neu.
+        """
+        rng = np.random.default_rng(0)
+        max_drift = 0.0
+        for roi_num in names:
+            co = extract_contours(orig_ds, roi_num)
+            cn = extract_contours(new_ds, roi_num)
+            if not co or not cn:
+                continue
+            po = np.vstack(co)
+            pn = np.vstack(cn)
+            if po.shape != pn.shape or po.shape[0] < 2:
+                continue
+            n = po.shape[0]
+            k = min(n_samples, n)
+            idx = rng.choice(n, size=k, replace=False)
+            do = np.linalg.norm(po[idx][:, None] - po[idx][None, :], axis=-1)
+            dn = np.linalg.norm(pn[idx][:, None] - pn[idx][None, :], axis=-1)
+            max_drift = max(max_drift, float(np.max(np.abs(do - dn))))
+        return max_drift
+
+    overall_pass = True
+    with tempfile.TemporaryDirectory(prefix="case_modifier_selftest_") as tmp:
+        # Test 1: Identity
+        info = run_case_transform(
+            case_dir=args.case_dir, output_dir=tmp,
+            tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
+            method="metadata", label=args.label,
+            rs_override=args.rs_override,
+        )
+        new = load_rtstruct(info["rs_output_path"])
+        d1, w1 = _max_point_diff(orig, new)
+        ok1 = d1 < 1e-4
+        print(f"  [1/3] Identity round-trip:    "
+              f"max point dev {d1:.3e} mm  "
+              f"({'PASS' if ok1 else 'FAIL'}, worst: {w1})")
+        overall_pass &= ok1
+
+    with tempfile.TemporaryDirectory(prefix="case_modifier_selftest_") as tmp:
+        # Test 2: Z-Rotation
+        info = run_case_transform(
+            case_dir=args.case_dir, output_dir=tmp,
+            tx=0, ty=0, tz=0, rx=0, ry=0, rz=15,
+            method="metadata", label=args.label,
+            rs_override=args.rs_override,
+        )
+        new = load_rtstruct(info["rs_output_path"])
+        drift2 = _max_pairwise_distance_drift(orig, new)
+        ok2 = drift2 < 1e-3
+        print(f"  [2/3] Z-rotation 15 deg:      "
+              f"max distance drift {drift2:.3e} mm  "
+              f"({'PASS' if ok2 else 'FAIL'})")
+        overall_pass &= ok2
+
+    with tempfile.TemporaryDirectory(prefix="case_modifier_selftest_") as tmp:
+        # Test 3: X-Rotation (echter Rigid-Body-Test)
+        info = run_case_transform(
+            case_dir=args.case_dir, output_dir=tmp,
+            tx=0, ty=0, tz=0, rx=5, ry=0, rz=0,
+            method="metadata", label=args.label,
+            rs_override=args.rs_override,
+        )
+        new = load_rtstruct(info["rs_output_path"])
+        drift3 = _max_pairwise_distance_drift(orig, new)
+        ok3 = drift3 < 1e-3
+        print(f"  [3/3] X-rotation 5 deg:       "
+              f"max distance drift {drift3:.3e} mm  "
+              f"({'PASS' if ok3 else 'FAIL'})")
+        overall_pass &= ok3
+
+    print(f"\n  Gesamt: {'PASS' if overall_pass else 'FAIL'}")
+    print(
+        "\n  Hinweis: Punkte-zu-Punkte-Distanzen sind die definitive Rigid-Body-\n"
+        "  Eigenschaft (immer erhalten).  Die Volumina aus analyzer.py sind das\n"
+        "  NICHT - die planar-axiale Shoelace-Formel gibt bei Nicht-Z-Rotationen\n"
+        "  Abweichungen im Prozent-Bereich, weil Konturen schraeg zur Z-Achse\n"
+        "  liegen.  Das ist ein Mess-Artefakt der Volumenformel, kein Bug der\n"
+        "  Transformation."
+    )
+    return 0 if overall_pass else 1
 
 
 def main(argv: "list[str] | None" = None) -> int:

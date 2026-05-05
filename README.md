@@ -643,13 +643,39 @@ Before any data is written, the case modifier validates the input:
 
 Any failure terminates the run with exit code 2 before any output is written.
 
+## The `resample` vs `metadata` Trade-Off
+
+Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication that depends on which method is used. The contour points themselves are always transformed correctly by the same $\mathbf{T}$ as the CT — point-to-point distances are preserved exactly, which is the definitive rigid-body invariant. The trade-off is about how the transformed dataset is *represented*:
+
+**`--method metadata`:** the CT's `ImagePositionPatient`/`ImageOrientationPatient` are rotated by $\mathbf{R}$, so the slice planes themselves become tilted in patient space. The contour points (which were originally on axial slices at constant $z$) are also rotated; their new positions lie exactly on the new tilted slice planes. **The relative geometry between CT slices and RS contours is preserved exactly.** No clipping, no discretisation artefacts.
+- ✓ True rigid-body fidelity. Pure 3D mathematics, no resampling.
+- ✓ HU values byte-identical to the source.
+- ✗ Output IOP is no longer `[1,0,0,0,1,0]`. Older TPS versions and some PACS browsers reject oblique RTSTRUCT/CT. Modern Eclipse and RayStation handle it correctly.
+
+**`--method resample` (default):** the CT's voxel grid stays axial, and pixels are inverse-mapped from the source. The contour points are still rotated by $\mathbf{T}$ in 3D, which means **after a non-axial rotation, the contours are tilted polygons that no longer lie on the axial slice planes** of the new CT. DICOM RTSTRUCT is conventionally per-axial-slice, so this is technically off-spec. Two consequences:
+- *Clipping at the field-of-view boundaries.* Anatomy that rotates outside the (fixed) voxel grid is lost — output voxels there contain −1000 HU. Contour points in those regions still exist but reference air. The case modifier detects this automatically and prints a per-ROI warning at the end of the run.
+- *Volume measurements via the planar Shoelace + mean-Z-spacing formula are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure volume differences of up to a few percent for moderate non-Z rotations. This is a measurement artefact of the formula, not a transformation error.
+- *Z-only rotations are immune* to both effects, because $r_z$ leaves contour Z values unchanged and the contour stays planar in the original axial slice.
+
+**Practical guidance:**
+- Pure translations: both methods are equivalent in correctness; resample produces standard axial output.
+- Z-rotation only: both methods are exactly equivalent in geometric fidelity; resample is preferable for TPS compatibility.
+- X/Y rotation: prefer **metadata** for analytic correctness if your TPS accepts oblique CT/RS; otherwise accept the resample artefacts and verify on critical structures.
+
 ## Verification Modes
 
 Three orthogonal modes are provided to verify correctness:
 
-- **`--dry-run`** — runs all input validation, computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. No files are written. Useful as a clinical preview before committing to a long resample run.
-- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI centroids, and compares with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Centroids transform linearly under rigid motion, so a deviation greater than ~1e-4 mm indicates a bug in the transform pipeline (e.g., a `ContourData` reshape error). The maximum norm and the worst ROI are reported.
-- **`--self-test`** — runs an end-to-end identity transform (zero translation, zero rotation) on a temporary directory and asserts that every contour point in the new RS matches the original within 1e-4 mm. Returns exit code 0 on pass, 1 on fail. Suitable for CI / regression checks.
+- **`--dry-run`** — runs all input validation, computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. No files are written.
+- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI centroids, and compares with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Centroids transform linearly under rigid motion, so a deviation greater than ~1e-4 mm indicates a bug in the transform pipeline. The maximum norm and the worst ROI are reported.
+- **`--self-test`** — runs three independent checks on a temporary copy and reports PASS/FAIL each:
+  1. *Identity round-trip*: zero translation, zero rotation; every contour point matches the original within 1e-4 mm. Catches accidental side effects in the pipeline.
+  2. *Z-rotation pairwise distance drift* (15°): point-to-point distances within each ROI are preserved within 1e-3 mm. Validates the trivially-volume-preserving direction.
+  3. *X-rotation pairwise distance drift* (5°): same test on a non-axial rotation. This is the **definitive rigid-body check** — distances are coordinate-system-invariant and are preserved even when the planar Shoelace formula no longer yields invariant volumes.
+
+  Pairwise distances are the right invariant to check: they are preserved by every rigid transform regardless of orientation, whereas the analyzer's planar-axial volume formula is not (see *resample vs metadata trade-off* above).
+
+The case modifier additionally runs an automatic **clipping check** after every real transformation in resample mode: it counts how many transformed contour points fall outside the output voxel grid, prints a per-ROI table sorted by severity, and recommends `--method metadata` when clipping is observed. In metadata mode the check is geometrically void (the slice grid rotates with the contours) and is skipped.
 
 ## Numerical Verification on the Reference Dataset
 
@@ -658,13 +684,14 @@ On the bundled `data/0000000171/` case (320 CT slices, 65 ROIs, 21 POINT markers
 | Test | Result | Tolerance |
 |---|---|---|
 | Identity round-trip — max contour-point deviation | 5 × 10⁻⁷ mm | < 1 × 10⁻⁴ mm |
+| Z-rotation 15° — max pairwise distance drift | < 1 × 10⁻⁶ mm | < 1 × 10⁻³ mm |
+| X-rotation 5° — max pairwise distance drift | 1.3 × 10⁻⁶ mm | < 1 × 10⁻³ mm |
 | Centroid linearity under non-trivial $\mathbf{T}$ | < 7 × 10⁻⁷ mm (worst ROI) | < 1 × 10⁻³ mm |
-| Volume preservation across 44 ROIs | 0.0000 % deviation | < 0.01 % |
 | Marker fixpoint (rotation about itself) | 0 mm | < 1 × 10⁻⁶ mm |
 | Drehpunkt position | exact | — |
 | FoR consistency CT ↔ RS (both modes) | preserved | — |
 
-The numerical floor (~1e-7 mm) is set by the float-to-six-decimal-string round trip in `ContourData`, not by the transform mathematics.
+The numerical floor (~1e-7…1e-6 mm) is set by the float-to-six-decimal-string round trip in `ContourData`, not by the transform mathematics. Note that **volume preservation as measured by the planar-axial Shoelace formula is *not* a tolerance to claim** — it holds exactly only for Z-rotations and translations; for X/Y rotations the formula's measurement error is an O(1%) artefact of the per-slice convention, not a transformation error.
 
 ## Limitations and Out-of-Scope
 
@@ -672,6 +699,7 @@ The numerical floor (~1e-7 mm) is set by the float-to-six-decimal-string round t
 - **Non-axial CT input is rejected** at the geometry-validation stage. Tilted or step-and-shoot acquisitions need to be re-sampled to standard axial first.
 - **Single RTSTRUCT per case.** When multiple `RS*.dcm` files are present, the user must select one with `--rs`.
 - **No dose recomputation.** The transformed CT can be re-imported into a TPS for fresh dose calculation, but no dose is recomputed in this tool.
+- **No re-projection of tilted contours onto axial slices in resample mode.** A semantically clean solution for X/Y rotations under resample would extract a 3D mesh from the original axial contours, rotate the mesh, and slice it with the new axial planes. This is not implemented; metadata mode is the recommended path when contour-on-axial-slice fidelity matters.
 
 ---
 
