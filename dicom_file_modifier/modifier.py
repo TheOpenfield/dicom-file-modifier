@@ -14,9 +14,11 @@ Zwei Methoden:
               Einschränkung: Manche Planungssysteme lehnen schräge IOP ab.
 
 Rotationskonvention:
-  Extrinsisch XYZ – erst rx um feste X-Achse, dann ry um feste Y-Achse,
-  dann rz um feste Z-Achse (DICOM-Patientenkoordinaten: X=links, Y=posterior,
-  Z=superior).  Rotationszentrum = geometrischer Mittelpunkt des Volumens.
+  Intrinsisch XYZ – erst rx um die X-Achse, dann ry um die mitgedrehte
+  Y-Achse, dann rz um die resultierende Z-Achse (SciPy-Großbuchstaben-
+  Konvention; dieselbe Matrix wie eine extrinsische ZYX-Rotation um die
+  festen DICOM-Patientenachsen: X=links, Y=posterior, Z=superior).
+  Rotationszentrum = geometrischer Mittelpunkt des Volumens.
 
 Verwendung:
   python -m dicom_file_modifier.modifier <CT-Verzeichnis> [Optionen]
@@ -146,7 +148,7 @@ def build_rigid_transform(
     Erstellt eine 4×4 starre Transformationsmatrix.
 
     Reihenfolge:
-      1. Rotation extrinsisch XYZ um das Volumenzentrum
+      1. Rotation intrinsisch XYZ (SciPy "XYZ") um das Volumenzentrum
       2. Translation
 
     Vorwärts-Transform (Original → Neu):
@@ -559,7 +561,7 @@ def main() -> None:
     grp_t.add_argument("--tz", type=float, default=0.0, metavar="mm",
                        help="Verschiebung in Z-Richtung (Superior+)")
 
-    grp_r = parser.add_argument_group("Rotation [°]  –  extrinsisch XYZ um Volumenmitte")
+    grp_r = parser.add_argument_group("Rotation [°]  –  intrinsisch XYZ um Volumenmitte")
     grp_r.add_argument("--rx", type=float, default=0.0, metavar="deg",
                        help="Rotation um X-Achse (Pitch)")
     grp_r.add_argument("--ry", type=float, default=0.0, metavar="deg",
@@ -612,7 +614,7 @@ def main() -> None:
     # ── Transformationsmatrix ───────────────────────────────────────────────
     print(f"\nTransformation:")
     print(f"  Translation  : tx={args.tx} mm,  ty={args.ty} mm,  tz={args.tz} mm")
-    print(f"  Rotation     : rx={args.rx}°,  ry={args.ry}°,  rz={args.rz}°  [extrinsisch XYZ]")
+    print(f"  Rotation     : rx={args.rx}°,  ry={args.ry}°,  rz={args.rz}°  [intrinsisch XYZ]")
     print(f"  Methode      : {args.method}")
 
     T = build_rigid_transform(

@@ -13,7 +13,7 @@ Eingabe ist ein Patienten-/Case-Ordner mit fester Struktur
         [optional] RD*.dcm        (RTDOSE  -- wird NICHT mit-transformiert)
 
 Auf diesen Datensatz wird dieselbe rigide Transformation T (Translation
-+ extrinsische XYZ-Euler-Rotation) angewendet, die ``modifier.py`` bereits
++ intrinsische XYZ-Euler-Rotation, SciPy "XYZ") angewendet, die ``modifier.py`` bereits
 fuer das CT bereitstellt.
 
 Stufenweise Implementierung:
@@ -779,7 +779,7 @@ def run_case_transform(
 
     print(f"\nTransformation:")
     print(f"  Translation : tx={tx} mm, ty={ty} mm, tz={tz} mm")
-    print(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [extrinsisch XYZ]")
+    print(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [intrinsisch XYZ]")
     print(f"  Methode     : {method}")
     print(f"  Zentrum     : {resolved_label}  "
           f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
@@ -962,7 +962,7 @@ def _build_parser() -> argparse.ArgumentParser:
     grp_t.add_argument("--ty", type=float, default=0.0, metavar="mm")
     grp_t.add_argument("--tz", type=float, default=0.0, metavar="mm")
 
-    grp_r = p.add_argument_group("Rotation [deg]  -  extrinsisch XYZ um Volumenmitte")
+    grp_r = p.add_argument_group("Rotation [deg]  -  intrinsisch XYZ um Volumenmitte")
     grp_r.add_argument("--rx", type=float, default=0.0, metavar="deg")
     grp_r.add_argument("--ry", type=float, default=0.0, metavar="deg")
     grp_r.add_argument("--rz", type=float, default=0.0, metavar="deg")

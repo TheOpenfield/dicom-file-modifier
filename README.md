@@ -90,7 +90,7 @@ This produces:
 | Option | Default | Description |
 |---|---|---|
 | `--tx/ty/tz` | 0 mm | Translation along X / Y / Z axis |
-| `--rx/ry/rz` | 0 ° | Rotation around X / Y / Z axis (extrinsic) |
+| `--rx/ry/rz` | 0 ° | Rotation around X / Y / Z axis (intrinsic XYZ Euler) |
 | `--method` | `resample` | `resample`: standard axial output; `metadata`: exact HU preservation |
 | `--order` | `1` | Interpolation order: 0 = nearest neighbour, 1 = linear, 3 = cubic |
 | `--output` | `output/ct_transformed` | Output directory |
@@ -123,7 +123,7 @@ This produces `output/run1/<case-id>_RB/`:
 | Option | Default | Description |
 |---|---|---|
 | `--tx/ty/tz` | 0 mm | Translation along X / Y / Z axis (LPS) |
-| `--rx/ry/rz` | 0 ° | Rotation around X / Y / Z axis (extrinsic XYZ Euler) |
+| `--rx/ry/rz` | 0 ° | Rotation around X / Y / Z axis (intrinsic XYZ Euler) |
 | `--method` | `resample` | Same as modifier: `resample` (default) or `metadata` |
 | `--order` | `1` | Interpolation order (resample only): 0/1/3 |
 | `--center` | *(prompt)* | Rotation centre. `volume`, `marker:NAME`, or `x,y,z` (LPS, mm) |
@@ -312,7 +312,7 @@ Large structures can comprise tens of thousands of contour points. To perform di
 1. **ICRU Report 50** (1993). *Prescribing, Recording, and Reporting Photon Beam Therapy.*
 2. **ICRU Report 62** (1999). *Prescribing, Recording and Reporting Photon Beam Therapy (Supplement to ICRU Report 50).*
 3. **ICRU Report 83** (2010). *Prescribing, Recording, and Reporting Photon-Beam Intensity-Modulated Radiation Therapy (IMRT).*
-4. **DICOM Standard**, Part 3, Section C.8.8.6 – *RT Structure Set Module.* [dicom.nema.org](https://www.dicomstandard.org/)
+4. **DICOM Standard**, Part 3, Section C.8.8.5 – *Structure Set Module* (and C.8.8.6 – *ROI Contour Module*). [dicomstandard.org](https://www.dicomstandard.org/)
 5. Huttenlocher, D. P., Klanderman, G. A., & Rucklidge, W. J. (1993). *Comparing images using the Hausdorff distance.* IEEE Transactions on Pattern Analysis and Machine Intelligence, 15(9), 850–863.
 6. **DICOM Standard**, Part 3, Sections C.7.6.2, C.7.6.3 – *Image Plane Module, Image Pixel Module.*
 7. Lehmann, T. M., Gönner, C., & Spitzer, K. (1999). *Survey: Interpolation methods in medical image processing.* IEEE Transactions on Medical Imaging, 18(11), 1049–1075.
@@ -371,7 +371,7 @@ Stored integer pixel values are converted to Hounsfield Units via a linear mappi
 
 $$\text{HU} = \text{stored} \times \text{RescaleSlope} + \text{RescaleIntercept}$$
 
-For modern CT scanners the slope is typically 1 and the intercept −1024, placing air at −1024 HU and water at 0 HU. The full diagnostic CT range spans approximately −1024 HU (air) to +3071 HU (dense bone / metal).
+For modern CT scanners the slope is typically 1 and the intercept −1024, so that water maps to 0 HU and air to roughly −1000 HU (by definition), with −1024 HU being the lowest representable value. The full diagnostic CT range spans approximately −1024 HU to +3071 HU (dense bone / metal) — the 4096 levels of a 12-bit acquisition.
 
 ## Rigid Body Transformation
 
@@ -387,17 +387,17 @@ $$\mathbf{T} = \begin{pmatrix} \mathbf{R} & \mathbf{t} \\ \mathbf{0}^T & 1 \end{
 
 ### Rotation Matrix Construction
 
-The rotation matrix is constructed from three rotation angles using **extrinsic Euler angles in XYZ order**: the patient is first rotated by $r_x$ around the fixed X axis, then by $r_y$ around the fixed Y axis, and finally by $r_z$ around the fixed Z axis. The combined rotation matrix is:
+The rotation matrix is constructed from three rotation angles using **intrinsic Euler angles in XYZ order** (SciPy's uppercase convention): each successive rotation acts about the axes of the already-rotated, body-fixed frame — first by $r_x$ about the X axis, then by $r_y$ about the new Y axis, then by $r_z$ about the resulting Z axis. The combined rotation matrix is:
 
-$$\mathbf{R} = \mathbf{R}_z(r_z)\,\mathbf{R}_y(r_y)\,\mathbf{R}_x(r_x)$$
+$$\mathbf{R} = \mathbf{R}_x(r_x)\,\mathbf{R}_y(r_y)\,\mathbf{R}_z(r_z)$$
 
 with the elementary rotation matrices:
 
 $$\mathbf{R}_x(\alpha) = \begin{pmatrix} 1 & 0 & 0 \\ 0 & \cos\alpha & -\sin\alpha \\ 0 & \sin\alpha & \cos\alpha \end{pmatrix}, \quad \mathbf{R}_y(\beta) = \begin{pmatrix} \cos\beta & 0 & \sin\beta \\ 0 & 1 & 0 \\ -\sin\beta & 0 & \cos\beta \end{pmatrix}, \quad \mathbf{R}_z(\gamma) = \begin{pmatrix} \cos\gamma & -\sin\gamma & 0 \\ \sin\gamma & \cos\gamma & 0 \\ 0 & 0 & 1 \end{pmatrix}$$
 
-Extrinsic rotation around fixed world axes is used in preference to intrinsic (body-fixed) rotation because it is more intuitive in the clinical setting: $r_z$ always corresponds to a rotation in the axial plane regardless of the other angles applied.
+Equivalently, this is the same rotation matrix as an *extrinsic* ZYX rotation about the fixed patient axes. For a single non-zero angle the intrinsic and extrinsic conventions coincide; they differ only when two or more rotation angles are applied simultaneously.
 
-The implementation uses `scipy.spatial.transform.Rotation.from_euler("XYZ", ...)` where uppercase letters indicate extrinsic convention.
+The implementation uses `scipy.spatial.transform.Rotation.from_euler("XYZ", ...)`, where in SciPy **uppercase letters indicate the intrinsic convention** (lowercase letters would select extrinsic).
 
 ### Rotation Centre
 
@@ -518,7 +518,7 @@ Two surfaces are extracted:
 - **Body surface**: threshold −300 HU, separating soft tissue from air
 - **Bone surface**: threshold +400 HU, isolating cortical bone
 
-A **downsampling factor of 2** is applied before running Marching Cubes (every second voxel in each direction) to reduce computation time and triangle count. This halves the spatial resolution of the surface mesh but has no effect on the underlying DICOM data.
+A **downsampling factor of 2** is applied before running Marching Cubes on the body surface (every second voxel in each direction) to reduce computation time and triangle count; the bone surface uses a factor of 3. This lowers the spatial resolution of the surface mesh but has no effect on the underlying DICOM data.
 
 ### Coordinate Conversion
 
@@ -546,7 +546,7 @@ The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-s
 
 ## Literature
 
-6. **DICOM Standard**, Part 3, Sections C.7.6.2, C.7.6.3 – *Image Plane Module, Image Pixel Module.* [dicom.nema.org](https://www.dicomstandard.org/)
+6. **DICOM Standard**, Part 3, Sections C.7.6.2, C.7.6.3 – *Image Plane Module, Image Pixel Module.* [dicomstandard.org](https://www.dicomstandard.org/)
 7. Lehmann, T. M., Gönner, C., & Spitzer, K. (1999). *Survey: Interpolation methods in medical image processing.* IEEE Transactions on Medical Imaging, 18(11), 1049–1075.
 8. Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm.* ACM SIGGRAPH Computer Graphics, 21(4), 163–169.
 9. Thévenaz, P., Blu, T., & Unser, M. (2000). *Interpolation revisited.* IEEE Transactions on Medical Imaging, 19(7), 739–758.
@@ -739,7 +739,7 @@ Plotting all three shape metrics (sphericity, compactness, elongation) in a sing
 - **Only Target–OAR pairs** are shown. Target–Target and OAR–OAR distances are less clinically meaningful for plan optimisation; they can always be retrieved from `statistics.txt`.
 - **Sorted ascending by minimum distance**: the most critical proximity relationships appear on the left.
 - **Cap at 25 pairs**: prevents figure overflow. With 65 structures, all pairwise combinations produce over 2000 entries — a bar chart of that size is unreadable (198,660 × 600 px) and clinically useless.
-- **5 mm threshold line**: AAPM TG-218 and most institutional protocols flag structures within 5 mm of a Target boundary as requiring explicit dose–volume constraint review. This line immediately highlights which OARs fall into the critical zone.
+- **5 mm threshold line**: most institutional planning protocols flag structures within ~5 mm of a Target boundary as requiring explicit dose–volume constraint review. This line immediately highlights which OARs fall into the critical zone.
 
 **Three distance types** are shown simultaneously per pair:
 - *Minimum distance*: the closest point between two contour surfaces; 0 mm means overlap.
@@ -776,5 +776,5 @@ The plots are designed to remain readable up to approximately 30 structures. Abo
 
 ## Literature
 
-11. **AAPM Task Group 218** (2021). *Tolerance limits and methodologies for IMRT measurement-based verification QA.* Medical Physics, 48(10).
+11. **AAPM Task Group 218** (2018). *Tolerance limits and methodologies for IMRT measurement-based verification QA: Recommendations of AAPM Task Group No. 218.* Medical Physics, 45(4), e53–e83.
 12. Taha, A. A., & Hanbury, A. (2015). *Metrics for evaluating 3D medical image segmentation: analysis, selection, and tool.* BMC Medical Imaging, 15(1), 29.
