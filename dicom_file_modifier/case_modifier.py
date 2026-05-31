@@ -726,6 +726,8 @@ def run_case_transform(
     series_number_offset: int = 1000,
     dry_run: bool = False,
     verify: bool = False,
+    no_viz: bool = False,
+    viz_ct_surface: bool = False,
 ) -> dict:
     """
     Stage-1-Implementierung: CT transformieren, RS unveraendert kopieren.
@@ -912,6 +914,30 @@ def run_case_transform(
     if verify:
         verify_report = _verify_rs_centroids(rs_ds, str(rs_out), T)
 
+    # ── 6c. Vorher/Nachher-Visualisierung ────────────────────────────────────
+    # Vergleicht Original-RS (rs_ds) mit transformiertem RS (new_rs) und blendet
+    # Rotationszentrum + POINT-Marker ein.  Fehler hier duerfen den bereits
+    # geschriebenen Transform nicht entwerten -> defensiv abgefangen.
+    if not no_viz:
+        try:
+            from . import visualizer as viz
+            viz.run_case_visualization(
+                orig_ds=rs_ds,
+                new_ds=new_rs,
+                center=center,
+                drehpunkt_pos=drehpunkt_pos,
+                translation=(tx, ty, tz),
+                T=T,
+                output_dir=case_out,
+                markers=find_point_markers(rs_ds),
+                geom=geom,
+                volume_hu=volume_hu,
+                ct_surface=viz_ct_surface,
+            )
+        except Exception as e:
+            print(f"\n  Hinweis: Visualisierung fehlgeschlagen ({e}). "
+                  "Transform-Dateien sind dennoch gueltig geschrieben.")
+
     print("\nFertig.")
     return {
         "case_id":         case_id,
@@ -987,6 +1013,16 @@ def _build_parser() -> argparse.ArgumentParser:
                        help=("Neue FrameOfReferenceUID fuer transformiertes CT+RS "
                              "vergeben (verhindert versehentliche Ueberlagerung mit "
                              "alten Plaenen/Dosen).  Default: alte FoR beibehalten."))
+
+    grp_viz = p.add_argument_group("Visualisierung")
+    grp_viz.add_argument("--no-viz", action="store_true",
+                         help="Keine Vorher/Nachher-Plots erzeugen "
+                              "(transform_3d.html / transform_overview.png / "
+                              "displacement.png).")
+    grp_viz.add_argument("--viz-ct-surface", action="store_true",
+                         help="Im 3D-HTML zusaetzlich die CT-Koerperoberflaeche "
+                              "extrahieren (Marching Cubes, rechenintensiv; "
+                              "Default: aus).")
 
     grp_v = p.add_argument_group("Validierung")
     grp_v.add_argument("--dry-run", action="store_true",
@@ -1100,6 +1136,7 @@ def _run_self_test(args: argparse.Namespace) -> int:
             tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
             method="metadata", label=args.label,
             rs_override=args.rs_override,
+            no_viz=True,
         )
         new = load_rtstruct(info["rs_output_path"])
         d1, w1 = _max_point_diff(orig, new)
@@ -1116,6 +1153,7 @@ def _run_self_test(args: argparse.Namespace) -> int:
             tx=0, ty=0, tz=0, rx=0, ry=0, rz=15,
             method="metadata", label=args.label,
             rs_override=args.rs_override,
+            no_viz=True,
         )
         new = load_rtstruct(info["rs_output_path"])
         drift2 = _max_pairwise_distance_drift(orig, new)
@@ -1132,6 +1170,7 @@ def _run_self_test(args: argparse.Namespace) -> int:
             tx=0, ty=0, tz=0, rx=5, ry=0, rz=0,
             method="metadata", label=args.label,
             rs_override=args.rs_override,
+            no_viz=True,
         )
         new = load_rtstruct(info["rs_output_path"])
         drift3 = _max_pairwise_distance_drift(orig, new)
@@ -1205,6 +1244,8 @@ def main(argv: "list[str] | None" = None) -> int:
             new_frame_of_reference=args.new_frame_of_reference,
             dry_run=args.dry_run,
             verify=args.verify,
+            no_viz=args.no_viz,
+            viz_ct_surface=args.viz_ct_surface,
         )
     except (FileNotFoundError, ValueError, KeyError) as e:
         print(f"\nFehler: {e}", file=sys.stderr)

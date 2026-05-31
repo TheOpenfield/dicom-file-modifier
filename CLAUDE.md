@@ -42,7 +42,7 @@ python -m dicom_file_modifier.case_modifier data/0000000171 --self-test
 
 Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `resample`; `metadata` keeps pixel data byte-identical and only rewrites IPP/IOP), `--order {0,1,3}` (interpolation order; 0 preserves exact discrete HU values), `--no-viz` to skip the Plotly HTML output.
 
-`case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`.
+`case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
 There is no test suite, lint config, or build step in this repo.
 
@@ -77,10 +77,14 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
 6. Aria-visible metadata: `StructureSetLabel` truncated to DICOM SH (16 chars) with the suffix preserved; `StructureSetDescription` carries the full transform string (LO, 64 chars) via `build_transform_description`; `SeriesDescription` mirrors the CT's; `SeriesNumber += 1000` so the transformed series sorts adjacent to but distinct from the original.
 7. `--self-test` runs an identity transform end-to-end and asserts that all `ContourData` values match the input within 1e-4 mm. `--verify` after a real run computes per-ROI centroids and compares with `T @ centroid_orig` (centroids are linear under rigid transforms). `--dry-run` validates inputs and prints `T` + planned output paths without writing.
 
+After a real (non-`--dry-run`) write, unless `--no-viz` is given, it calls `visualizer.run_case_visualization` with the in-memory original + transformed RS, `T`, the rotation centre, the `Drehpunkt` position, and the POINT-marker list, writing the three before/after plots into the case output dir. The call is wrapped in a try/except so a visualisation failure never invalidates the already-written transform.
+
 Default FoR behaviour is **keep** (original FoR is preserved on transformed CT+RS), with a runtime warning that legacy plans/doses sharing the FoR will be auto-overlaid by Aria. Use `--new-frame-of-reference` to mint a fresh FoR when this is undesired.
 
 ### `visualizer.py` — plots and statistics
 Takes either an analysis-results dict (from `analyzer.run_analysis`) or, via its CLI, runs the analyzer first and then renders. Outputs are written into `output/`: `volumes.png`, `shape_metrics.png`, `distances.png` (top-25 most-critical Target↔OAR pairs), `centroids_3d.png`, and `statistics.txt`. The CLI accepts the same `--targets`/`--oars` filters as the analyzer for selecting which ROIs to include.
+
+This module also hosts the **case-transform visualisation** used by `case_modifier` (it has no CLI of its own). `run_case_visualization(orig_ds, new_ds, center, drehpunkt_pos, translation, T, output_dir, markers=…, geom=…, volume_hu=…, ct_surface=…)` compares the original RTSTRUCT to the transformed one and emits: `transform_3d.html` (interactive Plotly — original vs transformed contour point clouds, with the rotation centre/`Drehpunkt`, translation vector, POINT markers, axis triad, and an opt-in CT body surface all as independently legend-toggleable traces), `transform_overview.png` (static tri-planar axial/coronal/sagittal before/after), and `displacement.png` (per-ROI centroid displacement `‖T(c)−c‖` vs the `‖t‖` reference line). It works from contour points alone — no CT pixels needed unless `ct_surface=True`, which calls `modifier._extract_surface`. `_structure_pointclouds` skips POINT-type contours so markers/`Drehpunkt` don't pollute the structure clouds.
 
 ## Notes for editing
 

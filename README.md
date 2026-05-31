@@ -117,6 +117,11 @@ python -m dicom_file_modifier.case_modifier data/0000000171 \
 This produces `output/run1/<case-id>_RB/`:
 - `CT/CT_0000.dcm … CT_NNNN.dcm` — transformed CT series (new `SeriesInstanceUID` and per-slice `SOPInstanceUID`s)
 - `RS_RB.dcm` — transformed RTSTRUCT (every `ContourData` triple multiplied by `T`, all SOP/Series UID references rewritten to point at the new CT, plus a synthetic `Drehpunkt` POINT-ROI inserted at the rotation centre)
+- `transform_3d.html` — interactive 3D before/after comparison of the contour geometry (see [Case Transform Visualisation](#case-transform-visualisation))
+- `transform_overview.png` — static tri-planar (axial / coronal / sagittal) before/after projection
+- `displacement.png` — per-ROI centroid displacement bar chart
+
+Visualisation is on by default; pass `--no-viz` to skip it (e.g., for batch/CI runs), or `--viz-ct-surface` to additionally extract the CT body surface into the 3D view.
 
 **All CLI options:**
 
@@ -135,6 +140,8 @@ This produces `output/run1/<case-id>_RB/`:
 | `--dry-run` | off | Validate inputs and print plan; write nothing |
 | `--verify` | off | After write: re-read RS and check centroid linearity per ROI |
 | `--self-test` | off | End-to-end identity-transform test; exit 0 = pass |
+| `--no-viz` | off | Skip the before/after visualisation plots |
+| `--viz-ct-surface` | off | Also extract the CT body surface (marching cubes) into `transform_3d.html` |
 | `--output` | `output` | Base output directory |
 
 **Aria/TPS-visible metadata.** The transformed series carries identifying information in the human-readable DICOM tags so a planner can spot it at a glance:
@@ -750,7 +757,7 @@ Plotting all three shape metrics (sphericity, compactness, elongation) in a sing
 
 **Chart type:** 3D scatter plot using matplotlib's mpl_toolkits.mplot3d.
 
-All structure centroids are plotted in the DICOM patient coordinate system (X=left, Y=posterior, Z=superior). Marker size scales with the square root of structure volume, so large structures are visually prominent without dominating. Targets use filled circles, OARs use triangles.
+All structure centroids are plotted in the DICOM patient coordinate system (X=left, Y=posterior, Z=superior). Marker size scales with the square root of structure volume, so large structures are visually prominent without dominating. Targets use filled circles, OARs use triangles. The 3D box aspect ratio is set proportional to the data extent in each axis, so equal millimetre distances render as equal lengths and the spatial layout is not distorted.
 
 **Clinical relevance:** This plot answers the question "where is everything relative to everything else?" at a glance. It is particularly useful for multi-metastasis cases (e.g., the example dataset has 7 brain metastases): one can verify that all GTV/PTV pairs are spatially co-located and that the OARs (brainstem, optic chiasm, cochleae) are in the expected positions.
 
@@ -759,6 +766,36 @@ All structure centroids are plotted in the DICOM patient coordinate system (X=le
 ### 5. `statistics.txt` – Numerical Summary
 
 A structured plain-text file with per-structure details (volume, centroid, bounding box, all three shape metrics) and aggregated distance statistics (mean, std, min, max for each distance type, plus a full pairwise table). Suitable for copy-paste into clinical reports or further spreadsheet analysis.
+
+## Case Transform Visualisation
+
+When `case_modifier` applies a rigid transform to a CT + RTSTRUCT pair, it calls `visualizer.run_case_visualization` to produce a *before/after* comparison of the contour geometry. These plots need only the contour points of the original and transformed RTSTRUCT — no CT pixel data — so they are cheap to generate in both `resample` and `metadata` modes. The (expensive) CT body surface is opt-in via `--viz-ct-surface`.
+
+### A. `transform_3d.html` – Interactive Before/After
+
+**Chart type:** Plotly `Scatter3d` point clouds plus marker/axis overlays.
+
+The original contour points (grey-blue) and transformed contour points (red) are drawn in the same DICOM patient coordinate system, so the displacement and any rotation are directly visible. Every layer is an **independently toggleable legend entry**, which is the natural place to switch the reference geometry on and off:
+
+- **Konturen (Original)** / **Konturen (Transformiert)** — the two point clouds.
+- **Drehpunkt / Rotationszentrum** + **Translationsvektor** — the chosen rotation centre and a dashed line to its post-transform position `c + t`.
+- **POINT-Marker (Original)** / **POINT-Marker (Transformiert)** — every POINT-type ROI, with names, original and `T`-mapped (off by default).
+- **DICOM-Achsen** — an L/P/S triad at the rotation centre (off by default).
+- **CT-Koerperoberflaeche** — only present with `--viz-ct-surface`; hidden until toggled.
+
+The scene uses `aspectmode='data'` so 1 mm is the same on-screen length in X, Y, and Z. Point clouds are deterministically sub-sampled (≈ 9000 points per layer) so the file stays responsive even with dozens of ROIs.
+
+### B. `transform_overview.png` – Static Tri-Planar Projection
+
+**Chart type:** Three orthographic 2D scatter panels (axial X-Y, coronal X-Z, sagittal Y-Z).
+
+A headless, report/CI-friendly companion to the HTML. Each panel overlays the original (grey) and transformed (red) contour points with equal aspect, marks the rotation centre (green star), draws the translation vector as an arrow, and shows the POINT markers. A pure translation appears as a uniform shift; a rotation shows up as a visibly tilted/rotated red cloud relative to the grey one.
+
+### C. `displacement.png` – Per-ROI Centroid Displacement
+
+**Chart type:** Horizontal bar chart, sorted descending, limited to the 40 most-displaced ROIs.
+
+For each ROI the centroid displacement `‖T(c) − c‖` is plotted, with a dashed reference line at the pure-translation magnitude `‖t‖`. Because a rotation about the chosen centre leaves that centre fixed, structures near the rotation centre move by ≈ `‖t‖`, while structures far from it move more (the rotational lever arm). This makes it a quick QA check: an unexpectedly large displacement flags a structure that swings a long way under the requested rotation.
 
 ## Implementation Notes
 
