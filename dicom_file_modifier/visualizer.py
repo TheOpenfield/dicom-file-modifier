@@ -37,7 +37,11 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-from dicom_file_modifier.analyzer import run_analysis, get_structure_names
+from dicom_file_modifier.analyzer import (
+    run_analysis, get_structure_names,
+    CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL, CAT_HELPER,
+    CATEGORY_ORDER,
+)
 
 
 # Farben
@@ -53,6 +57,39 @@ COLOR_TRANS  = "#C0392B"   # Rot fuer transformierte Geometrie
 COLOR_CENTER = "#27AE60"   # Gruen fuer das Rotationszentrum (Drehpunkt)
 COLOR_MARKER = "#F39C12"   # Orange fuer POINT-Marker
 
+# Einheitliche Kategorie-Farben/-Beschriftungen fuer ALLE Einzel-RTSTRUCT-Plots
+CATEGORY_COLORS = {
+    CAT_TARGET:       "#2471A3",   # Blau   – Zielvolumina (GTV/PTV)
+    CAT_OAR_SERIAL:   "#C0392B",   # Rot    – serielle OARs (max-dosis-kritisch)
+    CAT_OAR_PARALLEL: "#E67E22",   # Orange – parallele OARs (Volumeneffekt)
+    CAT_HELPER:       "#7F8C8D",   # Grau   – Hilfs-/Planungsstrukturen
+}
+CATEGORY_LABELS = {
+    CAT_TARGET:       "Zielvolumen (GTV/PTV)",
+    CAT_OAR_SERIAL:   "OAR seriell",
+    CAT_OAR_PARALLEL: "OAR parallel",
+    CAT_HELPER:       "Hilfs-/Planungsstruktur",
+}
+
+
+def _iter_structures(results: dict):
+    """Alle ausgewerteten Strukturen (Targets, OARs, Helpers) als (name, s)."""
+    for bucket in ("targets", "oars", "helpers"):
+        for name, s in results.get(bucket, {}).items():
+            yield name, s
+
+
+def _category_sort_key(s: dict):
+    """Sortierschlüssel: Kategorie-Reihenfolge, dann (für Targets) Läsion."""
+    cat = s.get("category", CAT_HELPER)
+    ci = CATEGORY_ORDER.index(cat) if cat in CATEGORY_ORDER else len(CATEGORY_ORDER)
+    if cat == CAT_TARGET:
+        # GTV vor PTV innerhalb derselben Läsion
+        key = s.get("lesion_key") or s["name"]
+        prefix = 0 if s["name"].upper().startswith("GTV") else 1
+        return (ci, key, prefix)
+    return (ci, -s.get("volume_cm3", 0.0), s["name"])
+
 
 # ---------------------------------------------------------------------------
 # Plot 1: Volumen-Balkendiagramm
@@ -60,51 +97,60 @@ COLOR_MARKER = "#F39C12"   # Orange fuer POINT-Marker
 
 def plot_volumes(results: dict, output_dir: Path) -> None:
     """
-    Horizontales Balkendiagramm aller Strukturvolumen.
-    Targets blau, OARs rot. Sortiert nach Volumen (absteigend).
-    Sinnvoller als ein Histogramm, wenn < 20 Strukturen vorliegen.
+    Horizontales Balkendiagramm aller Strukturvolumen auf LOG-Skala,
+    farbcodiert nach Kategorie und nach Kategorie gruppiert (Targets als
+    GTV/PTV-Paare benachbart, dann serielle/parallele OARs, dann – schraffiert
+    und abgesetzt – Hilfsstrukturen). Eine lineare Skala würde die kleinen
+    SRS-Targets (0.03 cm³) neben dem Ganzhirn (>1000 cm³) unsichtbar machen.
     """
-    names, volumes, colors = [], [], []
-
-    for name, s in results["targets"].items():
-        names.append(name)
-        volumes.append(s["volume_cm3"])
-        colors.append(COLOR_TARGET)
-
-    for name, s in results["oars"].items():
-        names.append(name)
-        volumes.append(s["volume_cm3"])
-        colors.append(COLOR_OAR)
-
-    if not names:
+    rows = [(name, s) for name, s in _iter_structures(results)
+            if s.get("volume_cm3", 0) > 0]
+    if not rows:
         return
+    rows.sort(key=lambda r: _category_sort_key(r[1]))
 
-    # Absteigend nach Volumen sortieren
-    order = np.argsort(volumes)[::-1]
-    names   = [names[i]   for i in order]
-    volumes = [volumes[i] for i in order]
-    colors  = [colors[i]  for i in order]
+    names   = [r[0] for r in rows]
+    volumes = [r[1]["volume_cm3"] for r in rows]
+    cats    = [r[1].get("category", CAT_HELPER) for r in rows]
+    colors  = [CATEGORY_COLORS.get(c, "#95A5A6") for c in cats]
+    hatches = ["///" if c == CAT_HELPER else "" for c in cats]
 
-    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.45 + 1)))
-    bars = ax.barh(names, volumes, color=colors, edgecolor="white", linewidth=0.5)
+    y = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.34 + 1.5)))
+    vmin = max(0.01, min(volumes) * 0.5)
+    # Balken vom Log-Achsenboden (vmin) bis zum echten Volumen. NICHT left=vmin
+    # + width=volume verwenden: dort wäre die rechte Kante vmin+volume und würde
+    # kleine Targets auf der Log-Skala überzeichnen. Breite = volume - vmin
+    # lässt die Spitze exakt auf dem Volumen landen (vmin < jedes Volumen).
+    bars = ax.barh(y, np.array(volumes) - vmin, color=colors, edgecolor="white",
+                   linewidth=0.5, left=vmin)
+    for bar, hatch in zip(bars, hatches):
+        if hatch:
+            bar.set_hatch(hatch)
 
-    # Werte ans Ende der Balken schreiben
-    for bar, vol in zip(bars, volumes):
-        ax.text(bar.get_width() + 0.01 * max(volumes),
-                bar.get_y() + bar.get_height() / 2,
-                f"{vol:.1f}", va="center", ha="left", fontsize=8)
+    for yi, vol in zip(y, volumes):
+        ax.text(vol * 1.05, yi, f"{vol:.2f}" if vol < 10 else f"{vol:.0f}",
+                va="center", ha="left", fontsize=7)
 
-    ax.set_xlabel("Volumen (cm³)", fontsize=11)
-    ax.set_title("Strukturvolumen (Targets vs. OARs)", fontsize=13, fontweight="bold")
-    ax.set_xlim(0, max(volumes) * 1.15)
+    ax.set_xscale("log")
+    ax.set_xlim(vmin, max(volumes) * 2.2)
+    ax.set_yticks(y)
+    ax.set_yticklabels(names, fontsize=8)
     ax.invert_yaxis()
-    ax.grid(axis="x", alpha=0.3, linestyle="--")
+    ax.set_xlabel("Volumen (cm³, log-Skala)", fontsize=11)
+    ax.set_title("Strukturvolumen nach Kategorie", fontsize=13, fontweight="bold")
+    ax.grid(axis="x", alpha=0.3, linestyle="--", which="both")
 
-    legend = [
-        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet (Target)"),
-        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan (OAR)"),
-    ]
-    ax.legend(handles=legend, loc="lower right", fontsize=9)
+    present = [c for c in CATEGORY_ORDER if c in cats]
+    legend = [mpatches.Patch(facecolor=CATEGORY_COLORS.get(c, "#95A5A6"),
+                             hatch="///" if c == CAT_HELPER else None,
+                             edgecolor="white", label=CATEGORY_LABELS.get(c, c))
+              for c in present]
+    ext = results.get("meta", {}).get("external_names", [])
+    if ext:
+        legend.append(mpatches.Patch(facecolor="none", edgecolor="none",
+                                     label=f"(External ausgeblendet: {', '.join(ext)})"))
+    ax.legend(handles=legend, loc="lower right", fontsize=8)
 
     plt.tight_layout()
     path = output_dir / "volumes.png"
@@ -119,62 +165,77 @@ def plot_volumes(results: dict, output_dir: Path) -> None:
 
 def plot_shape_metrics(results: dict, output_dir: Path) -> None:
     """
-    Gruppiertes Balkendiagramm der drei Formmetriken pro Struktur.
-    Ermoeglicht schnellen visuellen Vergleich zwischen Targets und OARs.
+    Heatmap-Tabelle der Formmetriken (Sphärizität, Solidität, Elongation) –
+    NUR für anatomische Einzelkomponenten-Strukturen (Targets + OARs), nach
+    Kategorie gruppiert. Hilfs-/Vereinigungsstrukturen werden ausgelassen, da
+    Hüllen-/Voxel-Formmetriken für Mehrkomponenten-Strukturen bedeutungslos
+    sind. Eine Heatmap ersetzt die unleserlichen 40 gedrehten x-Labels und
+    lässt Ausreißer (z.B. Rückenmark-Elongation) sofort erkennen.
     """
-    all_structs = {**results["targets"], **results["oars"]}
-    if not all_structs:
+    import matplotlib.colors as mcolors
+
+    # Nur anatomische Einzelkomponenten-Strukturen mit gültiger Formmetrik
+    # (gleiche Auswahl wie plot_sphericity_vs_elongation -> konsistente Plots;
+    # ungültige/Mehrkomponenten-Strukturen erscheinen weiter in statistics.txt).
+    rows = [(name, s) for name, s in _iter_structures(results)
+            if s.get("category") in (CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL)
+            and s["shape"].get("shape_valid", False)]
+    if not rows:
         return
+    rows.sort(key=lambda r: _category_sort_key(r[1]))
 
-    names        = list(all_structs.keys())
-    sphericities = [s["shape"]["sphericity"]  for s in all_structs.values()]
-    compactness  = [s["shape"]["compactness"] for s in all_structs.values()]
-    elongations  = [s["shape"]["elongation"]  for s in all_structs.values()]
+    names = [r[0] for r in rows]
+    cats  = [r[1].get("category") for r in rows]
+    sph = np.array([r[1]["shape"]["sphericity"]  for r in rows])
+    sol = np.array([r[1]["shape"]["solidity"]    for r in rows])
+    elo = np.array([r[1]["shape"]["elongation"]  for r in rows])
+    n = len(names)
 
-    x         = np.arange(len(names))
-    n_targets = len(results["targets"])
+    fig, axes = plt.subplots(
+        1, 4, figsize=(11, max(4, n * 0.32 + 1.5)),
+        gridspec_kw={"width_ratios": [0.12, 1, 1, 1], "wspace": 0.08})
+    y = np.arange(n)
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, max(4, len(names) * 0.4 + 2)))
+    # Spalte 0: Kategorie-Farbstreifen
+    cax = axes[0]
+    cat_rgb = [mcolors.to_rgb(CATEGORY_COLORS.get(c, "#95A5A6")) for c in cats]
+    cax.imshow(np.array(cat_rgb).reshape(n, 1, 3), aspect="auto")
+    cax.set_xticks([])
+    cax.set_yticks(y)
+    cax.set_yticklabels(names, fontsize=7)
+    cax.set_title("Kat.", fontsize=8)
 
-    metric_data = [
-        (axes[0], sphericities, "Sphaerizitaet",
-         "1.0 = perfekte Kugel\n< 1 = unregelmaessig/elongiert"),
-        (axes[1], compactness,  "Kompaktheit",
-         "1.0 = konvex ausgefuellt\n< 1 = konkav/lueckenhaft"),
-        (axes[2], elongations,  "Elongation",
-         "> 1 = gestreckt\n= 1 = isotropisch"),
-    ]
+    def _strip(ax, vals, title, cmap, vmin, vmax, fmt="{:.2f}"):
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        ax.imshow(vals.reshape(n, 1), aspect="auto", cmap=cmap, norm=norm)
+        for yi, v in zip(y, vals):
+            ax.text(0, yi, fmt.format(v), ha="center", va="center", fontsize=7,
+                    color="black")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(title, fontsize=9, fontweight="bold")
 
-    for ax, values, title, subtitle in metric_data:
-        bar_colors = [COLOR_TARGET if i < n_targets else COLOR_OAR
-                      for i in range(len(names))]
-        bars = ax.bar(x, values, color=bar_colors, edgecolor="white",
-                      linewidth=0.5, width=0.6)
+    # Sphärizität & Solidität: 0..1, grün = rund/konvex (gut)
+    _strip(axes[1], sph, "Sphärizität\n(1=Kugel)", "RdYlGn", 0.0, 1.0)
+    _strip(axes[2], sol, "Solidität\n(1=konvex)", "RdYlGn", 0.0, 1.0)
+    # Elongation: ab 1; höher = gestreckter -> Orangetöne
+    _strip(axes[3], elo, "Elongation\n(1=isotrop)", "Oranges",
+           1.0, float(max(elo.max(), 2.0)), fmt="{:.1f}")
 
-        for bar, val in zip(bars, values):
-            if val > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + 0.005 * max(values + [1]),
-                        f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+    # Kategorie-Trennlinien
+    bounds = [i for i in range(1, n) if cats[i] != cats[i - 1]]
+    for ax in axes:
+        for b in bounds:
+            ax.axhline(b - 0.5, color="black", linewidth=1.0, alpha=0.6)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(names, rotation=40, ha="right", fontsize=8)
-        ax.set_title(f"{title}\n{subtitle}", fontsize=10, fontweight="bold")
-        ax.set_ylim(0, max(values + [1.05]) * 1.12)
-        ax.grid(axis="y", alpha=0.3, linestyle="--")
-
-        # Referenzlinie bei 1.0 (Sphaerizitaet, Kompaktheit)
-        if title != "Elongation":
-            ax.axhline(1.0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
-
-    legend = [
-        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet"),
-        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan"),
-    ]
-    axes[0].legend(handles=legend, fontsize=8)
-
-    fig.suptitle("Formmetriken aller Strukturen", fontsize=13, fontweight="bold", y=1.01)
-    plt.tight_layout()
+    present = [c for c in CATEGORY_ORDER if c in cats]
+    legend = [mpatches.Patch(color=CATEGORY_COLORS.get(c, "#95A5A6"),
+                             label=CATEGORY_LABELS.get(c, c)) for c in present]
+    fig.legend(handles=legend, loc="lower center", ncol=len(legend),
+               fontsize=8, frameon=True, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle("Formmetriken (anatomische Strukturen; Hilfsstrukturen ausgelassen)",
+                 fontsize=12, fontweight="bold", y=1.0)
+    plt.tight_layout(rect=(0, 0.03, 1, 0.98))
     path = output_dir / "shape_metrics.png"
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -187,58 +248,60 @@ def plot_shape_metrics(results: dict, output_dir: Path) -> None:
 
 def plot_distances(results: dict, output_dir: Path, max_pairs: int = 25) -> None:
     """
-    Gruppiertes Balkendiagramm: Min./Hausdorff-/Schwerpunktabstand pro Strukturpaar.
-
-    Zeigt nur Target-OAR-Paare (klinisch relevant), sortiert nach minimalem Abstand
-    (aufsteigend = kritischste zuerst). Auf max_pairs Eintraege begrenzt.
-    Klinisch relevante Schwelle (5 mm) als gestrichelte rote Linie eingezeichnet.
+    Lollipop-Diagramm der klinisch kritischen Abstände: Target ↔ serielle OARs
+    (Hirnstamm, Rückenmark, Sehnerven, Chiasma, Hypophyse), aufsteigend nach
+    Minimalabstand. Punkt = Min-Abstand, offener Marker = HD95; Linie zwischen
+    beiden. Schwellen bei 3 mm / 5 mm. Ersetzt das alte Balkendiagramm, das von
+    Containment-Artefakten (PTV in eigener Vereinigung / im Ganzhirn) dominiert
+    wurde – diese sind hier durch die Kategorie-Filterung ausgeschlossen.
     """
-    if not results["distances"]:
+    dist = results.get("distances", [])
+    if not dist:
         return
 
-    target_names = set(results["targets"].keys())
-    oar_names    = set(results["oars"].keys())
+    serial = [d for d in dist
+              if d.get("pair_type") == "target-oar" and d.get("oar_subtype") == "serial"]
+    subtitle = "Target ↔ serielle OARs"
+    if not serial:   # Fallback: alle Target-OAR-Paare
+        serial = [d for d in dist if d.get("pair_type") == "target-oar"]
+        subtitle = "Target ↔ OAR"
+    if not serial:
+        return
 
-    # Nur Target-OAR-Paare behalten (klinisch relevant)
-    relevant = [
-        d for d in results["distances"]
-        if (d["structure_a"] in target_names and d["structure_b"] in oar_names)
-        or (d["structure_b"] in target_names and d["structure_a"] in oar_names)
-    ]
+    serial = sorted(serial, key=lambda d: d["min_distance_mm"])[:max_pairs]
+    labels = [f"{d['structure_a']} → {d['structure_b']}" for d in serial]
+    dmin   = [d["min_distance_mm"] for d in serial]
+    dh95   = [d.get("hd95_mm", d["hausdorff_distance_mm"]) for d in serial]
 
-    # Fallback: alle Paare wenn keine Target-OAR-Kombination vorhanden
-    if not relevant:
-        relevant = results["distances"]
+    y = np.arange(len(serial))[::-1]   # kleinster Abstand oben
+    fig, ax = plt.subplots(figsize=(10, max(4, len(serial) * 0.34 + 1.5)))
 
-    # Aufsteigend nach Minimalabstand sortieren (kritischste zuerst)
-    relevant = sorted(relevant, key=lambda d: d["min_distance_mm"])[:max_pairs]
+    for yi, mn, h95 in zip(y, dmin, dh95):
+        ax.plot([mn, h95], [yi, yi], color="#BDC3C7", linewidth=1.5, zorder=1)
+    flagged = [mn < 5.0 for mn in dmin]
+    ax.scatter(dmin, y, s=55, zorder=3, label="Min. Abstand",
+               color=[("#C0392B" if f else COLOR_MIN) for f in flagged],
+               edgecolors="black", linewidths=0.5)
+    ax.scatter(dh95, y, s=45, zorder=2, facecolors="none",
+               edgecolors=COLOR_HAUS, linewidths=1.4, label="HD95")
 
-    pairs = [f"{d['structure_a']}\nvs\n{d['structure_b']}" for d in relevant]
-    d_min  = [d["min_distance_mm"]       for d in relevant]
-    d_haus = [d["hausdorff_distance_mm"] for d in relevant]
-    d_cent = [d["centroid_distance_mm"]  for d in relevant]
+    ax.axvline(5.0, color="red", linestyle="--", linewidth=1.2, alpha=0.7,
+               label="Schwelle 5 mm")
+    ax.axvline(3.0, color="darkred", linestyle=":", linewidth=1.2, alpha=0.7,
+               label="Schwelle 3 mm")
 
-    x     = np.arange(len(pairs))
-    width = 0.25
+    for yi, mn in zip(y, dmin):
+        ax.text(mn, yi + 0.28, f"{mn:.1f}", ha="center", va="bottom", fontsize=7,
+                color="black")
 
-    fig, ax = plt.subplots(figsize=(max(8, min(len(pairs) * 2.2, 28)), 6))
-
-    ax.bar(x - width, d_min,  width, label="Min. Abstand",        color=COLOR_MIN,  alpha=0.85)
-    ax.bar(x,         d_haus, width, label="Hausdorff-Abstand",   color=COLOR_HAUS, alpha=0.85)
-    ax.bar(x + width, d_cent, width, label="Schwerpunkt-Abstand", color=COLOR_CENT, alpha=0.85)
-
-    # Klinische Schwelle: 5 mm fuer Mindestabstand PTV-OAR
-    ax.axhline(5.0, color="red", linestyle="--", linewidth=1.2, alpha=0.7,
-               label="Klinische Schwelle (5 mm)")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(pairs, fontsize=8)
-    ax.set_ylabel("Abstand (mm)", fontsize=11)
-    ax.set_title("Abstands-Metriken zwischen Strukturpaaren", fontsize=13,
-                 fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", alpha=0.3, linestyle="--")
-    ax.set_ylim(0, max(d_cent + d_haus + [10]) * 1.1)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Abstand (mm)", fontsize=11)
+    ax.set_title(f"Kritische Abstände: {subtitle}\n(aufsteigend, < 5 mm rot markiert)",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlim(left=0)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(axis="x", alpha=0.3, linestyle="--")
 
     plt.tight_layout()
     path = output_dir / "distances.png"
@@ -253,52 +316,70 @@ def plot_distances(results: dict, output_dir: Path, max_pairs: int = 25) -> None
 
 def plot_centroids_3d(results: dict, output_dir: Path) -> None:
     """
-    3D-Streudiagramm der Strukturzentren im DICOM-Patientenkoordinatensystem
-    (X=links, Y=posterior, Z=superior). Setzt Groesse proportional zum Volumen.
-    Gibt raeumliche Lage und Abstands-Verhaeltnisse auf einen Blick wieder.
+    3D-Streudiagramm der Strukturzentren (LPS: X=links, Y=posterior, Z=superior),
+    farbcodiert nach Kategorie, Markergröße ∝ √Volumen. Statt aller ~40 Labels
+    (vorher unleserlicher Label-Brei) werden nur serielle OARs beschriftet und
+    die Targets durchnummeriert (Zuordnung Nummer→Läsion in der Seitenlegende).
+    Marker und External sind ausgeschlossen.
     """
-    fig = plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=(11, 8))
     ax  = fig.add_subplot(111, projection="3d")
+    coords = []
 
-    coords = []   # zum Setzen eines verzerrungsfreien Box-Aspektverhaeltnisses
+    # Targets durchnummerieren (nach Läsion, GTV/PTV teilen sich eine Nummer)
+    target_rows = sorted(results.get("targets", {}).items(),
+                         key=lambda kv: _category_sort_key(kv[1]))
+    lesion_to_num: dict = {}
+    num_legend = []
+    for name, s in target_rows:
+        key = s.get("lesion_key") or name
+        if key not in lesion_to_num:
+            lesion_to_num[key] = len(lesion_to_num) + 1
+            num_legend.append(f"{lesion_to_num[key]}: {key}")
+        cx, cy, cz = s["centroid_mm"]
+        size = max(25, min(500, np.sqrt(max(s["volume_cm3"], 0.0)) * 40))
+        ax.scatter(cx, cy, cz, s=size, c=CATEGORY_COLORS[CAT_TARGET],
+                   marker="o", alpha=0.8, edgecolors="white", linewidths=0.5)
+        ax.text(cx, cy, cz + 2, str(lesion_to_num[key]), fontsize=7,
+                ha="center", color="black", fontweight="bold")
+        coords.append((cx, cy, cz))
 
-    def _add_group(struct_dict, color, marker):
-        for name, s in struct_dict.items():
-            cx, cy, cz = s["centroid_mm"]
-            vol = s["volume_cm3"]
-            # Marker-Flaeche skaliert mit der Wurzel des Volumens, damit grosse
-            # Strukturen sichtbar dominanter, aber kleine nicht unsichtbar sind
-            # (lineare Skalierung liesse 100-cm3-Strukturen alles erschlagen).
-            size = max(30, min(600, np.sqrt(max(vol, 0.0)) * 40))
-            ax.scatter(cx, cy, cz, s=size, c=color, marker=marker,
-                       alpha=0.75, edgecolors="white", linewidths=0.5)
-            ax.text(cx, cy, cz + 3, name, fontsize=7, ha="center", color=color)
-            coords.append((cx, cy, cz))
+    # OARs: seriell (Dreieck, beschriftet) + parallel (Quadrat, unbeschriftet)
+    for name, s in results.get("oars", {}).items():
+        sub = s.get("oar_subtype")
+        col = CATEGORY_COLORS[CAT_OAR_SERIAL if sub == "serial" else CAT_OAR_PARALLEL]
+        marker = "^" if sub == "serial" else "s"
+        cx, cy, cz = s["centroid_mm"]
+        size = max(25, min(500, np.sqrt(max(s["volume_cm3"], 0.0)) * 40))
+        ax.scatter(cx, cy, cz, s=size, c=col, marker=marker,
+                   alpha=0.75, edgecolors="white", linewidths=0.5)
+        if sub == "serial":
+            ax.text(cx, cy, cz + 3, name, fontsize=7, ha="center", color=col)
+        coords.append((cx, cy, cz))
 
-    _add_group(results["targets"], COLOR_TARGET, "o")
-    _add_group(results["oars"],    COLOR_OAR,    "^")
-
-    # Gleiches Laengen-zu-Pixel-Verhaeltnis fuer alle Achsen, sonst werden
-    # raeumliche Abstaende im 3D-Plot verzerrt dargestellt (irrefuehrend).
     if coords:
-        c_arr = np.array(coords)
-        spans = np.ptp(c_arr, axis=0)
+        spans = np.ptp(np.array(coords), axis=0)
         spans[spans == 0] = 1.0
         ax.set_box_aspect(tuple(spans))
 
-    ax.set_xlabel("X  [mm]  (Links)", fontsize=9)
-    ax.set_ylabel("Y  [mm]  (Posterior)", fontsize=9)
-    ax.set_zlabel("Z  [mm]  (Superior)", fontsize=9)
-    ax.set_title("Raeumliche Verteilung der Strukturschwerpunkte",
+    ax.set_xlabel("X [mm] (Links)", fontsize=9)
+    ax.set_ylabel("Y [mm] (Posterior)", fontsize=9)
+    ax.set_zlabel("Z [mm] (Superior)", fontsize=9)
+    ax.set_title("Räumliche Verteilung der Strukturschwerpunkte",
                  fontsize=12, fontweight="bold")
 
     legend = [
-        mpatches.Patch(color=COLOR_TARGET, label="Zielgebiet (Kreis)"),
-        mpatches.Patch(color=COLOR_OAR,    label="Risikoorgan (Dreieck)"),
+        mpatches.Patch(color=CATEGORY_COLORS[CAT_TARGET], label="Target (Kreis, nummeriert)"),
+        mpatches.Patch(color=CATEGORY_COLORS[CAT_OAR_SERIAL], label="OAR seriell (Dreieck)"),
+        mpatches.Patch(color=CATEGORY_COLORS[CAT_OAR_PARALLEL], label="OAR parallel (Quadrat)"),
     ]
-    ax.legend(handles=legend, fontsize=9, loc="upper left")
+    ax.legend(handles=legend, fontsize=8, loc="upper left")
+    if num_legend:
+        fig.text(0.015, 0.5, "Targets:\n" + "\n".join(num_legend),
+                 fontsize=7, va="center", ha="left",
+                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.16, 0, 1, 1))
     path = output_dir / "centroids_3d.png"
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -315,63 +396,331 @@ def write_statistics(results: dict, output_dir: Path) -> None:
     def _stats(values):
         if not values:
             return {"n": 0, "mean": 0, "std": 0, "min": 0, "max": 0}
-        return {
-            "n":    len(values),
-            "mean": float(np.mean(values)),
-            "std":  float(np.std(values)),
-            "min":  float(np.min(values)),
-            "max":  float(np.max(values)),
-        }
+        return {"n": len(values), "mean": float(np.mean(values)),
+                "std": float(np.std(values)), "min": float(np.min(values)),
+                "max": float(np.max(values))}
+
+    def _write_struct(f, name, s):
+        sh = s["shape"]
+        flag = "" if sh.get("shape_valid", False) else "   [!] Mehrkomponenten/ungueltige Formmetrik"
+        f.write(f"\n  {name}  (ROI #{s['roi_number']}, {s.get('category','?')})\n")
+        f.write(f"    Konturen   : {s['num_contours']} Schichten, {s['num_points']} Punkte\n")
+        f.write(f"    Volumen    : {s['volume_cm3']:.3f} cm3"
+                f"   (Voxel-Quervergleich: {sh.get('volume_voxel_cm3', 0):.3f} cm3)\n")
+        f.write(f"    Aequiv.-Durchmesser: {sh.get('equivalent_diameter_mm', 0):.1f} mm"
+                f"   max. 3D-Durchmesser: {sh.get('max_diameter_mm', 0):.1f} mm\n")
+        cx, cy, cz = s["centroid_mm"]
+        f.write(f"    Schwerpunkt: ({cx:.1f}, {cy:.1f}, {cz:.1f}) mm\n")
+        bx, by, bz = sh["bbox_size_mm"]
+        f.write(f"    BBox       : {bx:.1f} x {by:.1f} x {bz:.1f} mm\n")
+        f.write(f"    Sphaerizitaet: {sh['sphericity']:.4f}   "
+                f"Soliditaet: {sh['solidity']:.4f}   Elongation: {sh['elongation']:.4f}"
+                f"{flag}\n")
 
     path = output_dir / "statistics.txt"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("RTSTRUCT Analyse – Statistiken\n")
-        f.write("=" * 50 + "\n\n")
+        f.write("RTSTRUCT Analyse - Statistiken\n")
+        f.write("=" * 60 + "\n\n")
 
-        for section, struct_dict in [("ZIELGEBIETE", results["targets"]),
-                                      ("RISIKOORGANE", results["oars"])]:
-            f.write(f"{section}\n")
-            f.write("-" * 50 + "\n")
+        meta = results.get("meta", {})
+        if meta:
+            f.write("KATEGORIEN: " + ", ".join(
+                f"{k}={v}" for k, v in meta.get("category_counts", {}).items()) + "\n")
+            if meta.get("external_names"):
+                f.write(f"External (ausgeschlossen): {', '.join(meta['external_names'])}\n")
+            f.write(f"POINT-Marker (ausgeschlossen): {meta.get('marker_count', 0)}\n")
+            f.write("Hinweis: Sphaerizitaet & Soliditaet sind auf (0,1] beschraenkt "
+                    "(konsistente Voxelmaske); fuer Mehrkomponenten-Hilfsstrukturen "
+                    "sind Huellen-Formmetriken nicht aussagekraeftig.\n\n")
+
+        # OARs nach Subtyp aufteilen
+        oar_serial = {n: s for n, s in results["oars"].items() if s.get("oar_subtype") == "serial"}
+        oar_parallel = {n: s for n, s in results["oars"].items() if s.get("oar_subtype") != "serial"}
+        for section, struct_dict in [
+            ("ZIELGEBIETE (Targets)", results["targets"]),
+            ("RISIKOORGANE - seriell", oar_serial),
+            ("RISIKOORGANE - parallel", oar_parallel),
+            ("HILFS-/PLANUNGSSTRUKTUREN", results.get("helpers", {})),
+        ]:
+            if not struct_dict:
+                continue
+            f.write(f"\n{section}\n")
+            f.write("-" * 60 + "\n")
             for name, s in struct_dict.items():
-                sh = s["shape"]
-                f.write(f"\n  {name}  (ROI #{s['roi_number']})\n")
-                f.write(f"    Konturen  : {s['num_contours']} Schichten, "
-                        f"{s['num_points']} Punkte\n")
-                f.write(f"    Volumen   : {s['volume_cm3']:.3f} cm3\n")
-                cx, cy, cz = s["centroid_mm"]
-                f.write(f"    Schwerpunkt: ({cx:.1f}, {cy:.1f}, {cz:.1f}) mm\n")
-                bx, by, bz = sh["bbox_size_mm"]
-                f.write(f"    BBox Groesse: {bx:.1f} x {by:.1f} x {bz:.1f} mm\n")
-                f.write(f"    Sphaerizitaet : {sh['sphericity']:.4f}\n")
-                f.write(f"    Kompaktheit   : {sh['compactness']:.4f}\n")
-                f.write(f"    Elongation    : {sh['elongation']:.4f}\n")
+                _write_struct(f, name, s)
 
-        if results["distances"]:
-            f.write("\n\nABSTANDS-STATISTIK\n")
-            f.write("-" * 50 + "\n")
-            st_min  = _stats([d["min_distance_mm"]       for d in results["distances"]])
-            st_haus = _stats([d["hausdorff_distance_mm"] for d in results["distances"]])
-            st_cent = _stats([d["centroid_distance_mm"]  for d in results["distances"]])
+        dist = results.get("distances", [])
+        toar = [d for d in dist if d.get("pair_type") == "target-oar"]
+        gtvptv = [d for d in dist if d.get("pair_type") == "gtv-ptv"]
 
-            f.write(f"Anzahl Paare : {st_min['n']}\n\n")
-            for label, st in [("Min. Abstand (mm)",        st_min),
-                               ("Hausdorff-Abstand (mm)",  st_haus),
-                               ("Schwerpunkt-Abstand (mm)", st_cent)]:
-                f.write(f"  {label}\n")
-                f.write(f"    Mittelwert : {st['mean']:.2f}\n")
-                f.write(f"    Std.abw.   : {st['std']:.2f}\n")
-                f.write(f"    Min        : {st['min']:.2f}\n")
-                f.write(f"    Max        : {st['max']:.2f}\n\n")
+        if toar:
+            f.write("\n\nABSTANDS-STATISTIK (nur Target<->OAR Paare)\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"Anzahl Paare : {len(toar)}\n\n")
+            for label, key in [("Min. Abstand (mm)", "min_distance_mm"),
+                               ("HD95 (mm)", "hd95_mm"),
+                               ("Hausdorff (mm)", "hausdorff_distance_mm"),
+                               ("ASSD (mm)", "assd_mm")]:
+                st = _stats([d[key] for d in toar])
+                f.write(f"  {label}: Mittel {st['mean']:.2f}, Std {st['std']:.2f}, "
+                        f"Min {st['min']:.2f}, Max {st['max']:.2f}\n")
 
-            f.write("\nEINZELPAARE\n")
-            f.write(f"{'Paar':<45} {'Min':>8} {'Hausdorff':>12} {'Zentroid':>10}\n")
-            f.write("-" * 78 + "\n")
-            for d in results["distances"]:
-                pair = f"{d['structure_a']} vs {d['structure_b']}"
-                f.write(f"{pair:<45} {d['min_distance_mm']:>8.2f} "
-                        f"{d['hausdorff_distance_mm']:>12.2f} "
-                        f"{d['centroid_distance_mm']:>10.2f}\n")
+            f.write("\nKRITISCHSTE PAARE (aufsteigend nach Min-Abstand, Top 30)\n")
+            f.write(f"{'Paar':<46}{'Min':>7}{'HD95':>7}{'Haus':>7}{'ASSD':>7}{'Zentr':>7}\n")
+            f.write("-" * 81 + "\n")
+            for d in sorted(toar, key=lambda e: e["min_distance_mm"])[:30]:
+                pair = f"{d['structure_a']} -> {d['structure_b']}"
+                f.write(f"{pair[:45]:<46}{d['min_distance_mm']:>7.2f}{d['hd95_mm']:>7.2f}"
+                        f"{d['hausdorff_distance_mm']:>7.2f}{d['assd_mm']:>7.2f}"
+                        f"{d['centroid_distance_mm']:>7.2f}\n")
 
+        if gtvptv:
+            f.write("\n\nGTV<->PTV MARGIN-CHECK (pro Laesion)\n")
+            f.write(f"{'GTV -> PTV':<46}{'Min':>7}{'HD95':>7}{'ASSD':>7}\n")
+            f.write("-" * 67 + "\n")
+            for d in gtvptv:
+                pair = f"{d['structure_a']} -> {d['structure_b']}"
+                f.write(f"{pair[:45]:<46}{d['min_distance_mm']:>7.2f}"
+                        f"{d['hd95_mm']:>7.2f}{d['assd_mm']:>7.2f}\n")
+
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 6: Naehe-Matrix  PTV x kritische OARs   (NEU)
+# ---------------------------------------------------------------------------
+
+def _ptv_rows(results: dict):
+    """PTVs (oder ersatzweise alle Targets), sortiert nach Läsion."""
+    ptvs = [(n, s) for n, s in results.get("targets", {}).items()
+            if n.upper().startswith("PTV")]
+    if not ptvs:
+        ptvs = list(results.get("targets", {}).items())
+    return sorted(ptvs, key=lambda kv: _category_sort_key(kv[1]))
+
+
+def _critical_oar_cols(results: dict):
+    """Spalten der Nähe-Matrix: serielle OARs + ausgewählte kleine parallele.
+
+    Parallele werden per case-insensitivem Teilstring ausgewählt (Auge/eye,
+    Linse/lens, Hippocampus), nicht per exaktem ROI-Namen – sonst blieben die
+    Spalten bei abweichender Namenskonvention anderer Datensätze leer.
+    """
+    oars = results.get("oars", {})
+    serial = [n for n, s in oars.items() if s.get("oar_subtype") == "serial"]
+    par_keywords = ("auge", "eye", "linse", "lens", "hippocamp")
+    key_par = [n for n, s in oars.items()
+               if s.get("oar_subtype") != "serial"
+               and any(k in n.lower() for k in par_keywords)]
+    return serial + key_par
+
+
+def plot_proximity_matrix(results: dict, output_dir: Path) -> None:
+    """
+    Heatmap der Minimalabstände PTV × kritische OARs (serielle + kleine
+    parallele). Ein Blick zeigt, welche Metastase welchem Risikoorgan
+    gefährlich nahe kommt. Farbschwellen: rot ≤2, orange ≤5, gelb ≤10,
+    hellgrün ≤20, grün >20 mm. Containment-Strukturen (Ganzhirn, Vereinigungen)
+    sind hier bewusst NICHT enthalten.
+    """
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    toar = [d for d in results.get("distances", []) if d.get("pair_type") == "target-oar"]
+    ptvs = _ptv_rows(results)
+    cols = _critical_oar_cols(results)
+    if not toar or not ptvs or not cols:
+        return
+
+    lut = {}
+    for d in toar:
+        lut[(d["structure_a"], d["structure_b"])] = d["min_distance_mm"]
+    M = np.full((len(ptvs), len(cols)), np.nan)
+    for i, (pn, _) in enumerate(ptvs):
+        for j, on in enumerate(cols):
+            v = lut.get((pn, on), lut.get((on, pn)))
+            if v is not None:
+                M[i, j] = v
+
+    bounds = [0, 2, 5, 10, 20, 1e9]
+    cmap = ListedColormap(["#C0392B", "#E67E22", "#F1C40F", "#A9DFBF", "#27AE60"])
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(cols) * 0.95 + 2),
+                                    max(4, len(ptvs) * 0.5 + 2)))
+    ax.imshow(np.ma.masked_invalid(M), aspect="auto", cmap=cmap, norm=norm)
+    ax.set_xticks(range(len(cols)))
+    ax.set_xticklabels(cols, rotation=40, ha="right", fontsize=8)
+    ax.set_yticks(range(len(ptvs)))
+    ax.set_yticklabels([s.get("lesion_key") or n for n, s in ptvs], fontsize=8)
+    for i in range(len(ptvs)):
+        for j in range(len(cols)):
+            if not np.isnan(M[i, j]):
+                ax.text(j, i, f"{M[i, j]:.1f}", ha="center", va="center",
+                        fontsize=7, color="white" if M[i, j] <= 5 else "black")
+    ax.set_title("Nähe-Matrix: PTV × kritische OARs  –  Min-Abstand (mm)\n"
+                 "rot ≤2  orange ≤5  gelb ≤10  hellgrün ≤20  grün >20",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    path = output_dir / "proximity_matrix.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 7: Naechstes kritisches OAR pro PTV   (NEU)
+# ---------------------------------------------------------------------------
+
+def plot_nearest_critical_oar(results: dict, output_dir: Path) -> None:
+    """Pro PTV das EINE nächstgelegene serielle OAR (Triage-Liste).
+
+    Balken = Minimalabstand, beschriftet mit dem betreffenden OAR. Aufsteigend
+    sortiert (gefährlichste Läsion oben), Schwellen bei 3 und 5 mm.
+    """
+    toar = [d for d in results.get("distances", [])
+            if d.get("pair_type") == "target-oar" and d.get("oar_subtype") == "serial"]
+    if not toar:
+        return
+    ptvs = [n for n, _ in _ptv_rows(results)]
+
+    rows = []
+    for p in ptvs:
+        cands = [(d["structure_b"] if d["structure_a"] == p else d["structure_a"],
+                  d["min_distance_mm"])
+                 for d in toar if p in (d["structure_a"], d["structure_b"])]
+        if cands:
+            oar, mn = min(cands, key=lambda c: c[1])
+            rows.append((p, oar, mn))
+    if not rows:
+        return
+    rows.sort(key=lambda r: r[2], reverse=True)   # größter unten, kleinster oben
+    labels = [results["targets"][p].get("lesion_key") or p for p, _, _ in rows]
+    vals = [r[2] for r in rows]
+    colors = ["#C0392B" if v < 3 else ("#E67E22" if v < 5 else COLOR_MIN) for v in vals]
+
+    fig, ax = plt.subplots(figsize=(9, max(3.5, len(rows) * 0.4 + 1.5)))
+    y = np.arange(len(rows))
+    ax.barh(y, vals, color=colors, edgecolor="white", linewidth=0.5)
+    for yi, (_, oar, mn) in zip(y, rows):
+        ax.text(mn + 0.5, yi, f"{mn:.1f} mm  → {oar}", va="center", ha="left", fontsize=8)
+    ax.axvline(5.0, color="red", linestyle="--", linewidth=1.2, alpha=0.7, label="5 mm")
+    ax.axvline(3.0, color="darkred", linestyle=":", linewidth=1.2, alpha=0.7, label="3 mm")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Min-Abstand zum nächsten seriellen OAR (mm)", fontsize=11)
+    ax.set_title("Nächstes kritisches OAR pro PTV", fontsize=12, fontweight="bold")
+    ax.set_xlim(0, max(vals) * 1.35 + 2)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(axis="x", alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    path = output_dir / "nearest_critical_oar.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 8: Sphaerizitaet vs. Elongation   (NEU)
+# ---------------------------------------------------------------------------
+
+def plot_sphericity_vs_elongation(results: dict, output_dir: Path) -> None:
+    """Streudiagramm des Formcharakters (nur anatomische Strukturen).
+
+    x = Elongation (≥1), y = Sphärizität (0..1), Größe ∝ √Volumen, Farbe =
+    Kategorie. Reale Organe trennen sich natürlich (Augen ~rund; Rückenmark /
+    Sehnerven stark elongiert). Hilfsstrukturen sind ausgeschlossen.
+    """
+    rows = [(n, s) for n, s in _iter_structures(results)
+            if s.get("category") in (CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL)
+            and s["shape"].get("shape_valid", False)]
+    if not rows:
+        return
+    fig, ax = plt.subplots(figsize=(9, 7))
+    for cat in (CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL):
+        grp = [s for _, s in rows if s.get("category") == cat]
+        if not grp:
+            continue
+        xs = [s["shape"]["elongation"] for s in grp]
+        ys = [s["shape"]["sphericity"] for s in grp]
+        sz = [max(30, min(700, np.sqrt(max(s["volume_cm3"], 0.0)) * 45)) for s in grp]
+        ax.scatter(xs, ys, s=sz, color=CATEGORY_COLORS[cat], alpha=0.7,
+                   edgecolors="white", linewidths=0.6, label=CATEGORY_LABELS[cat])
+    # serielle OARs beschriften (klinisch wichtig + meist Ausreißer)
+    for n, s in rows:
+        if s.get("oar_subtype") == "serial":
+            ax.annotate(n, (s["shape"]["elongation"], s["shape"]["sphericity"]),
+                        fontsize=7, xytext=(4, 4), textcoords="offset points")
+    ax.set_xlabel("Elongation (Hauptachsen-Verhältnis, ≥1)", fontsize=11)
+    ax.set_ylabel("Sphärizität (1 = Kugel)", fontsize=11)
+    ax.set_title("Formcharakter: Sphärizität vs. Elongation\n"
+                 "(Markergröße ∝ √Volumen; Hilfsstrukturen ausgeschlossen)",
+                 fontsize=12, fontweight="bold")
+    ax.set_ylim(0, 1.05)
+    ax.grid(alpha=0.3, linestyle="--")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    path = output_dir / "sphericity_vs_elongation.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 9: GTV->PTV Margin pro Laesion   (NEU)
+# ---------------------------------------------------------------------------
+
+def plot_gtv_ptv_margin(results: dict, output_dir: Path) -> None:
+    """Pro Läsion GTV- vs. PTV-Volumen (log) plus impliziter isotroper Margin.
+
+    Macht sichtbar, ob jede Metastase einen konsistenten GTV→PTV-Margin
+    erhalten hat (Margin ~ (d_PTV − d_GTV)/2 aus Äquivalent-Durchmessern).
+    """
+    targets = results.get("targets", {})
+    by_key: dict = {}
+    for n, s in targets.items():
+        key = s.get("lesion_key") or n
+        prefix = "GTV" if n.upper().startswith("GTV") else ("PTV" if n.upper().startswith("PTV") else None)
+        if prefix:
+            by_key.setdefault(key, {})[prefix] = s
+    pairs = [(k, d["GTV"], d["PTV"]) for k, d in by_key.items() if "GTV" in d and "PTV" in d]
+    if not pairs:
+        return
+    pairs.sort(key=lambda t: t[2]["volume_cm3"])
+
+    keys = [p[0] for p in pairs]
+    gtv_v = [p[1]["volume_cm3"] for p in pairs]
+    ptv_v = [p[2]["volume_cm3"] for p in pairs]
+    margins = [max(0.0, (p[2]["shape"]["equivalent_diameter_mm"]
+                         - p[1]["shape"]["equivalent_diameter_mm"]) / 2.0) for p in pairs]
+
+    y = np.arange(len(keys))
+    h = 0.38
+    fig, ax = plt.subplots(figsize=(9, max(3.5, len(keys) * 0.5 + 1.5)))
+    vmin = max(0.001, min(gtv_v) * 0.5)   # stets < jedes Volumen -> Breite > 0
+    # Breite = Volumen - vmin, damit die Balkenspitze auf der Log-Skala exakt
+    # auf dem echten Volumen liegt (left=vmin + width=volume würde überzeichnen).
+    ax.barh(y + h / 2, np.array(gtv_v) - vmin, height=h, color="#2471A3",
+            label="GTV", left=vmin)
+    ax.barh(y - h / 2, np.array(ptv_v) - vmin, height=h, color="#85C1E9",
+            label="PTV", left=vmin)
+    for yi, g, p, m in zip(y, gtv_v, ptv_v, margins):
+        ax.text(p * 1.05, yi - h / 2, f"{p:.2f} cm³", va="center", ha="left", fontsize=7)
+        ax.text(g * 1.05, yi + h / 2, f"{g:.2f}", va="center", ha="left", fontsize=7)
+        ax.text(vmin, yi, f"  Margin≈{m:.1f} mm", va="center", ha="left",
+                fontsize=7, color="black", fontweight="bold")
+    ax.set_xscale("log")
+    ax.set_xlim(vmin, max(ptv_v) * 2.5)
+    ax.set_yticks(y)
+    ax.set_yticklabels(keys, fontsize=8)
+    ax.set_xlabel("Volumen (cm³, log)", fontsize=11)
+    ax.set_title("GTV→PTV pro Läsion (Volumen + impliziter Margin)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9, loc="lower right")
+    ax.grid(axis="x", alpha=0.3, linestyle="--", which="both")
+    plt.tight_layout()
+    path = output_dir / "gtv_ptv_margin.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
     print(f"  Gespeichert: {path}")
 
 
@@ -773,12 +1122,20 @@ def run_case_visualization(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nErstelle Case-Transform-Visualisierungen in {output_dir} …")
-    plot_transform_overview(orig_ds, new_ds, center, drehpunkt_pos,
-                            markers, output_dir)
-    plot_displacement_summary(orig_ds, T, translation, output_dir)
-    plot_transform_3d(orig_ds, new_ds, center, drehpunkt_pos, markers,
-                      output_dir, T=T, geom=geom, volume_hu=volume_hu,
-                      ct_surface=ct_surface)
+    # Pro-Plot-Isolation: ein fehlschlagender Plot darf die anderen nicht kippen.
+    plots = (
+        lambda: plot_transform_overview(orig_ds, new_ds, center, drehpunkt_pos,
+                                        markers, output_dir),
+        lambda: plot_displacement_summary(orig_ds, T, translation, output_dir),
+        lambda: plot_transform_3d(orig_ds, new_ds, center, drehpunkt_pos, markers,
+                                  output_dir, T=T, geom=geom, volume_hu=volume_hu,
+                                  ct_surface=ct_surface),
+    )
+    for fn in plots:
+        try:
+            fn()
+        except Exception as e:
+            print(f"  (!) Case-Plot uebersprungen: {e}")
     print("Case-Visualisierung abgeschlossen.")
 
 
@@ -790,10 +1147,28 @@ def run_visualization(results: dict, output_dir: Path) -> None:
     """Erstellt alle Plots fuer ein bereits analysiertes results-Dict."""
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nErstelle Visualisierungen in {output_dir} ...")
-    plot_volumes(results, output_dir)
-    plot_shape_metrics(results, output_dir)
-    plot_distances(results, output_dir)
-    plot_centroids_3d(results, output_dir)
+    expected = {
+        "plot_volumes": "volumes.png",
+        "plot_shape_metrics": "shape_metrics.png",
+        "plot_distances": "distances.png",
+        "plot_centroids_3d": "centroids_3d.png",
+        "plot_proximity_matrix": "proximity_matrix.png",
+        "plot_nearest_critical_oar": "nearest_critical_oar.png",
+        "plot_sphericity_vs_elongation": "sphericity_vs_elongation.png",
+        "plot_gtv_ptv_margin": "gtv_ptv_margin.png",
+    }
+    for fn in (plot_volumes, plot_shape_metrics, plot_distances,
+               plot_centroids_3d, plot_proximity_matrix,
+               plot_nearest_critical_oar, plot_sphericity_vs_elongation,
+               plot_gtv_ptv_margin):
+        try:
+            fn(results, output_dir)
+            png = expected.get(fn.__name__)
+            if png and not (output_dir / png).exists():
+                # Plot hat sich wegen fehlender Daten still beendet -> sichtbar machen
+                print(f"  (-) {fn.__name__} uebersprungen (keine passenden Daten)")
+        except Exception as e:   # ein fehlgeschlagener Plot darf den Rest nicht stoppen
+            print(f"  (!) {fn.__name__} uebersprungen: {e}")
     write_statistics(results, output_dir)
     print("Visualisierung abgeschlossen.")
 

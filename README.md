@@ -65,8 +65,9 @@ python -m dicom_file_modifier.visualizer data/0000000171/RS.dcm \
 
 This creates:
 - `volumes.png`: Horizontal bar chart of all structure volumes, colour-coded by type
-- `shape_metrics.png`: Grouped bar chart of sphericity, compactness, elongation per structure
-- `distances.png`: Grouped bar chart of min/Hausdorff/centroid distances for the 25 most critical Target–OAR pairs
+- `shape_metrics.png`: Category-grouped heatmap of sphericity, solidity, elongation (anatomical structures)
+- `distances.png`: Lollipop of min-distance + HD95 for Target↔serial-OAR pairs, with 3/5 mm thresholds
+- `proximity_matrix.png`, `nearest_critical_oar.png`, `sphericity_vs_elongation.png`, `gtv_ptv_margin.png`: additional SRS / multi-metastasis plots
 - `centroids_3d.png`: 3D scatter of structure centroids in patient space, marker size ∝ volume
 - `statistics.txt`: Full numerical summary of all metrics
 
@@ -235,15 +236,15 @@ Sphericity describes how closely a structure resembles a sphere. It is defined a
 
 $$\Psi = \frac{\pi^{1/3} \cdot (6V)^{2/3}}{A_{\text{surface}}}$$
 
-A value of 1.0 corresponds to a perfect sphere; smaller values indicate irregular or elongated shapes. Since the true surface area is not trivial to determine from contour data, the **surface area of the convex hull** of the point cloud is used as an approximation (calculated via `scipy.spatial.ConvexHull`).
+A value of 1.0 corresponds to a perfect sphere; smaller values indicate irregular or elongated shapes. By the isoperimetric inequality $\Psi \le 1$ for **any** solid, but this holds only when $V$ and $A$ describe the *same* body. The volume $V$ and surface area $A$ are therefore both taken from a **single consistent voxel mask**: the stacked contours are rasterised onto a local grid (in-plane via `matplotlib.path`, slice spacing in z), the volume is the filled voxel volume, and the surface area is obtained from a marching-cubes mesh of that mask (`skimage.measure`). The result is clamped to $(0,1]$. (Earlier versions mixed a planimetric slice-stack volume with a convex-hull surface area — two different bodies — which produced unphysical values $\Psi > 1$ on small near-spherical targets.) If rasterisation is unavailable the code falls back to a convex-hull-consistent estimate.
 
-#### Compactness
+#### Solidity
 
-Compactness relates the actual volume to the volume of the convex hull:
+Solidity (formerly mislabelled "compactness"; the scikit-image / ImageJ name is *solidity*) relates the actual volume to the volume of the convex hull:
 
-$$K = \frac{V}{V_{\text{convex}}}$$
+$$S = \frac{V_{\text{mask}}}{V_{\text{convex}}}$$
 
-A value close to 1.0 means the structure has few indentations or cavities. Low values indicate concave or highly irregular shapes, which may be clinically relevant for tumors that wrap around other structures.
+A value of 1.0 means the structure is convex (few indentations or cavities); lower values indicate concave or highly irregular shapes, which may be clinically relevant for tumors that wrap around other structures. Because a body is contained in its convex hull, $S \le 1$ by definition; the numerator uses the rasterised voxel volume (not the inflated planimetric volume) and the result is clamped to $(0,1]$. For multi-component unions / dose shells / optimisation structures (flagged `n_components > 1` / `shape_valid = false`) the convex-hull metrics are not meaningful and are excluded from the shape plots.
 
 #### Elongation
 
@@ -297,9 +298,9 @@ Large structures can comprise tens of thousands of contour points. To perform di
 
 ## Limitations
 
-- **No voxel-based analysis:** The script works exclusively with contour points from the RTSTRUCT file. For overlap metrics like the **Dice coefficient** or **Conformity Number**, the associated CT would be required as a reference grid to rasterize the contours into a 3D voxel grid.
-- **Surface approximation:** Sphericity uses the convex hull as an approximation of the actual surface. For structures with strong indentations, the surface is underestimated and sphericity correspondingly overestimated.
-- **Planimetric volume:** Volume calculation assumes equidistant slice spacing. With non-equidistant slices, the mean spacing is used, which can lead to small inaccuracies.
+- **No inter-structure overlap metrics:** Distance/volume work from contour points (the reported volume is the planimetric slice-stack volume). Sphericity/solidity additionally rasterise each structure onto its **own** local voxel grid, but **Dice / Jaccard / Conformity Number** between two structures still require a *common* reference grid (the associated CT) and are not implemented.
+- **Surface approximation:** Sphericity's surface area is taken from a marching-cubes mesh of the rasterised voxel mask (consistent with the mask volume, so $\Psi \le 1$). The mask resolution is bounded for performance, so the surface is a discretised approximation; very thin or sub-voxel features may be under-resolved.
+- **Planimetric volume:** The reported volume assumes equidistant slice spacing; with non-equidistant slices the mean spacing is used, which can introduce small inaccuracies. (A voxel-volume cross-check is reported alongside in `statistics.txt`.)
 - **Not a clinical diagnostic tool:** The script serves geometric analysis and does not replace clinical evaluation by a medical physicist or radiation therapist.
 
 ## Used Libraries
@@ -726,38 +727,30 @@ A histogram (the previous implementation) is only meaningful when many samples a
 
 **Clinical relevance:** Volume is the primary metric for Target coverage (PTV volume drives monitor unit calculation) and OAR sparing (e.g., mean brain dose correlates with brain volume irradiated). Unexpected outliers in volume are a common QA flag.
 
-### 2. `shape_metrics.png` – Shape Metrics Comparison
+### 2. `shape_metrics.png` – Shape Metrics Heatmap
 
-**Chart type:** Three grouped bar charts side by side (one panel per metric).
+**Chart type:** Category-grouped heatmap table (rows = anatomical structures, columns = sphericity / solidity / elongation), with a category colour strip on the left.
 
-Plotting all three shape metrics (sphericity, compactness, elongation) in a single figure with a consistent structure ordering allows direct visual comparison. A reference line at 1.0 is drawn for sphericity and compactness, since 1.0 is the theoretical maximum for a convex, sphere-like structure.
+A heatmap replaces the earlier three grouped bar charts: with ~40 structures the rotated x-axis labels were unreadable, and the heatmap lets outliers (e.g. the spinal cord's elongation of ~9) be spotted at a glance. Sphericity and solidity use a 0→1 diverging colormap (green = round / convex), elongation a sequential map (darker = more stretched). **Only single-component anatomical structures** (Targets + OARs with `shape_valid = true`) are shown; multi-component helper/union/shell structures are excluded because their convex-hull metrics are meaningless (they remain listed in `statistics.txt`).
 
-**Sphericity** quantifies how closely the structure resembles a sphere: values near 1 indicate round, regular shapes; values well below 1 indicate irregular or elongated structures. Clinically, low sphericity in a PTV may indicate a complex shape requiring more beam arrangements.
+**Sphericity** quantifies how closely the structure resembles a sphere (round PTVs near 1; complex shapes lower → may need more beam arrangements). **Solidity** (volume / convex-hull volume) detects concavity: below ~0.85 suggests the structure wraps around other anatomy (e.g. a C-shaped PTV around the brainstem). **Elongation** (sqrt of largest-to-smallest PCA eigenvalue ratio) measures directional stretching; high elongation with low sphericity in the spinal cord confirms its cylindrical nature, while unexpectedly high elongation in a GTV may indicate a drawing artefact.
 
-**Compactness** (volume / convex hull volume) detects concavity: a value below ~0.85 suggests the structure wraps around other anatomy (e.g., a C-shaped PTV around the brainstem). This is important when choosing between conformal arc and IMRT/VMAT techniques.
+### 3. `distances.png` – Critical Target↔OAR Distance Lollipop
 
-**Elongation** (sqrt of largest-to-smallest PCA eigenvalue ratio) measures directional stretching. High elongation combined with low sphericity in an OAR such as the spinal cord confirms its cylindrical nature, which is expected. Unexpectedly high elongation in a GTV may indicate a drawing artefact.
-
-### 3. `distances.png` – Target–OAR Distance Bar Chart
-
-**Chart type:** Grouped bar chart with three distance types per pair, limited to the 25 Target–OAR pairs with the smallest minimum distance (most critical first).
+**Chart type:** Horizontal lollipop plot — one row per Target↔**serial-OAR** pair, sorted ascending by minimum distance (most critical on top). The filled dot is the minimum distance, the open marker is HD95, and a connecting line spans the two. Dashed lines mark the 3 mm and 5 mm clinical thresholds; rows below 5 mm are highlighted red.
 
 **Design decisions:**
-- **Only Target–OAR pairs** are shown. Target–Target and OAR–OAR distances are less clinically meaningful for plan optimisation; they can always be retrieved from `statistics.txt`.
-- **Sorted ascending by minimum distance**: the most critical proximity relationships appear on the left.
-- **Cap at 25 pairs**: prevents figure overflow. With 65 structures, all pairwise combinations produce over 2000 entries — a bar chart of that size is unreadable (198,660 × 600 px) and clinically useless.
-- **5 mm threshold line**: most institutional planning protocols flag structures within ~5 mm of a Target boundary as requiring explicit dose–volume constraint review. This line immediately highlights which OARs fall into the critical zone.
+- **Only Target↔serial-OAR pairs** (brainstem, cord, optic nerves, chiasm, pituitary) are shown — these are the proximity-critical, dose-limiting organs. The earlier "smallest minimum distance" ranking surfaced clinically meaningless *containment* pairs (a PTV inside its own union, or inside the whole brain — ~0 mm by construction); category-aware filtering removes them. Broader proximity is covered by `proximity_matrix.png`.
+- **HD95 instead of raw Hausdorff** as the companion metric: the raw maximum Hausdorff is dominated by single outliers, so the 95th-percentile variant is shown for robustness.
+- Min/HD95/Hausdorff/ASSD/centroid distances for all pairs remain available in `statistics.txt`.
 
-**Three distance types** are shown simultaneously per pair:
-- *Minimum distance*: the closest point between two contour surfaces; 0 mm means overlap.
-- *Hausdorff distance*: the worst-case separation; indicates maximum excursion of one structure towards the other.
-- *Centroid distance*: robust gross separation; useful as a sanity check (should always exceed minimum distance).
+All distances are computed **exactly** (full KD-tree, deterministic) — earlier versions randomly sub-sampled the point clouds without a seed, which over-reported clearance (the unsafe direction) and was non-reproducible.
 
 ### 4. `centroids_3d.png` – Spatial Centroid Map
 
 **Chart type:** 3D scatter plot using matplotlib's mpl_toolkits.mplot3d.
 
-All structure centroids are plotted in the DICOM patient coordinate system (X=left, Y=posterior, Z=superior). Marker size scales with the square root of structure volume, so large structures are visually prominent without dominating. Targets use filled circles, OARs use triangles. The 3D box aspect ratio is set proportional to the data extent in each axis, so equal millimetre distances render as equal lengths and the spatial layout is not distorted.
+Structure centroids are plotted in the DICOM patient coordinate system (X=left, Y=posterior, Z=superior), coloured by category (Target / serial OAR / parallel OAR). Marker size scales with the square root of structure volume. Instead of labelling all ~40 centroids (previously an unreadable label tangle), only the serial OARs are labelled and the Targets are numbered 1…N with a side legend mapping number → lesion (POINT markers and the external body contour are excluded). The 3D box aspect ratio is set proportional to the data extent in each axis, so equal millimetre distances render as equal lengths.
 
 **Clinical relevance:** This plot answers the question "where is everything relative to everything else?" at a glance. It is particularly useful for multi-metastasis cases (e.g., the example dataset has 7 brain metastases): one can verify that all GTV/PTV pairs are spatially co-located and that the OARs (brainstem, optic chiasm, cochleae) are in the expected positions.
 
@@ -765,7 +758,18 @@ All structure centroids are plotted in the DICOM patient coordinate system (X=le
 
 ### 5. `statistics.txt` – Numerical Summary
 
-A structured plain-text file with per-structure details (volume, centroid, bounding box, all three shape metrics) and aggregated distance statistics (mean, std, min, max for each distance type, plus a full pairwise table). Suitable for copy-paste into clinical reports or further spreadsheet analysis.
+A structured plain-text file, grouped by category (Targets, serial OARs, parallel OARs, helper structures), with per-structure details (volume + voxel cross-check, equivalent-sphere diameter, max 3D diameter, centroid, bounding box, sphericity, solidity, elongation, component count) and aggregated Target↔OAR distance statistics (mean/std/min/max of min, HD95, Hausdorff and ASSD), the most critical pairs, and a GTV→PTV margin check. Suitable for copy-paste into clinical reports or further spreadsheet analysis.
+
+### 6. Additional clinical plots (multi-metastasis / SRS)
+
+- **`proximity_matrix.png`** – heatmap of minimum distance (mm) for every PTV (rows) × critical OAR (columns: serial OARs plus eyes/lenses/hippocampi), colour-banded (red ≤2, orange ≤5, yellow ≤10, light-green ≤20, green >20 mm). One glance shows which metastasis threatens which organ.
+- **`nearest_critical_oar.png`** – per-PTV triage bar of the single nearest serial OAR (labelled with the organ and distance), sorted, with 3 mm / 5 mm threshold lines.
+- **`sphericity_vs_elongation.png`** – scatter of shape character for anatomical structures (x = elongation, y = sphericity, marker size ∝ √volume, colour = category); round targets cluster top-left, elongated serial OARs (cord, optic nerves) sit far right.
+- **`gtv_ptv_margin.png`** – per-lesion GTV vs PTV volume (log axis) with the implied isotropic margin (from equivalent-sphere radii), a quick check that every metastasis received a consistent CTV→PTV expansion.
+
+### Structure classification
+
+Before any plotting, each ROI is classified into **Target / serial-OAR / parallel-OAR / helper / external / marker** (`classify_structure`), so every plot shares one colour vocabulary and helper/union/optimisation structures (e.g. `h_PTV_gesamt`, dose shells, `opt system`) and POINT markers / the external body contour are kept out of the clinical plots and metrics. GTV/PTV pairs are matched by a lesion key derived from the ROI name.
 
 ## Case Transform Visualisation
 
