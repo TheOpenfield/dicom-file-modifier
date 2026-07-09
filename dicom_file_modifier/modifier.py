@@ -14,9 +14,11 @@ Zwei Methoden:
               Einschränkung: Manche Planungssysteme lehnen schräge IOP ab.
 
 Rotationskonvention:
-  Extrinsisch XYZ – erst rx um feste X-Achse, dann ry um feste Y-Achse,
-  dann rz um feste Z-Achse (DICOM-Patientenkoordinaten: X=links, Y=posterior,
-  Z=superior).  Rotationszentrum = geometrischer Mittelpunkt des Volumens.
+  Intrinsisch XYZ – erst rx um die X-Achse, dann ry um die mitgedrehte
+  Y-Achse, dann rz um die resultierende Z-Achse (SciPy-Großbuchstaben-
+  Konvention; dieselbe Matrix wie eine extrinsische ZYX-Rotation um die
+  festen DICOM-Patientenachsen: X=links, Y=posterior, Z=superior).
+  Rotationszentrum = geometrischer Mittelpunkt des Volumens.
 
 Verwendung:
   python -m dicom_file_modifier.modifier <CT-Verzeichnis> [Optionen]
@@ -146,7 +148,7 @@ def build_rigid_transform(
     Erstellt eine 4×4 starre Transformationsmatrix.
 
     Reihenfolge:
-      1. Rotation extrinsisch XYZ um das Volumenzentrum
+      1. Rotation intrinsisch XYZ (SciPy "XYZ") um das Volumenzentrum
       2. Translation
 
     Vorwärts-Transform (Original → Neu):
@@ -226,6 +228,10 @@ def apply_metadata_transform(slices: list, T: np.ndarray) -> list:
     """
     Aktualisiert ImagePositionPatient und ImageOrientationPatient (Vorwärts-Transform).
     Pixeldaten bleiben byte-identisch → HU-Werte exakt erhalten.
+
+    SOPInstanceUID bleibt vorerst unverändert; die endgültige Vergabe der neuen
+    SOP-UIDs erfolgt zentral in :func:`save_ct_series` (damit auch die
+    Old→New-SOP-Map dort einheitlich aufgebaut werden kann).
     """
     R = T[:3, :3]
     new_slices = []
@@ -242,7 +248,6 @@ def apply_metadata_transform(slices: list, T: np.ndarray) -> list:
         new_iop = np.concatenate([R @ old_iop[:3], R @ old_iop[3:]])
         nd.ImageOrientationPatient = [f"{v:.6f}" for v in new_iop]
 
-        nd.SOPInstanceUID = generate_uid()
         new_slices.append(nd)
     return new_slices
 
@@ -255,7 +260,9 @@ def save_ct_series(
     slices: list,
     output_dir: str,
     new_volume_hu: "np.ndarray | None" = None,
-) -> None:
+    series_description_suffix: str = "_transformed",
+    frame_of_reference_uid: "str | None" = None,
+) -> dict:
     """
     Speichert CT-Slices als DICOM-Dateien mit neuer SeriesInstanceUID.
 
@@ -264,17 +271,46 @@ def save_ct_series(
     - new_volume_hu ≠ None  →  Pixeldaten werden aus dem Volumen geschrieben;
                                Metadaten kommen aus den Original-Slices
                                (resample-Methode).
+
+    series_description_suffix:
+        Suffix, das an das Original-SeriesDescription angehängt wird.
+        Default ``"_transformed"`` (Verhalten unverändert für ältere Aufrufer).
+
+    frame_of_reference_uid:
+        Wenn ``None`` (Default), bleibt die FrameOfReferenceUID der Slices
+        unverändert.  Wenn ein String, wird sie auf jedem geschriebenen Slice
+        überschrieben (z. B. wenn das aufrufende Tool eine neue FoR vergibt).
+
+    Rückgabe:
+        Dict mit folgenden Keys, hilfreich für nachgelagerte Schritte
+        (z. B. RTSTRUCT-UID-Rewriting):
+
+        - ``"series_uid"``:                  neue SeriesInstanceUID (str)
+        - ``"frame_of_reference_uid_used"``: tatsächlich geschriebene FoR-UID (str | None)
+        - ``"sop_map"``:                     dict {alte_SOPInstanceUID: neue_SOPInstanceUID}
+                                             (eine Eintragung pro Slice)
     """
     os.makedirs(output_dir, exist_ok=True)
     series_uid = generate_uid()
+    sop_map: dict = {}
+    for_used: "str | None" = None
 
     for k, ds in enumerate(slices):
         nd = copy.deepcopy(ds)
         nd.SeriesInstanceUID = series_uid
-        nd.SOPInstanceUID    = generate_uid()
+
+        old_sop = str(getattr(ds, "SOPInstanceUID", ""))
+        new_sop = generate_uid()
+        nd.SOPInstanceUID = new_sop
+        if old_sop:
+            sop_map[old_sop] = str(new_sop)
+
+        if frame_of_reference_uid is not None:
+            nd.FrameOfReferenceUID = frame_of_reference_uid
+        for_used = str(getattr(nd, "FrameOfReferenceUID", "")) or for_used
 
         orig_desc = str(getattr(ds, "SeriesDescription", "CT"))
-        nd.SeriesDescription = orig_desc + "_transformed"
+        nd.SeriesDescription = orig_desc + series_description_suffix
 
         if new_volume_hu is not None:
             slope     = float(getattr(ds, "RescaleSlope",     1.0))
@@ -296,6 +332,11 @@ def save_ct_series(
         nd.save_as(out_path)
 
     print(f"  {len(slices)} Slices gespeichert -> {output_dir}")
+    return {
+        "series_uid": str(series_uid),
+        "frame_of_reference_uid_used": for_used,
+        "sop_map": sop_map,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -520,7 +561,7 @@ def main() -> None:
     grp_t.add_argument("--tz", type=float, default=0.0, metavar="mm",
                        help="Verschiebung in Z-Richtung (Superior+)")
 
-    grp_r = parser.add_argument_group("Rotation [°]  –  extrinsisch XYZ um Volumenmitte")
+    grp_r = parser.add_argument_group("Rotation [°]  –  intrinsisch XYZ um Volumenmitte")
     grp_r.add_argument("--rx", type=float, default=0.0, metavar="deg",
                        help="Rotation um X-Achse (Pitch)")
     grp_r.add_argument("--ry", type=float, default=0.0, metavar="deg",
@@ -573,7 +614,7 @@ def main() -> None:
     # ── Transformationsmatrix ───────────────────────────────────────────────
     print(f"\nTransformation:")
     print(f"  Translation  : tx={args.tx} mm,  ty={args.ty} mm,  tz={args.tz} mm")
-    print(f"  Rotation     : rx={args.rx}°,  ry={args.ry}°,  rz={args.rz}°  [extrinsisch XYZ]")
+    print(f"  Rotation     : rx={args.rx}°,  ry={args.ry}°,  rz={args.rz}°  [intrinsisch XYZ]")
     print(f"  Methode      : {args.method}")
 
     T = build_rigid_transform(
