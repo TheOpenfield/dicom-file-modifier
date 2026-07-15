@@ -17,27 +17,27 @@ Each module is invoked as `python -m dicom_file_modifier.<module>`:
 
 ```bash
 # Geometric analysis of an RTSTRUCT file → JSON + console summary
-python -m dicom_file_modifier.analyzer data/0000000171/RS.dcm --output output/
+python -m dicom_file_modifier.analyzer data/<case-id>/RS.dcm --output output/
 
 # Plots + statistics.txt from an RTSTRUCT file
-python -m dicom_file_modifier.visualizer data/0000000171/RS.dcm --output output/
+python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm --output output/
 # Optional structure selection:
-python -m dicom_file_modifier.visualizer data/0000000171/RS.dcm \
+python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm \
     --targets GTV,PTV --oars Hirnstamm,Rueckenmark --output output/
 
 # Rigid body transform of a CT series (translation mm, rotation deg)
-python -m dicom_file_modifier.modifier data/0000000171/CT \
+python -m dicom_file_modifier.modifier data/<case-id>/CT \
     --tx 10 --ty 0 --tz -5 --rx 0 --ry 0 --rz 15 \
     --output output/ct_transformed
 
 # Lockstep transform: CT + RTSTRUCT in one go (case-folder workflow)
-python -m dicom_file_modifier.case_modifier data/0000000171 \
+python -m dicom_file_modifier.case_modifier data/<case-id> \
     --tx 10 --ty 0 --tz -5 --rx 0 --ry 0 --rz 15 \
     --center marker:HS1 --output output/run1
 # List POINT-type markers (potential rotation centres) and exit
-python -m dicom_file_modifier.case_modifier data/0000000171 --list-markers
+python -m dicom_file_modifier.case_modifier data/<case-id> --list-markers
 # Identity-transform self-test (exit 0 = pass)
-python -m dicom_file_modifier.case_modifier data/0000000171 --self-test
+python -m dicom_file_modifier.case_modifier data/<case-id> --self-test
 ```
 
 Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `resample`; `metadata` keeps pixel data byte-identical and only rewrites IPP/IOP), `--order {0,1,3}` (interpolation order; 0 preserves exact discrete HU values), `--no-viz` to skip the Plotly HTML output.
@@ -55,13 +55,13 @@ Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions �
 
 Key conventions:
 - Contours are kept as a `list[np.ndarray]`, one (N,3) array per slice. `contours_to_points` flattens them when a unified point cloud is needed.
-- Volume is planimetric (Shoelace area × mean slice spacing). Surface area for sphericity uses the convex hull of the point cloud, not the true contour surface.
-- Distance computations subsample point clouds (defaults: 5000 for min-distance via `cKDTree`, 3000 for Hausdorff) for tractability — see the README "Performance Notes" section.
-- Structure classification (`PTV`/`CTV`/`GTV`/`OAR`) comes from `RTROIObservationsSequence.RTROIInterpretedType`.
+- Volume is planimetric (Shoelace area × mean slice spacing). Sphericity/solidity rasterise each structure onto its own local voxel grid (`matplotlib.path` in-plane) and take volume + surface from that one mask (surface via `skimage.measure.marching_cubes`); the convex hull is only a fallback.
+- Distance computations are exact and deterministic (one `cKDTree` query pair yields min/Hausdorff/HD95/ASSD); only clouds > 50,000 points are thinned to that cap with a fixed seed — see the README "Performance Notes" section.
+- Structure classification into Target / serial-OAR / parallel-OAR / helper / external / marker is done by `classify_structure` (ROI name + `RTROIInterpretedType` + contour geometry; name rules override mistagged DICOM types).
 
 ### `modifier.py` — CT rigid body transform
 Two transform paths sharing the same affine math:
-- `--method resample` (default): builds the voxel-to-patient affine `A` from IOP/IPP/PixelSpacing/slice-spacing, composes `M = A⁻¹ T⁻¹ A`, and **inverse-maps** each output voxel back into the source volume using `scipy.ndimage.map_coordinates`. Processed in **20-slice chunks** to keep peak memory ~80 MB on typical 512×512×320 volumes. Out-of-bounds voxels are filled with −1000 HU.
+- `--method resample` (default): builds the voxel-to-patient affine `A` from IOP/IPP/PixelSpacing/slice-spacing, composes `M = A⁻¹ T⁻¹ A`, and **inverse-maps** each output voxel back into the source volume using `scipy.ndimage.map_coordinates`. Processed in **20-slice chunks** to bound transient coordinate-array memory (two 4×n float64 arrays of ~160 MB each per chunk, vs. ~2.5 GB per whole-volume array) on typical 512×512×320 volumes. Out-of-bounds voxels are filled with −1000 HU.
 - `--method metadata`: pixel bytes untouched; only `ImagePositionPatient` and `ImageOrientationPatient` are rewritten via the forward transform `T`. Guarantees exact HU preservation but produces non-axial slices that some TPS may not accept.
 
 Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` — in SciPy uppercase = intrinsic; the same matrix as an extrinsic ZYX rotation) about the volume's geometric centre; the offset is folded into `T` so a single 4×4 matrix represents the whole transform. All output series get fresh `SeriesInstanceUID` and per-slice `SOPInstanceUID`s. Optional Plotly HTML viz extracts surfaces with marching cubes (`skimage.measure.marching_cubes`).
@@ -72,8 +72,8 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
 1. `discover_case` auto-finds `CT/` subdir and the unique `RS*.dcm` (override with `--rs`); warns about sibling `RP*`/`RD*` that do not get transformed.
 2. `validate_ct_geometry` enforces uniform `ImageOrientationPatient`, `PixelSpacing`, and slice spacing within 1%. `validate_for_consistency` checks that the RTSTRUCT references the CT's `FrameOfReferenceUID`.
 3. `find_point_markers` enumerates all ROIs whose `ContourGeometricType == "POINT"` — these become valid rotation centres alongside `volume` and explicit `x,y,z`. `parse_center_spec` handles all three forms; `interactive_center_prompt` is used when stdin is a TTY and no `--center` is given.
-4. CT transform runs through `modifier`'s `build_rigid_transform`, `resample_volume` / `apply_metadata_transform`, and `save_ct_series`. `save_ct_series` was extended (Stage 1) to return a `{series_uid, frame_of_reference_uid_used, sop_map}` dict so the RS rewrite can map old→new SOP UIDs.
-5. `transform_rtstruct` applies `T` to every `ContourData` triple (rigid → no point-cloud distortion; volume preserved), rewrites every `ReferencedSOPInstanceUID` via `sop_map`, updates `RTReferencedSeriesSequence.SeriesInstanceUID` to point at the new CT, optionally mints a new `FrameOfReferenceUID` (--new-frame-of-reference), and inserts a synthetic POINT-type ROI named `Drehpunkt` at `centre + (tx,ty,tz)` so the planner sees the rotation centre at a glance.
+4. CT transform runs through `modifier`'s `build_rigid_transform`, `resample_volume` / `apply_metadata_transform`, and `save_ct_series`. `save_ct_series` returns a `{series_uid, frame_of_reference_uid_used, sop_map}` dict so the RS rewrite can map old→new SOP UIDs.
+5. `transform_rtstruct` applies `T` to every `ContourData` triple (rigid → no point-cloud distortion; 3D volume preserved), rewrites every `ReferencedSOPInstanceUID` via `sop_map`, updates `RTReferencedSeriesSequence.SeriesInstanceUID` to point at the new CT, optionally mints a new `FrameOfReferenceUID` (--new-frame-of-reference), and inserts a synthetic POINT-type ROI named `Drehpunkt` at `centre + (tx,ty,tz)` so the planner sees the rotation centre at a glance.
 6. Aria-visible metadata: `StructureSetLabel` truncated to DICOM SH (16 chars) with the suffix preserved; `StructureSetDescription` carries the full transform string (LO, 64 chars) via `build_transform_description`; `SeriesDescription` mirrors the CT's; `SeriesNumber += 1000` so the transformed series sorts adjacent to but distinct from the original.
 7. `--self-test` runs an identity transform end-to-end and asserts that all `ContourData` values match the input within 1e-4 mm. `--verify` after a real run computes per-ROI centroids and compares with `T @ centroid_orig` (centroids are linear under rigid transforms). `--dry-run` validates inputs and prints `T` + planned output paths without writing.
 
