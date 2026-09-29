@@ -17,6 +17,7 @@ Berechnet zwischen Strukturen:
 Verwendung:
   python -m dicom_file_modifier.analyzer rtstruct.dcm [--targets PTV,CTV,GTV] [--oars Parotis,Rueckenmark]
   python -m dicom_file_modifier.analyzer rtstruct.dcm --list    # Nur Strukturnamen auflisten
+  python -m dicom_file_modifier.analyzer --self-test            # Synthetische Konsistenztests (Löcher, z-Lücken)
 
 Benötigte Packages:
   pip install pydicom numpy scipy shapely matplotlib
@@ -27,6 +28,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
+from functools import reduce
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +38,8 @@ import pydicom
 from scipy.spatial import ConvexHull
 from scipy.spatial.distance import directed_hausdorff, pdist
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 # Fester Zufallsgenerator: Distanz-/Subsample-Operationen sollen reproduzierbar
 # sein (vorher unverseedetes np.random.choice -> nicht-deterministische QA-Werte).
@@ -173,97 +178,182 @@ def contours_to_points(contours: list[np.ndarray]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 3. Volumenberechnung
+# 3. Schichten, XOR-Geometrie und Volumen
 # ---------------------------------------------------------------------------
 
-def polygon_area(pts_2d: np.ndarray) -> float:
-    """Berechnet die Fläche eines 2D-Polygons mit der Shoelace-Formel."""
-    try:
-        poly = Polygon(pts_2d)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        return abs(poly.area)
-    except Exception:
-        return 0.0
+# Konturen, deren z-Werte sich um höchstens diese Toleranz unterscheiden, liegen
+# auf derselben Schicht (DICOM-z ist pro Ebene exakt; die Toleranz fängt nur
+# Rundungsrauschen ab).
+_Z_MERGE_TOL_MM = 0.05
+# Ein z-Abstand > _GAP_FACTOR x nominale Schichtdicke gilt als Lücke
+# (fehlende Schicht oder räumlich getrennte Komponente) und wird nie überbrückt.
+_GAP_FACTOR = 1.5
 
 
-def compute_volume(contours: list[np.ndarray]) -> float:
+def _polygonal(geom):
+    """Nur die flächigen Teile einer Geometrie (``make_valid`` kann Linien liefern)."""
+    if geom.geom_type in ("Polygon", "MultiPolygon"):
+        return geom
+    parts = [g for g in getattr(geom, "geoms", [])
+             if g.geom_type in ("Polygon", "MultiPolygon")]
+    return unary_union(parts) if parts else Polygon()
+
+
+def _contour_polygon(pts: np.ndarray):
+    """Gültiges Shapely-(Multi)Polygon einer Kontur (x, y = erste zwei Spalten)
+    oder ``None`` bei < 3 Punkten bzw. verschwindender Fläche.
+
+    Ungültige Ringe (Selbstschnitt-Spitzen, wie sie Eclipse gelegentlich
+    schreibt) werden mit ``make_valid`` repariert; das erhält -- anders als
+    ``buffer(0)`` -- beide Lappen einer Schleife.  Die Reparatur MUSS vor jeder
+    Overlay-Operation erfolgen, sonst wirft GEOS eine TopologyException.
     """
-    Berechnet das Volumen in cm³.
-    Summiert Konturflächen × Schichtabstand.
+    if len(pts) < 3:
+        return None
+    try:
+        poly = Polygon(np.asarray(pts, dtype=float)[:, :2])
+        if not poly.is_valid:
+            try:
+                poly = _polygonal(make_valid(poly))
+            except Exception:
+                poly = poly.buffer(0)
+        if poly.is_empty or poly.area <= 0:
+            return None
+        return poly
+    except Exception:
+        return None
+
+
+def polygon_area(pts_2d: np.ndarray) -> float:
+    """Fläche eines 2D-Polygons (Shoelace via Shapely; 0.0 bei ungültig)."""
+    poly = _contour_polygon(np.asarray(pts_2d, dtype=float))
+    return float(poly.area) if poly is not None else 0.0
+
+
+def _group_slices(contours: list[np.ndarray],
+                  tol: float = _Z_MERGE_TOL_MM) -> list[tuple[float, list[np.ndarray]]]:
+    """Gruppiert Konturen nach Schicht, z aufsteigend: ``[(z, [pts, ...]), ...]``.
+
+    Konturen mit z-Abstand <= ``tol`` zur laufenden Gruppe gehören zur selben
+    Schicht; z der Gruppe ist der Mittelwert.  Ersetzt das frühere Runden auf
+    3 bzw. 4 Dezimalen (Volumen vs. Raster), das inkonsistent war.
+    """
+    order = sorted(range(len(contours)), key=lambda i: float(contours[i][0, 2]))
+    groups = []                      # [([z, ...], [pts, ...]), ...]
+    for i in order:
+        z = float(contours[i][0, 2])
+        if groups and z - groups[-1][0][-1] <= tol:
+            groups[-1][0].append(z)
+            groups[-1][1].append(contours[i])
+        else:
+            groups.append(([z], [contours[i]]))
+    return [(float(np.mean(zs)), pts) for zs, pts in groups]
+
+
+def _nominal_slice_spacing(zs) -> tuple[Optional[float], int]:
+    """Nominale Schichtdicke und Anzahl der z-Lücken aus Schicht-z-Werten.
+
+    Der *Mittelwert* der z-Abstände ist (z_max - z_min)/(n - 1) und wird bei
+    Lücken (fehlende Schicht, getrennte Läsionen in einer ROI) aufgebläht.
+    Stattdessen: Median der Abstände, die höchstens ``_GAP_FACTOR`` x den
+    kleinsten Abstand betragen (robust gegen Lücken und Rundungsrauschen).
+    Abstände > ``_GAP_FACTOR`` x Nominalwert werden als Lücken gezählt und
+    NICHT überbrückt.  Liefert ``(None, 0)`` bei weniger als zwei Schichten.
+    """
+    zs = np.sort(np.asarray(list(zs), dtype=float))
+    if len(zs) < 2:
+        return None, 0
+    d = np.diff(zs)
+    d_min = float(d.min())
+    if d_min <= 0:
+        return None, 0
+    dz = float(np.median(d[d <= _GAP_FACTOR * d_min]))
+    n_gaps = int(np.count_nonzero(d > _GAP_FACTOR * dz))
+    return dz, n_gaps
+
+
+def _slice_geometry(polys):
+    """XOR (Even-Odd) aller Polygone einer Schicht.
+
+    Das ist die DICOM-Semantik von ``CLOSED_PLANAR_XOR`` und die Eclipse-
+    Konvention für mehrere Konturen einer ROI auf einer Ebene: eine
+    verschachtelte Innenkontur ist ein Loch, eine Insel im Loch zählt wieder,
+    getrennte Inseln addieren sich; reihenfolgeunabhängig.  Nebenwirkung:
+    identische Doppelkonturen löschen sich aus (wie im TPS).
+    """
+    if len(polys) == 1:
+        return polys[0]
+    return reduce(lambda a, b: a.symmetric_difference(b), polys)
+
+
+def _slice_geometries(contours: list[np.ndarray]) -> list[tuple[float, object]]:
+    """Pro Schicht die XOR-Geometrie: ``[(z, geom), ...]``, nur Flächen > 0."""
+    out = []
+    for z, pts_list in _group_slices(contours):
+        polys = [p for p in (_contour_polygon(pts) for pts in pts_list) if p is not None]
+        if not polys:
+            continue
+        try:
+            geom = _slice_geometry(polys)
+        except Exception:
+            continue
+        if geom.is_empty or geom.area <= 0:      # z.B. Selbst-XOR -> leer
+            continue
+        out.append((z, geom))
+    return out
+
+
+def compute_volume(contours: list[np.ndarray], geoms=None) -> float:
+    """
+    Berechnet das Volumen in cm³ als Schichtstapel:
+    V = dz_nom * Σ_k A_k,  A_k = XOR-Fläche aller Konturen der Schicht k.
+
+    dz_nom ist die nominale Schichtdicke (``_nominal_slice_spacing``);
+    z-Lücken werden nicht überbrückt.  ``geoms`` (aus ``_slice_geometries``)
+    kann übergeben werden, um die XOR-Geometrien nicht doppelt zu berechnen.
     """
     if len(contours) < 2:
         return 0.0
-
-    # Schicht-Z-Werte und Flächen sammeln
-    slice_data = {}
-    for pts in contours:
-        z = round(pts[0, 2], 3)
-        area = polygon_area(pts[:, :2])
-        slice_data.setdefault(z, 0.0)
-        slice_data[z] += area  # Mehrere Konturen pro Schicht addieren
-
-    z_values = sorted(slice_data.keys())
-    if len(z_values) < 2:
+    dz, _ = _nominal_slice_spacing(z for z, _ in _group_slices(contours))
+    if dz is None:
         return 0.0
-
-    # Mittleren Schichtabstand bestimmen
-    dz = np.mean(np.diff(z_values))
-
-    total_area = sum(slice_data.values())
-    volume_mm3 = total_area * abs(dz)
-    return volume_mm3 / 1000.0  # mm³ -> cm³
+    if geoms is None:
+        geoms = _slice_geometries(contours)
+    total_area = sum(g.area for _, g in geoms)
+    return total_area * dz / 1000.0  # mm³ -> cm³
 
 
 # ---------------------------------------------------------------------------
 # 4. Schwerpunkt
 # ---------------------------------------------------------------------------
 
-def _polygon_centroid_xy(pts_2d: np.ndarray) -> Optional[np.ndarray]:
-    """Flächenschwerpunkt (Shoelace-Moment) eines 2D-Polygons, oder None.
-
-    Der arithmetische Mittelwert der *Eckpunkte* ist NICHT der Polygon-
-    schwerpunkt (er ist zu dicht besetzten Randabschnitten hin verzerrt); wir
-    verwenden daher shapely ``Polygon.centroid`` (= Flächenmoment-Integral).
+def compute_centroid(contours: list[np.ndarray], geoms=None) -> np.ndarray:
     """
-    try:
-        poly = Polygon(pts_2d)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty or poly.area == 0:
-            return None
-        c = poly.centroid
-        return np.array([c.x, c.y])
-    except Exception:
-        return None
+    Flächengewichteter Schwerpunkt (x, y, z) in mm.
 
-
-def compute_centroid(contours: list[np.ndarray]) -> np.ndarray:
-    """
-    Berechnet den flächengewichteten Schwerpunkt (x, y, z) in mm.
-    Jede Schicht wird mit ihrer Konturfläche gewichtet; die In-Plane-Position
-    jeder Schicht ist der echte Polygon-Flächenschwerpunkt (nicht das
-    Eckpunkt-Mittel).
+    Gewicht jeder Schicht ist ihre XOR-Fläche, die In-Plane-Position der
+    Flächenschwerpunkt der XOR-Region (Shapely ``centroid`` = Flächenmoment,
+    NICHT das Eckpunkt-Mittel, das zu dicht besetzten Randabschnitten hin
+    verzerrt wäre).  Ein Loch verschiebt den Schwerpunkt damit korrekt von
+    sich weg, statt ihn -- wie bei positiver Gewichtung der Innenkontur --
+    zu sich hin zu ziehen.
     """
     if not contours:
         return np.array([0.0, 0.0, 0.0])
+    if geoms is None:
+        geoms = _slice_geometries(contours)
 
     weighted_sum = np.zeros(3)
     total_weight = 0.0
-
-    for pts in contours:
-        area = polygon_area(pts[:, :2])
-        centroid_xy = _polygon_centroid_xy(pts[:, :2])
-        if centroid_xy is None or area <= 0:
+    for z, g in geoms:
+        c = g.centroid
+        if c.is_empty:
             continue
-        z = pts[0, 2]
-        weighted_sum += area * np.array([centroid_xy[0], centroid_xy[1], z])
-        total_weight += area
+        weighted_sum += g.area * np.array([c.x, c.y, z])
+        total_weight += g.area
 
     if total_weight == 0:
-        all_pts = contours_to_points(contours)
-        return all_pts.mean(axis=0)
-
+        return contours_to_points(contours).mean(axis=0)
     return weighted_sum / total_weight
 
 
@@ -271,20 +361,68 @@ def compute_centroid(contours: list[np.ndarray]) -> np.ndarray:
 # 5. Formanalyse
 # ---------------------------------------------------------------------------
 
+def rasterize_contours(contours: list[np.ndarray], xc: np.ndarray,
+                       yc: np.ndarray, zc: np.ndarray) -> np.ndarray:
+    """
+    Rastert Konturen per XOR auf ein gegebenes Gitter (Voxelmittelpunkte
+    ``xc``, ``yc``, ``zc`` in mm, jeweils aufsteigend) -> bool-Maske (nz, ny, nx).
+
+    Jede Kontur wird der nächsten z-Ebene zugeordnet (Toleranz: halber
+    Ebenenabstand, sonst übersprungen) und per XOR mit der Ebene kombiniert,
+    d.h. Löcher/Inseln exakt wie in ``_slice_geometry``.  Bewusst KEIN
+    Matplotlib-Compound-Path: dessen ``contains_points`` füllt verschachtelte
+    Konturen (getestet).  ``contains_points`` läuft nur über das Bounding-Box-
+    Teilgitter jeder Kontur (halbiert die Laufzeit, Pflicht für feine Raster).
+
+    Wiederverwendbar für beliebige Gitter, z.B. ein feines Dosisraster mit
+    z auf den Dosisebenen.
+    """
+    from matplotlib.path import Path as MplPath
+
+    xc = np.asarray(xc, dtype=float)
+    yc = np.asarray(yc, dtype=float)
+    zc = np.asarray(zc, dtype=float)
+    z_tol = 0.5 * float(np.min(np.diff(zc))) if len(zc) > 1 else np.inf
+    mask = np.zeros((len(zc), len(yc), len(xc)), dtype=bool)
+
+    for pts in contours:
+        if len(pts) < 3:
+            continue
+        z = float(pts[0, 2])
+        k = int(np.argmin(np.abs(zc - z)))
+        if abs(zc[k] - z) > z_tol + 1e-6:
+            continue                        # Kontur liegt auf keiner Gitterebene
+        i0 = int(np.searchsorted(xc, pts[:, 0].min()))
+        i1 = int(np.searchsorted(xc, pts[:, 0].max(), side="right"))
+        j0 = int(np.searchsorted(yc, pts[:, 1].min()))
+        j1 = int(np.searchsorted(yc, pts[:, 1].max(), side="right"))
+        if i1 <= i0 or j1 <= j0:
+            continue
+        gx, gy = np.meshgrid(xc[i0:i1], yc[j0:j1])          # (j1-j0, i1-i0)
+        try:
+            inside = MplPath(pts[:, :2]).contains_points(
+                np.column_stack([gx.ravel(), gy.ravel()]))
+        except Exception:
+            continue
+        mask[k, j0:j1, i0:i1] ^= inside.reshape(j1 - j0, i1 - i0)
+    return mask
+
+
 def _rasterize_structure(contours: list[np.ndarray],
                          target_dim: int = 96):
     """
     Rastert die gestapelten Konturen in eine binäre 3D-Voxelmaske.
 
     Liefert ``(mask, spacing, centers)`` mit ``mask`` (nz, ny, nx) bool,
-    ``spacing`` = (sz, sy, sx) in mm und ``centers`` als (N,3)-Array der
-    Voxelmittelpunkte in LPS-mm (für den Hüllen-Halbraumtest), oder ``None``
-    bei zu wenig Daten.  Eine konsistente Maske ist die Grundlage für
-    mathematisch *beschränkte* Sphärizität/Solidität (im Gegensatz zur alten,
-    inkonsistenten Mischung aus planimetrischem Volumen und konvexer Hülle).
+    ``spacing`` = (sz, sy, sx) in mm und ``centers`` = (xc, yc, zc) der
+    Voxelmittelpunkte in LPS-mm, oder ``None`` bei zu wenig Daten.  Die
+    z-Ebenen liegen exakt auf den Konturebenen (nominale Schichtdicke, siehe
+    ``_nominal_slice_spacing``); z-Lücken ergeben leere Ebenen, so dass
+    ``n_components`` getrennte Teile korrekt zählt.  Eine konsistente Maske
+    ist die Grundlage für mathematisch *beschränkte* Sphärizität/Solidität.
     """
     try:
-        from matplotlib.path import Path as MplPath
+        import matplotlib.path  # noqa: F401  (nur Verfügbarkeit prüfen)
     except Exception:
         return None
 
@@ -298,49 +436,32 @@ def _rasterize_structure(contours: list[np.ndarray],
     if span_x <= 0 or span_y <= 0:
         return None
 
-    zs = np.array(sorted({round(float(p[0, 2]), 4) for p in contours}))
-    dz = float(np.mean(np.diff(zs))) if len(zs) > 1 else 1.0
-    dz = abs(dz) if dz != 0 else 1.0
+    dz, _ = _nominal_slice_spacing(z for z, _ in _group_slices(contours))
+    s_z = dz if dz is not None else 1.0
 
     s_xy = max(span_x, span_y) / target_dim
     s_xy = float(np.clip(s_xy, 0.3, 5.0))
-    s_z = dz
     pad = 2
 
     nx = int(np.ceil(span_x / s_xy)) + 1 + 2 * pad
     ny = int(np.ceil(span_y / s_xy)) + 1 + 2 * pad
     nz = int(round(span_z / s_z)) + 1 + 2 * pad
     if nx * ny * nz > 6_000_000:          # Sicherheitskappe gegen Speicher-Spikes
-        scale = (nx * ny * nz / 6_000_000) ** (1 / 3)
-        s_xy *= scale
+        # nz ist durch die Schichtdicke fest -> nur in-plane vergröbern
+        # (Quadratwurzel, nicht Kubikwurzel).
+        s_xy *= (nx * ny * nz / 6_000_000) ** 0.5
         nx = int(np.ceil(span_x / s_xy)) + 1 + 2 * pad
         ny = int(np.ceil(span_y / s_xy)) + 1 + 2 * pad
 
-    ox, oy, oz = x0 - pad * s_xy, y0 - pad * s_xy, z0 - pad * s_z
+    ox, oy = x0 - pad * s_xy, y0 - pad * s_xy
+    oz = z0 - (pad + 0.5) * s_z            # -> zc[pad] == z0 exakt
     xc = ox + (np.arange(nx) + 0.5) * s_xy
     yc = oy + (np.arange(ny) + 0.5) * s_xy
-    gx, gy = np.meshgrid(xc, yc)          # (ny, nx)
-    grid_xy = np.column_stack([gx.ravel(), gy.ravel()])
+    zc = oz + (np.arange(nz) + 0.5) * s_z
 
-    mask = np.zeros((nz, ny, nx), dtype=bool)
-    for pts in contours:
-        z = float(pts[0, 2])
-        k = int(round((z - oz) / s_z))
-        if not (0 <= k < nz):
-            continue
-        if len(pts) < 3:
-            continue
-        try:
-            inside = MplPath(pts[:, :2]).contains_points(grid_xy)
-        except Exception:
-            continue
-        mask[k] |= inside.reshape(ny, nx)
-
+    mask = rasterize_contours(contours, xc, yc, zc)
     if not mask.any():
         return None
-
-    # Voxelmittelpunkt-Achsen (für den Hüllen-Halbraumtest in _voxel_shape_metrics)
-    zc = oz + (np.arange(nz) + 0.5) * s_z
     return mask, (s_z, s_xy, s_xy), (xc, yc, zc)
 
 
@@ -596,8 +717,11 @@ def analyze_structure(ds: pydicom.Dataset, roi_number: int, roi_name: str,
     """Vollständige Analyse einer einzelnen Struktur."""
     contours = extract_contours(ds, roi_number)
     all_pts = contours_to_points(contours)
-    volume = compute_volume(contours)
-    centroid = compute_centroid(contours)
+    slices = _group_slices(contours)
+    dz, n_gaps = _nominal_slice_spacing(z for z, _ in slices)
+    geoms = _slice_geometries(contours)          # XOR pro Schicht, einmal berechnet
+    volume = compute_volume(contours, geoms=geoms)
+    centroid = compute_centroid(contours, geoms=geoms)
     shape = compute_shape_metrics(contours, volume)
 
     return {
@@ -607,6 +731,9 @@ def analyze_structure(ds: pydicom.Dataset, roi_number: int, roi_name: str,
         "oar_subtype": oar_subtype,          # "serial" | "parallel" | None
         "lesion_key": lesion_key(roi_name),  # zum Paaren von GTV mit PTV
         "num_contours": len(contours),
+        "num_slices": len(slices),
+        "slice_spacing_mm": None if dz is None else round(dz, 3),
+        "n_gaps": n_gaps,                    # z-Lücken (nie überbrückt)
         "num_points": len(all_pts),
         "volume_cm3": round(volume, 3),
         "centroid_mm": tuple(np.round(centroid, 2)),
@@ -794,8 +921,14 @@ def _print_structure(r: dict):
     """Gibt die Analyseergebnisse einer Struktur formatiert aus."""
     s = r["shape"]
     print(f"\n  > {r['name']} (ROI #{r['roi_number']})")
-    print(f"    Konturen: {r['num_contours']} Schichten, "
+    print(f"    Konturen: {r['num_contours']} auf "
+          f"{r.get('num_slices', r['num_contours'])} Schichten, "
           f"{r['num_points']} Punkte")
+    dz = r.get("slice_spacing_mm")
+    gaps = r.get("n_gaps", 0) or 0
+    dz_txt = f"{dz:.2f} mm" if dz is not None else "n/a"
+    gap_txt = f"   (!) z-Lücken: {gaps}" if gaps else ""
+    print(f"    Schichtabstand: {dz_txt}{gap_txt}")
     print(f"    Volumen:        {r['volume_cm3']:.3f} cm³")
     print(f"    Schwerpunkt:    x={r['centroid_mm'][0]:.1f}, "
           f"y={r['centroid_mm'][1]:.1f}, z={r['centroid_mm'][2]:.1f} mm")
@@ -815,6 +948,181 @@ def _print_structure(r: dict):
 
 
 # ---------------------------------------------------------------------------
+# 7b. Self-Test (synthetische Geometrie, kein DICOM nötig)
+# ---------------------------------------------------------------------------
+
+def _synthetic_circle(z: float, r: float, cx: float = 0.0, cy: float = 0.0,
+                      n: int = 64) -> np.ndarray:
+    """Regelmäßiges n-Eck (Kreisapproximation) als (n,3)-Kontur bei Höhe z."""
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    return np.column_stack([cx + r * np.cos(t), cy + r * np.sin(t),
+                            np.full(n, float(z))])
+
+
+def _synthetic_keyhole(z: float, r_out: float, r_in: float, n: int = 64,
+                       delta: float = 1e-3) -> np.ndarray:
+    """Ring als EINE Kontur in Keyhole-Technik: Außenbogen gegen den Uhrzeiger-
+    sinn, schmaler Kanal (Breite ~2*delta), Innenbogen im Uhrzeigersinn zurück."""
+    t = np.linspace(delta, 2.0 * np.pi - delta, n)
+    outer = np.column_stack([r_out * np.cos(t), r_out * np.sin(t)])
+    inner = np.column_stack([r_in * np.cos(t[::-1]), r_in * np.sin(t[::-1])])
+    xy = np.vstack([outer, inner])
+    return np.column_stack([xy, np.full(len(xy), float(z))])
+
+
+def _run_self_test() -> int:
+    """Konsistenztests für XOR-Löcher und z-Lücken.  Rückgabe 0 = PASS, 1 = FAIL."""
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(bool(ok))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
+
+    def close(a, b, rel=1e-9):
+        return abs(a - b) <= rel * max(abs(a), abs(b), 1e-12)
+
+    def sphere(z_center, R=10.0):
+        return [_synthetic_circle(z_center + z, np.sqrt(R * R - z * z))
+                for z in np.arange(-9.0, 9.5, 1.0)]
+
+    def slice_info(contours):
+        sl = _group_slices(contours)
+        dz, g = _nominal_slice_spacing(z for z, _ in sl)
+        return len(sl), dz, g
+
+    print("\nAnalyzer Self-Test (synthetische Konturen, XOR-Löcher und z-Lücken)")
+    print("-" * 70)
+
+    # 1) Nominale Schichtdicke / Lücken
+    dz, g = _nominal_slice_spacing([5.0])
+    check("Schichtdicke: eine Schicht -> (None, 0)", dz is None and g == 0)
+    dz, g = _nominal_slice_spacing([0.0, 3.0])
+    check("Schichtdicke: [0,3] -> (3, 0 Lücken)", close(dz, 3.0) and g == 0)
+    dz, g = _nominal_slice_spacing([0.0, 1.0, 32.0])
+    check("Schichtdicke: [0,1,32] -> (1, 1 Lücke)", close(dz, 1.0) and g == 1,
+          f"dz={dz}, gaps={g}")
+    dz, g = _nominal_slice_spacing([0.0, 0.999, 2.0])
+    check("Schichtdicke: Rundungsrauschen [0,0.999,2] -> ~1, 0 Lücken",
+          abs(dz - 1.0) < 2e-3 and g == 0, f"dz={dz}")
+    dz, g = _nominal_slice_spacing([0, 1, 2, 3, 4, 7, 10, 13])
+    check("Schichtdicke: [0..4,7,10,13] -> (1, 3 Lücken)", close(dz, 1.0) and g == 3,
+          f"dz={dz}, gaps={g}")
+
+    # 2) Schichtgruppierung
+    grp = _group_slices([_synthetic_circle(0.0, 5), _synthetic_circle(0.02, 5),
+                         _synthetic_circle(1.0, 5)])
+    check("Schichtgruppierung: z=0/0.02/1.0 -> 2 Schichten, Repräsentant 0.01",
+          len(grp) == 2 and abs(grp[0][0] - 0.01) < 1e-9)
+
+    Z = np.arange(20, dtype=float)          # 20 Schichten à 1 mm
+    A20 = polygon_area(_synthetic_circle(0, 20)[:, :2])
+    A10 = polygon_area(_synthetic_circle(0, 10)[:, :2])
+    A4 = polygon_area(_synthetic_circle(0, 4)[:, :2])
+
+    # 3) Volle Scheibe (Referenz)
+    disk = [_synthetic_circle(z, 20) for z in Z]
+    v_disk = compute_volume(disk)
+    s_disk = compute_shape_metrics(disk, v_disk)
+    c_disk = compute_centroid(disk)
+    check("Scheibe r=20: V = A20*20 exakt", close(v_disk, A20 * 20 / 1000),
+          f"V={v_disk:.4f}")
+    check("Scheibe: Solidität 1.0, 1 Komponente",
+          s_disk["solidity"] == 1.0 and s_disk["n_components"] == 1,
+          f"sol={s_disk['solidity']}, nc={s_disk['n_components']}")
+    check("Scheibe: Schwerpunkt (0,0,9.5)", np.allclose(c_disk, [0, 0, 9.5], atol=1e-6),
+          f"c={np.round(c_disk, 4)}")
+
+    # 4) Verschachtelter Ring (Loch)
+    ring = [c for z in Z for c in (_synthetic_circle(z, 20), _synthetic_circle(z, 10))]
+    v_ring = compute_volume(ring)
+    s_ring = compute_shape_metrics(ring, v_ring)
+    v_ring_exp = (A20 - A10) * 20 / 1000
+    check("Ring 20/10: V = (A20-A10)*20 exakt (Loch subtrahiert)",
+          close(v_ring, v_ring_exp), f"V={v_ring:.4f}, erwartet {v_ring_exp:.4f}")
+    check("Ring: |V - pi*300*20/1000| < 0.5 %",
+          abs(v_ring - np.pi * 300 * 20 / 1000) < 0.005 * v_ring)
+    check("Ring: 1 Komponente, Solidität < 0.85",
+          s_ring["n_components"] == 1 and s_ring["solidity"] < 0.85,
+          f"sol={s_ring['solidity']}, nc={s_ring['n_components']}")
+    check("Ring: Sphärizität < Scheibe - 0.1 (Innenfläche zählt)",
+          s_ring["sphericity"] < s_disk["sphericity"] - 0.1,
+          f"{s_ring['sphericity']} vs {s_disk['sphericity']}")
+    check("Ring: Voxelvolumen innerhalb 1 % des planimetrischen",
+          abs(s_ring["volume_voxel_cm3"] - v_ring) < 0.01 * v_ring,
+          f"Vvox={s_ring['volume_voxel_cm3']}")
+    check("Ring: reihenfolgeunabhängig", close(compute_volume(ring[::-1]), v_ring))
+
+    # 5) Keyhole-Ring (eine Kontur)
+    kh = [_synthetic_keyhole(z, 20, 10) for z in Z]
+    v_kh = compute_volume(kh)
+    s_kh = compute_shape_metrics(kh, v_kh)
+    check("Keyhole-Ring: V wie verschachtelter Ring (rel. 1e-3)",
+          abs(v_kh - v_ring) < 1e-3 * v_ring, f"V={v_kh:.4f}")
+    check("Keyhole-Ring: 1 Komponente, Solidität < 0.85",
+          s_kh["n_components"] == 1 and s_kh["solidity"] < 0.85, f"sol={s_kh['solidity']}")
+
+    # 6) Insel im Loch
+    isl = [c for z in Z for c in (_synthetic_circle(z, 20), _synthetic_circle(z, 10),
+                                  _synthetic_circle(z, 4))]
+    v_isl = compute_volume(isl)
+    s_isl = compute_shape_metrics(isl, v_isl)
+    check("Insel im Loch 20/10/4: V = (A20-A10+A4)*20 exakt",
+          close(v_isl, (A20 - A10 + A4) * 20 / 1000), f"V={v_isl:.4f}")
+    check("Insel im Loch: 2 Komponenten", s_isl["n_components"] == 2,
+          f"nc={s_isl['n_components']}")
+
+    # 7) Kugel
+    sph = sphere(0.0)
+    areas = sum(polygon_area(c[:, :2]) for c in sph)
+    v_sph = compute_volume(sph)
+    s_sph = compute_shape_metrics(sph, v_sph)
+    _, _, g_sph = slice_info(sph)
+    check("Kugel R=10: V = Summe der Flächen exakt", close(v_sph, areas / 1000),
+          f"V={v_sph:.4f}")
+    check("Kugel: 0 Lücken, 1 Komponente, Sphärizität > 0.8",
+          g_sph == 0 and s_sph["n_components"] == 1 and s_sph["sphericity"] > 0.8,
+          f"sph={s_sph['sphericity']}")
+
+    # 8) Zwei Kugeln mit 60 mm Abstand in einer ROI
+    two = sphere(0.0) + sphere(60.0)
+    v_two = compute_volume(two)
+    s_two = compute_shape_metrics(two, v_two)
+    c_two = compute_centroid(two)
+    n_two, dz_two, g_two = slice_info(two)
+    check("Zwei Kugeln (60 mm Lücke): V = 2 x Kugel exakt (keine Aufblähung)",
+          close(v_two, 2 * v_sph), f"V={v_two:.4f}")
+    check("Zwei Kugeln: 2 Komponenten, 1 Lücke, 38 Schichten, dz=1",
+          s_two["n_components"] == 2 and g_two == 1 and n_two == 38 and close(dz_two, 1.0),
+          f"nc={s_two['n_components']}, gaps={g_two}, slices={n_two}, dz={dz_two}")
+    check("Zwei Kugeln: Schwerpunkt z = 30", abs(c_two[2] - 30.0) < 1e-6,
+          f"z={c_two[2]:.4f}")
+
+    # 9) Kugel mit fehlender Schicht (keine Überbrückung)
+    holey = [c for c in sphere(0.0) if abs(c[0, 2]) > 1e-9]
+    areas_h = sum(polygon_area(c[:, :2]) for c in holey)
+    v_h = compute_volume(holey)
+    s_h = compute_shape_metrics(holey, v_h)
+    _, _, g_h = slice_info(holey)
+    check("Kugel ohne z=0: V = Summe der 18 Flächen (Lücke nicht überbrückt)",
+          close(v_h, areas_h / 1000), f"V={v_h:.4f}, mit Schicht {v_sph:.4f}")
+    check("Kugel ohne z=0: 1 Lücke, 2 Komponenten",
+          g_h == 1 and s_h["n_components"] == 2, f"gaps={g_h}, nc={s_h['n_components']}")
+
+    # 10) Doppelte identische Kontur -> XOR löscht aus
+    dup = [c for z in Z for c in (_synthetic_circle(z, 20), _synthetic_circle(z, 20))]
+    v_dup = compute_volume(dup)
+    s_dup = compute_shape_metrics(dup, v_dup)
+    check("Doppelkontur: V = 0 (XOR-Semantik), shape_valid False",
+          v_dup == 0.0 and not s_dup["shape_valid"], f"V={v_dup}")
+
+    n_fail = results.count(False)
+    print("-" * 70)
+    print(f"Gesamt: {'PASS' if n_fail == 0 else 'FAIL'}  "
+          f"({len(results) - n_fail}/{len(results)} Prüfungen bestanden)")
+    return 0 if n_fail == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # 8. CLI
 # ---------------------------------------------------------------------------
 
@@ -827,9 +1135,11 @@ Beispiele:
   %(prog)s rtstruct.dcm --list
   %(prog)s rtstruct.dcm --targets PTV,CTV,GTV --oars Parotis,Rueckenmark,Blase
   %(prog)s rtstruct.dcm   # Auto-Erkennung über DICOM RT ROI Type
+  %(prog)s --self-test    # Synthetische Konsistenztests (Löcher, z-Lücken)
         """,
     )
-    parser.add_argument("file", help="Pfad zur RTSTRUCT DICOM Datei")
+    parser.add_argument("file", nargs="?", default=None,
+                        help="Pfad zur RTSTRUCT DICOM Datei")
     parser.add_argument("--list", action="store_true",
                         help="Nur Strukturnamen auflisten")
     parser.add_argument("--targets", type=str, default=None,
@@ -838,8 +1148,16 @@ Beispiele:
                         help="Komma-getrennte Risikoorgan-Namen")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="Ausgabeverzeichnis für <stem>_analysis.json")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Synthetische Konsistenztests (Ring/Loch, Keyhole, "
+                             "Kugeln, z-Lücken); Exit 0 = pass, 1 = fail")
 
     args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(_run_self_test())
+    if not args.file:
+        parser.error("file ist erforderlich (außer mit --self-test)")
 
     target_list = args.targets.split(",") if args.targets else None
     oar_list = args.oars.split(",") if args.oars else None

@@ -404,7 +404,13 @@ def write_statistics(results: dict, output_dir: Path) -> None:
         sh = s["shape"]
         flag = "" if sh.get("shape_valid", False) else "   [!] Mehrkomponenten/ungueltige Formmetrik"
         f.write(f"\n  {name}  (ROI #{s['roi_number']}, {s.get('category','?')})\n")
-        f.write(f"    Konturen   : {s['num_contours']} Schichten, {s['num_points']} Punkte\n")
+        f.write(f"    Konturen   : {s['num_contours']} auf "
+                f"{s.get('num_slices', s['num_contours'])} Schichten, "
+                f"{s['num_points']} Punkte\n")
+        dz = s.get("slice_spacing_mm")
+        gaps = s.get("n_gaps", 0) or 0
+        f.write(f"    Schichtabst: {f'{dz:.2f} mm' if dz is not None else 'n/a'}"
+                f"{f'   [!] z-Luecken: {gaps}' if gaps else ''}\n")
         f.write(f"    Volumen    : {s['volume_cm3']:.3f} cm3"
                 f"   (Voxel-Quervergleich: {sh.get('volume_voxel_cm3', 0):.3f} cm3)\n")
         f.write(f"    Aequiv.-Durchmesser: {sh.get('equivalent_diameter_mm', 0):.1f} mm"

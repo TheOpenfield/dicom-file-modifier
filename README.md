@@ -56,6 +56,8 @@ Analyse RTSTRUCT files and compute geometric metrics:
 
 ```bash
 python -m dicom_file_modifier.analyzer data/<case-id>/RS.dcm --output output/
+# Synthetic consistency tests of the analyzer geometry (holes/XOR, z-gaps); exit 0 = pass
+python -m dicom_file_modifier.analyzer --self-test
 ```
 
 This will generate:
@@ -212,33 +214,35 @@ Organs at risk (OAR) are structures whose radiation dose must be limited, e.g., 
 
 ### Volume Calculation
 
-The volume of a structure is calculated slice-by-slice by summing contour areas:
+The volume of a structure is calculated as a stack of slabs, one per contour slice:
 
 ```math
-V = \sum_{i=1}^{N} A_i \cdot \Delta z
+V = \Delta z_{\mathrm{nom}} \cdot \sum_{k=1}^{S} A_k
 ```
 
-Where $A_i$ is the area of contour $i$ (summed over all $N$ contours of the structure) and $\Delta z$ is the mean spacing between the distinct contour z-positions, i.e. each contour represents a slab one slice thick. The area of each contour is determined using the **Shoelace formula** (Gauss's area formula, also known as the surveyor's formula), with the vertex index taken cyclically ($x_n = x_0$, $y_n = y_0$):
+Where $S$ is the number of slices (contour z-positions closer than 0.05 mm are merged into one slice), $A_k$ is the area of slice $k$ (see below) and $\Delta z_{\mathrm{nom}}$ is the nominal slice spacing, i.e. each slice represents a slab one slice thick. The area of a single contour is determined using the **Shoelace formula** (Gauss's area formula, also known as the surveyor's formula), with the vertex index taken cyclically ($x_n = x_0$, $y_n = y_0$):
 
 ```math
 A = \frac{1}{2} \left| \sum_{j=0}^{n-1} (x_j \, y_{j+1} - x_{j+1} \, y_j) \right|
 ```
 
-If a slice contains several contours, their areas are added. This is correct for the separate islands of a fragmented structure, but **not for holes**: DICOM may encode a ring-shaped or hollow structure as an outer contour plus a nested inner contour whose area should be *subtracted*, but the analyzer adds it (a synthetic ring with radii 10/20 mm measured 34.5 cm³ instead of 20.7 cm³). A hole encoded with the keyhole technique (a single contour) is measured correctly.
+**Several contours on one slice (holes and islands).** DICOM encodes a ring-shaped or hollow structure as an outer contour plus a nested inner contour on the same slice, and a fragmented structure as several disjoint contours. All contours of a slice are combined by **XOR** (exclusive disjunction, the even-odd rule; Shapely `symmetric_difference`). This is the semantics of the DICOM contour type `CLOSED_PLANAR_XOR` and the convention Eclipse uses for its plain `CLOSED_PLANAR` contours: a nested contour is a hole, an island inside a hole counts again, disjoint islands add up, and the order of the contours does not matter. $A_k$ is the area of the resulting region. A hole encoded with the keyhole technique (a single contour with a narrow channel) yields the same area. Two consequences of the XOR rule, both consistent with the TPS: identical duplicate contours cancel to zero area, and partially overlapping contours lose their overlap. Invalid contours (self-intersecting spikes) are repaired with Shapely `make_valid` before the combination.
+
+**Nominal slice spacing.** $\Delta z_{\mathrm{nom}}$ is the median of the differences between consecutive slice positions, taken over those differences that do not exceed 1.5 times the smallest difference. Larger differences are **z-gaps** (a skipped slice, or separate lesions stored in one ROI). They are counted and reported as `n_gaps`, but **not bridged**: no volume is attributed to a z-range without a contour, and the gap does not inflate the spacing of the other slices. (The previous implementation used the mean spacing, which a single 30 mm gap in a 1 mm series inflates by a factor of about 1.7.) A ROI with genuinely variable slice thickness is not supported: its thicker part is counted with $\Delta z_{\mathrm{nom}}$ and flagged as gaps.
 
 **Unit:** Results are converted from mm³ to cm³ (division by 1000).
 
-**Limitation:** This method is a planimetric approximation. It is more accurate with thinner CT slices. A voxel-based volume on the CT's own grid (as a TPS computes it) would require the associated CT image; the analyzer's voxel cross-check uses a local grid of its own (see *Sphericity*).
+**Limitation:** This method is a planimetric approximation. It is more accurate with thinner CT slices. A voxel-based volume on the CT's own grid (as a TPS computes it) would require the associated CT image; the analyzer's voxel cross-check uses a local grid of its own (see *Sphericity*). A structure with a single contour slice has no measurable spacing and reports 0 cm³.
 
 ### Centroid Calculation
 
-The centroid is calculated as the **area-weighted average** of contour centroids:
+The centroid is calculated as the **area-weighted average** of the slice centroids:
 
 ```math
-\vec{C} = \frac{\sum_{i=1}^{N} A_i \cdot \vec{c}_i}{\sum_{i=1}^{N} A_i}
+\vec{C} = \frac{\sum_{k=1}^{S} A_k \cdot \vec{c}_k}{\sum_{k=1}^{S} A_k}
 ```
 
-Where $\vec{c}_i$ is the centroid of contour $i$ — the area centroid (first area moment) of the polygon, computed with Shapely, placed at the contour's z-position — and $A_i$ is the corresponding contour area as weight. The polygon area centroid is used rather than the arithmetic mean of the vertices, which would be biased towards densely sampled segments of the contour.
+Where $\vec{c}_k$ is the area centroid (first area moment) of the XOR region of slice $k$, computed with Shapely and placed at the slice's z-position, and $A_k$ is that region's area as weight (see *Volume Calculation*). A hole therefore shifts the centroid away from itself, as it should, instead of attracting it as a positively weighted inner contour would. The area centroid is used rather than the arithmetic mean of the vertices, which would be biased towards densely sampled segments of the contour.
 
 Weighting by area ensures that larger cross-sections contribute more to the overall centroid than small edge slices. The result is three coordinates *(x, y, z)* in millimeters in the DICOM patient coordinate system.
 
@@ -254,7 +258,7 @@ Sphericity describes how closely a structure resembles a sphere (Wadell's defini
 \Psi = \frac{\pi^{1/3} \cdot (6V)^{2/3}}{A_{\text{surface}}}
 ```
 
-A value of 1.0 corresponds to a perfect sphere; smaller values indicate irregular or elongated shapes. By the isoperimetric inequality $\Psi \le 1$ for **any** solid, but this holds only when $V$ and $A$ describe the *same* body. The volume $V$ and surface area $A$ are therefore both taken from a **single consistent voxel mask**: the stacked contours are rasterised onto a local grid (in-plane via `matplotlib.path`, slice spacing in z), the volume is the filled voxel volume, and the surface area is obtained from a marching-cubes mesh of that mask (`skimage.measure`). The result is clamped to $(0,1]$. If rasterisation is unavailable the code falls back to a convex-hull-consistent estimate.
+A value of 1.0 corresponds to a perfect sphere; smaller values indicate irregular or elongated shapes. By the isoperimetric inequality $\Psi \le 1$ for **any** solid, but this holds only when $V$ and $A$ describe the *same* body. The volume $V$ and surface area $A$ are therefore both taken from a **single consistent voxel mask**: the stacked contours are rasterised onto a local grid (in-plane via `matplotlib.path`, the contours of one plane combined by XOR so that holes stay open, one grid plane on every contour plane at the nominal slice spacing), the volume is the filled voxel volume, and the surface area is obtained from a marching-cubes mesh of that mask (`skimage.measure`). The result is clamped to $(0,1]$. If rasterisation is unavailable the code falls back to a convex-hull-consistent estimate.
 
 Because the surface is measured on a discretised, slice-stacked mask (terraces between slices, marching-cubes facets), the surface area is systematically over-estimated and $\Psi$ is **biased low**: a perfect sphere contoured on 1–3 mm slices scores only about 0.79–0.92, lower for small structures and thick slices. Sphericity values are therefore meaningful for comparing structures of similar size and slice spacing, not as absolute values.
 
@@ -266,7 +270,7 @@ Solidity (the scikit-image / ImageJ name for this metric) relates the actual vol
 S = \frac{V_{\text{mask}}}{V_{\text{convex}}}
 ```
 
-A value of 1.0 means the structure is convex; lower values indicate concave or highly irregular shapes, which may be clinically relevant for tumours that wrap around other structures. For the true body $S \le 1$, because a body is contained in its convex hull. The implementation, however, divides the voxel-mask volume — the same slab stack as the planimetric volume, which extends half a slice beyond the outermost contours — by the convex hull of the contour *vertices*, which ends at the outermost contour planes. The raw ratio is therefore biased upwards (exactly $N/(N-1)$ for a prism spanning $N$ slices; 1.01–1.13 for spheres in synthetic tests) and is clamped to $(0,1]$. As a result convex structures read 1.0, and moderate concavities of small, few-slice structures can be masked. For multi-component unions / dose shells / optimisation structures (flagged `n_components > 1` / `shape_valid = false`) the convex-hull metrics are not meaningful and are excluded from the shape plots.
+A value of 1.0 means the structure is convex; lower values indicate concave or highly irregular shapes, which may be clinically relevant for tumours that wrap around other structures. For the true body $S \le 1$, because a body is contained in its convex hull. The implementation, however, divides the voxel-mask volume — the same slab stack as the planimetric volume, which extends half a slice beyond the outermost contours — by the convex hull of the contour *vertices*, which ends at the outermost contour planes. The raw ratio is therefore biased upwards (exactly $N/(N-1)$ for a prism spanning $N$ slices; 1.01–1.13 for spheres in synthetic tests) and is clamped to $(0,1]$. As a result convex structures read 1.0, and moderate concavities of small, few-slice structures can be masked. Holes do reduce the mask volume: a ring with radii 20/10 mm over 20 slices reads about 0.79 (= 0.75 × 20/19), where an implementation that fills holes would read 1.0. For multi-component unions / dose shells / optimisation structures (flagged `n_components > 1` / `shape_valid = false`) the convex-hull metrics are not meaningful and are excluded from the shape plots.
 
 #### Elongation
 
@@ -358,7 +362,7 @@ All distance metrics are computed **exactly on the full point clouds**: a single
 - **No inter-structure overlap metrics:** Distance/volume work from contour points (the reported volume is the planimetric slice-stack volume). Sphericity/solidity additionally rasterise each structure onto its **own** local voxel grid, but overlap measures such as **Dice / Jaccard** need both structures on a *common* grid and are not implemented. The distance metrics cannot substitute for them (see *Minimum Distance*).
 - **Vertex-based distances:** All distances are computed between contour vertices, a discrete sample of the surfaces, so they approximate the continuous surface distances only to within roughly the vertex and slice spacing.
 - **Surface approximation:** Sphericity's surface area is taken from a marching-cubes mesh of the rasterised voxel mask. The mask resolution is bounded for performance, so the surface is a discretised approximation that over-estimates the true area ($\Psi$ biased low, see *Sphericity*); very thin or sub-voxel features may be under-resolved.
-- **Planimetric volume:** $\Delta z$ is the mean spacing between the distinct contour z-positions. This is appropriate for contiguous, equidistant contours, but a structure that has a **gap in z** (e.g. a union of lesions at different heights) gets an inflated $\Delta z$ and hence an inflated volume. Two spheres of radius 10 mm with centres 60 mm apart, stored in one ROI, measured 2.06× their true volume. The voxel cross-check in `statistics.txt` uses the same mean spacing, so it does not catch this error. Nested inner (hole) contours are added rather than subtracted (see *Volume Calculation*).
+- **Planimetric volume:** $\Delta z$ is the nominal slice spacing (median of the smallest cluster of z-differences), so a **gap in z** (a skipped slice, or a union of lesions at different heights stored in one ROI) neither inflates the spacing nor is bridged. Two spheres of radius 10 mm with centres 60 mm apart, stored in one ROI, measure exactly twice one sphere and are reported with `n_components = 2` and `n_gaps = 1`; a sphere with one skipped slice loses that slab (about 7.5 % for a 10 mm radius on 1 mm slices) and is likewise flagged with a gap, whereas a TPS would interpolate the missing slice. A ROI with genuinely variable slice thickness is under-read in its thicker part. Nested inner contours are holes (XOR rule, see *Volume Calculation*); the voxel cross-check in `statistics.txt` uses the same XOR rule and the same nominal spacing.
 - **Not a clinical diagnostic tool:** The script serves geometric analysis and does not replace clinical evaluation by a medical physicist or radiation therapist.
 
 ## Used Libraries
@@ -368,7 +372,7 @@ All distance metrics are computed **exactly on the full point clouds**: a single
 | `pydicom` | ≥ 2.3 | Reading DICOM files |
 | `numpy` | ≥ 1.21 | Numerical calculations and linear algebra |
 | `scipy` | ≥ 1.7 | KD-tree, Hausdorff distance, convex hull, interpolation, rotations |
-| `shapely` | ≥ 1.8 | 2D polygon operations (area calculation) |
+| `shapely` | ≥ 1.8 | 2D polygon operations (validation, area, centroid, XOR of same-plane contours) |
 | `matplotlib` | ≥ 3.5 | Static plotting and visualisation |
 | `scikit-image` | ≥ 0.19 | Marching cubes surface extraction (analyzer sphericity surface; modifier & case_modifier CT surfaces) |
 | `plotly` | ≥ 5.0 | Interactive 3D visualisation (modifier, case_modifier) |
@@ -743,7 +747,7 @@ Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication t
 
 **`--method resample` (default):** the CT's voxel grid stays axial, and pixels are inverse-mapped from the source. The contour points are still rotated by $\mathbf{T}$ in 3D, which means **after a non-axial rotation, the contours are tilted polygons that no longer lie on the axial slice planes** of the new CT. DICOM RTSTRUCT is conventionally per-axial-slice, so this is technically off-spec. Two consequences:
 - *Clipping at the grid boundaries.* The output grid is fixed, so anatomy moved beyond it is lost. Grid regions whose source lies outside the original scan are filled with −1000 HU. A contour point that stays inside the grid always has the correct anatomy beneath it, because it samples exactly its original source position. A contour point moved *outside* the grid has no image data at all. The case modifier detects such points automatically and prints a per-ROI warning at the end of the run.
-- *Volume measurements via the planar Shoelace + mean-Z-spacing formula are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure a volume reduced by roughly $\cos^2\theta$ (−3 % at 10°, −7 % at 15°). This is a measurement artefact of the formula, not a transformation error.
+- *Volume measurements via the per-axial-slice formula (XOR area × nominal slice spacing) are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure a volume reduced by roughly $\cos^2\theta$ (−3 % at 10°, −7 % at 15°). This is a measurement artefact of the formula, not a transformation error.
 - *Z-only rotations are immune* to the tilt and volume effects, because $r_z$ leaves contour Z values unchanged and each contour stays in its original axial slice. They can still move anatomy out of the in-plane grid when the rotation centre is far from the image centre or a translation is added.
 
 **Practical guidance:**
@@ -839,7 +843,7 @@ Structure centroids are plotted in the DICOM patient coordinate system (X=left, 
 
 ### 5. `statistics.txt` – Numerical Summary
 
-A structured plain-text file, grouped by category (Targets, serial OARs, parallel OARs, helper structures), with per-structure details (volume + voxel cross-check, equivalent-sphere diameter, max 3D diameter, centroid, bounding box, sphericity, solidity, elongation, and a flag for multi-component / invalid shape metrics). It also contains aggregated Target↔OAR distance statistics (mean/std/min/max of min, HD95, Hausdorff and ASSD over *all* Target↔OAR pairs, including containment pairs such as Target↔whole brain), the most critical pairs, and a GTV→PTV margin check (minimum distance, HD95 and ASSD per lesion). Suitable for copy-paste into reports or further spreadsheet analysis.
+A structured plain-text file, grouped by category (Targets, serial OARs, parallel OARs, helper structures), with per-structure details (contour and slice count, nominal slice spacing with a z-gap flag, volume + voxel cross-check, equivalent-sphere diameter, max 3D diameter, centroid, bounding box, sphericity, solidity, elongation, and a flag for multi-component / invalid shape metrics). It also contains aggregated Target↔OAR distance statistics (mean/std/min/max of min, HD95, Hausdorff and ASSD over *all* Target↔OAR pairs, including containment pairs such as Target↔whole brain), the most critical pairs, and a GTV→PTV margin check (minimum distance, HD95 and ASSD per lesion). Suitable for copy-paste into reports or further spreadsheet analysis.
 
 ### 6. Additional clinical plots (multi-metastasis / SRS)
 

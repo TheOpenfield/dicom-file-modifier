@@ -18,6 +18,8 @@ Each module is invoked as `python -m dicom_file_modifier.<module>`:
 ```bash
 # Geometric analysis of an RTSTRUCT file → JSON + console summary
 python -m dicom_file_modifier.analyzer data/<case-id>/RS.dcm --output output/
+# Synthetic geometry self-test of the analyzer (XOR holes, z-gaps; exit 0 = pass)
+python -m dicom_file_modifier.analyzer --self-test
 
 # Plots + statistics.txt from an RTSTRUCT file
 python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm --output output/
@@ -44,7 +46,7 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no test suite, lint config, or build step in this repo.
+There is no pytest suite, lint config, or build step in this repo. The only automated checks are `python -m dicom_file_modifier.analyzer --self-test` (synthetic geometry: XOR holes, keyhole contours, z-gaps) and `python -m dicom_file_modifier.case_modifier <case> --self-test` (rigid-body round trip).
 
 ## Architecture
 
@@ -54,8 +56,8 @@ Four runnable modules. `analyzer`, `modifier`, and `visualizer` are independent 
 Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions → `run_analysis` aggregates everything into a single results dict that is also written as `<rtstruct-stem>_analysis.json`.
 
 Key conventions:
-- Contours are kept as a `list[np.ndarray]`, one (N,3) array per slice. `contours_to_points` flattens them when a unified point cloud is needed.
-- Volume is planimetric (Shoelace area × mean slice spacing). Sphericity/solidity rasterise each structure onto its own local voxel grid (`matplotlib.path` in-plane) and take volume + surface from that one mask (surface via `skimage.measure.marching_cubes`); solidity divides that mask volume by the convex hull of the contour vertices, and the hull is also the sphericity fallback.
+- Contours are kept as a `list[np.ndarray]`, one (N,3) array per contour (a slice may hold several: islands and holes). `contours_to_points` flattens them when a unified point cloud is needed.
+- Contours are grouped into slices (`_group_slices`, z within 0.05 mm) and all contours of a slice are XOR-combined (`_slice_geometries`: Shapely `symmetric_difference` after `make_valid`), so a nested contour is a hole (DICOM `CLOSED_PLANAR_XOR` / Eclipse semantics; duplicate contours cancel). Volume is planimetric: XOR area × nominal slice spacing (`_nominal_slice_spacing` = median of the smallest cluster of z-differences; larger differences are reported as `n_gaps` and are never bridged). Sphericity/solidity rasterise each structure onto its own local voxel grid via `rasterize_contours` (XOR per nearest z-plane, bbox-cropped `matplotlib.path`; reusable for any grid, e.g. a future dose grid) and take volume + surface from that one mask (surface via `skimage.measure.marching_cubes`); solidity divides that mask volume by the convex hull of the contour vertices, and the hull is also the sphericity fallback.
 - Distance computations are exact and deterministic (one `cKDTree` query pair yields min/Hausdorff/HD95/ASSD); only clouds > 50,000 points are thinned to that cap with a fixed seed — see the README "Performance Notes" section.
 - Structure classification into Target / serial-OAR / parallel-OAR / helper / external / marker is done by `classify_structure` (ROI name + `RTROIInterpretedType` + contour geometry; name rules override mistagged DICOM types).
 
