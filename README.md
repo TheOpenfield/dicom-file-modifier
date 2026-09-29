@@ -569,7 +569,7 @@ The HU-to-stored conversion is the exact inverse of the loading step:
 
 Values are clipped to the valid int16 range $[-32768, 32767]$ and stored as signed 16-bit integers (`PixelRepresentation = 1`), which is common for CT. (Some scanners instead store unsigned pixels with `PixelRepresentation = 0` and a matching intercept; the output here is written as signed int16 regardless.) The original `RescaleSlope` and `RescaleIntercept` are preserved unchanged so the output is correctly calibrated in any TPS.
 
-Each output file receives a new `SOPInstanceUID` and `SeriesInstanceUID` (generated with `pydicom.uid.generate_uid()` which produces DICOM-conformant UID strings) so that the transformed series is recognised as an independent series by the TPS and PACS, while the `StudyInstanceUID` and patient demographics remain identical for correct study association.
+Each output file receives a new `SOPInstanceUID` and `SeriesInstanceUID` (generated with `pydicom.uid.generate_uid()` which produces DICOM-conformant UID strings) so that the transformed series is recognised as an independent series by the TPS and PACS, while the `StudyInstanceUID` and patient demographics remain identical for correct study association. The new `SOPInstanceUID` is also written to the file-meta header (`MediaStorageSOPInstanceUID`), because DICOM Part 10 requires the two to match.
 
 ## Metadata-Only Method (`--method metadata`)
 
@@ -675,7 +675,7 @@ When `save_ct_series` writes the transformed CT, every output slice receives a f
 - Top-level `RTReferencedSeriesSequence[*].SeriesInstanceUID` to the new CT series UID.
 - Top-level `RTReferencedSeriesSequence[*].ContourImageSequence[*].ReferencedSOPInstanceUID` via the SOP map.
 
-The RS itself receives a fresh `SOPInstanceUID` and `SeriesInstanceUID` so it is recognised as a new structure set.
+The RS itself receives a fresh `SOPInstanceUID` (again also in the file-meta header) and `SeriesInstanceUID` so it is recognised as a new structure set.
 
 ## FrameOfReferenceUID Strategy
 

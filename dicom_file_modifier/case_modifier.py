@@ -536,8 +536,8 @@ def transform_rtstruct(
                 if hasattr(roi, "ReferencedFrameOfReferenceUID"):
                     roi.ReferencedFrameOfReferenceUID = new_for_uid
 
-    # 4. Neue UIDs fuer das RS selbst
-    new_ds.SOPInstanceUID    = generate_uid()
+    # 4. Neue UIDs fuer das RS selbst (SOPInstanceUID auch im File-Meta-Header)
+    mod.set_sop_instance_uid(new_ds, generate_uid())
     new_ds.SeriesInstanceUID = generate_uid()
 
     now = datetime.now()

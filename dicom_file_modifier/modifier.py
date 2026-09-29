@@ -256,6 +256,18 @@ def apply_metadata_transform(slices: list, T: np.ndarray) -> list:
 #  Speichern
 # ─────────────────────────────────────────────────────────────────────────────
 
+def set_sop_instance_uid(ds: pydicom.Dataset, uid: str) -> None:
+    """
+    Setzt die SOPInstanceUID und zieht die MediaStorageSOPInstanceUID im
+    File-Meta-Header (DICOM Part 10) mit.  Beide müssen identisch sein, und
+    ``save_as`` gleicht sie nicht ab.
+    """
+    ds.SOPInstanceUID = uid
+    # Ohne Header (fehlt oder leer) keinen unvollständigen Header anlegen
+    if getattr(ds, "file_meta", None):
+        ds.file_meta.MediaStorageSOPInstanceUID = uid
+
+
 def save_ct_series(
     slices: list,
     output_dir: str,
@@ -301,7 +313,7 @@ def save_ct_series(
 
         old_sop = str(getattr(ds, "SOPInstanceUID", ""))
         new_sop = generate_uid()
-        nd.SOPInstanceUID = new_sop
+        set_sop_instance_uid(nd, new_sop)
         if old_sop:
             sop_map[old_sop] = str(new_sop)
 

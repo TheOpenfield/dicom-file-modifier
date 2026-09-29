@@ -90,6 +90,7 @@ This module also hosts the **case-transform visualisation** used by `case_modifi
 
 - DICOM patient coordinate system is **LPS** (X=left, Y=posterior, Z=superior); all distances/translations are in mm, rotations in degrees.
 - `data/` and `output/` are gitignored — don't commit DICOM files or generated artifacts.
+- Assign a new `SOPInstanceUID` only via `modifier.set_sop_instance_uid`: it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
 - Some user-facing strings and argparse help text are in German; keep that consistent within each module rather than mixing languages.
 - The README contains substantial mathematical documentation (volume, sphericity, Hausdorff, affine math, interpolation orders) — consult it before changing the geometric formulas, since the implementations are derived from those exact definitions.
 - README math: write display equations as ` ```math ` fenced blocks, not `$$…$$`, and keep inline `$…$` free of backslash-punctuation (`\{`, `\|`, `\,`, `\;`, `\!`, `\\`; use `\lbrace`, `\lVert … \rVert` etc.). GitHub's Markdown parser strips those backslash escapes before MathJax runs, which silently corrupts or breaks the formula.
