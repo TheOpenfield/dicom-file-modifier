@@ -10,6 +10,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 - [CT Rigid Body Transformer](#ct-rigid-body-transformer-documentation) — rigid transform of a CT series
 - [Case Modifier](#case-modifier-documentation) — lockstep transform of a CT + its RTSTRUCT
 - [RTSTRUCT Visualizer](#rtstruct-visualizer-documentation) — plots and statistics
+- [Dose Indices](#dose-index-documentation) — Paddick CI, GI, ICRU 83 HI and isodose contours from RTSTRUCT + RTDOSE
 - [References](#references)
 
 ## Features
@@ -18,6 +19,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 - **Modifier**: Rigid body transformation of CT DICOM series (translation + rotation), either resampled onto the original axial grid or HU-exact by rewriting only the geometry tags, with 3D visualisation
 - **Case Modifier**: Lockstep rigid body transformation of a CT series **and** its companion RTSTRUCT in a single pass — contour points are transformed alongside the pixel data, UID references are rewritten so the new RS links to the new CT, and an optional `Drehpunkt` POINT marker is inserted at the rotation centre for easy identification in the TPS
 - **Visualizer**: Generate plots and statistics from analysis results
+- **Dose Indices**: Compute Paddick conformity index, gradient index, ICRU 83 homogeneity index and DVH statistics for each target from an RTSTRUCT + RTDOSE pair (prescription from the RTPLAN), and write a separate RTSTRUCT with the isodose ROIs and the intersection / underdosed / spill helper contours for verification in the TPS; an Eclipse-compatibility mode reproduces the TPS raster conventions
 
 ## Project Structure
 
@@ -26,19 +28,24 @@ dicom-file-modifier/
 ├── data/                    # Input DICOM files (not synced)
 │   └── <case-id>/           # One folder per case
 │       ├── CT/              # CT slices (*.dcm)
-│       └── RS*.dcm          # RTSTRUCT file
+│       ├── RS*.dcm          # RTSTRUCT file
+│       ├── RD*.dcm          # RTDOSE file (dose_indices)
+│       └── RP*.dcm          # RTPLAN file (dose_indices: prescription; optional)
 ├── output/                  # Analysis results and modified files (not synced)
 ├── dicom_file_modifier/     # Python package
 │   ├── __init__.py
 │   ├── analyzer.py          # RTSTRUCT analysis module
 │   ├── modifier.py          # CT rigid body transformer
 │   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
-│   └── visualizer.py        # Visualisation module
+│   ├── visualizer.py        # Visualisation module
+│   ├── dose.py              # Dose-grid numerics library (RTDOSE, fine grid, sampling, DVH statistics)
+│   ├── dose_indices.py      # Dose index computation (CI/GI/HI) + reports
+│   └── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
 ├── requirements.txt         # Python dependencies
 └── README.md                # This file
 ```
 
-**Case folder convention:** `case_modifier` expects a folder of the form `data/<case-id>/` containing a `CT/` subfolder with the CT DICOM slices plus exactly one `RS*.dcm` file at the case root. Sibling `RP*.dcm` (RTPLAN) and `RD*.dcm` (RTDOSE) files are detected and reported but **not** transformed.
+**Case folder convention:** `case_modifier` expects a folder of the form `data/<case-id>/` containing a `CT/` subfolder with the CT DICOM slices plus exactly one `RS*.dcm` file at the case root. Sibling `RP*.dcm` (RTPLAN) and `RD*.dcm` (RTDOSE) files are detected and reported but **not** transformed. `dose_indices` uses the same folder layout: it reads `RS*.dcm` and `RD*.dcm` (plus `RP*.dcm` for the prescription) and needs `CT/` only for the slice references of the exported RTSTRUCT and for the Eclipse-compatibility raster.
 
 ## Installation
 
@@ -164,6 +171,56 @@ Visualisation is on by default; pass `--no-viz` to skip it (e.g., for batch/CI r
 - `StructureSetDescription = "rigid t=(10,0,-5) r=(0,0,15) c=Marker 'HS1' m=res FoR=keep"` (VR ST; the tool truncates it to 64 chars) — translation, rotation, centre label, method and FoR strategy
 - `SeriesNumber += 1000` so the transformed series is easy to tell apart from the original (e.g. 2 → 1002)
 - `--label` overrides the suffix (e.g., `--label _SHIFT_LR10`)
+
+### Dose Indices – Paddick CI, GI, HI + Isodose RTSTRUCT
+
+Compute plan-quality indices for the target volume(s) of a case from its RTSTRUCT + RTDOSE (prescription from the RTPLAN) and write a separate RTSTRUCT with the isodose and helper contours:
+
+```bash
+# Default: 0.25 mm evaluation grid, slab volume model, PIV restricted to the isodose component of the target
+python -m dicom_file_modifier.dose_indices data/<case-id> --output output/
+
+# Everything on Eclipse conventions (CT-pixel-aligned grid, half end slabs, global PIV, field isolines)
+python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high --label _ECL
+
+# Explicit files, prescription and isodose levels
+python -m dicom_file_modifier.dose_indices --rs RS.dcm --rd RD.dcm --rx 20 --isodose 100,80,50,12Gy --no-rs
+
+# ROI table + prescriptions / analytic phantom self-test / writer self-test (exit 0 = pass)
+python -m dicom_file_modifier.dose_indices data/<case-id> --list
+python -m dicom_file_modifier.dose_indices --self-test
+python -m dicom_file_modifier.rtstruct_writer --self-test
+```
+
+This produces `output/<case-id>_IDX/`:
+- `RS_<case-id>_IDX.dcm` — separate RTSTRUCT with `ISO_100%_20.0Gy`, `ISO_50%_10.0Gy` and, per target, `<Target>_x_ISO100` (intersection), `<Target>_minus_ISO100` (underdosed) and `ISO100_minus_<Target>` (spill); `--include-target` adds a verbatim copy of the target
+- `<case-id>_indices.json` — all components, indices, DVH statistics and settings
+- `indices.txt` — the console report; `indices.csv` — one row per target (`--append-csv PATH` appends the rows to a cross-case collection table)
+
+**All CLI options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `case_dir` / `--rs --rd --rp` | *(auto)* | Case folder with `RS*.dcm`, `RD*.dcm`, optional `RP*.dcm` and `CT/`; or explicit files |
+| `--target` | *(auto)* | `NAME[,NAME…]`, exact or unique substring. Default: ROIs classified as targets whose name starts with `PTV`; a RTPLAN `DoseReferenceDescription` prefix narrows the choice to one |
+| `--rx` / `--rx-pct-of-max` | *(RTPLAN)* | Prescription in Gy, or as a percentage of the grid maximum (SRS convention) |
+| `--isodose` | `100,50` | Isodose levels in % of Rx or absolute (`12Gy`); 100 and 50 are always included (CI, GI) |
+| `--grid` | `0.25` | In-plane resolution of the evaluation grid in mm (`1.0`, `0.5`, `0.25`, `0.1`); z stays on the dose planes |
+| `--dose-interp` | `linear` | Dose interpolation: trilinear or cubic B-spline |
+| `--volume-model` | `slab` | `slab`: every contour slice is a full slab; `eclipse`: the first and last slab of a structure count half (TPS convention) |
+| `--piv-scope` | `component` | PIV = only the Rx-isodose component(s) overlapping the target (multi-target plans), or `global` |
+| `--iso-contours` | `mask` | Isodose contours from the voxel mask (edge midpoints) or as isolines of the sampled dose field (`field`) |
+| `--eclipse-compat` | off | `high` / `default`: evaluation grid on the CT pixel raster (1 or 2 pixels, see below), `eclipse` volume model, global PIV, linear interpolation, field isolines without simplification |
+| `--label` | `_IDX` | Suffix for the output folder, RS file name and `StructureSetLabel` |
+| `--no-rs` / `--include-target` | off | Skip the RTSTRUCT export / add a copy of the target ROI(s) |
+| `--simplify-mm` | `0.1` | Douglas–Peucker tolerance of the exported contours (keep below half the grid resolution) |
+| `--transfer-syntax` | `explicit` | Transfer syntax of the exported RTSTRUCT (`explicit` or `implicit` VR little endian) |
+| `--max-name-len` | `64` | Maximum ROI name length (DICOM LO limit) |
+| `--append-csv` | off | Append the result rows to a collection CSV (header written once) |
+| `--list` / `--self-test` | off | ROI table + prescriptions; analytic phantom self-test |
+| `--output` | `output` | Base output directory |
+
+See [Dose Index Documentation](#dose-index-documentation) for the definitions, the grid conventions and the Eclipse comparison.
 
 ## Dependencies
 
@@ -902,6 +959,139 @@ The heatmap and lollipop layouts are chosen to stay readable at ~40 structures a
 
 ---
 
+# Dose Index Documentation
+
+## Overview
+
+`dose_indices` evaluates a dose distribution against one or more target volumes. It reads the RTSTRUCT (contours), the RTDOSE (3D dose grid) and, if present, the RTPLAN (prescription), rasterises the target and the isodose regions onto one common fine grid, and computes the conformity, gradient and homogeneity indices together with the DVH statistics of the target. The isodose regions and the helper regions used by the indices are written back as contours into a separate RTSTRUCT, so a planner can overlay them on the CT in the treatment planning system and see *exactly* which voxels the numbers were computed from. Everything is computed on the same grid with the same sampling, so the exported contours and the reported volumes are consistent by construction.
+
+## Data Foundation: RTDOSE Grid
+
+An RTDOSE object stores the dose as a multi-frame image: `pixel_array` has the shape *(frames, rows, columns)*, its integer values are converted to Gy with `DoseGridScaling`, and the frames are placed along the slice normal by the `GridFrameOffsetVector` (GFOV). The GFOV is either *relative* (first value 0, offsets from `ImagePositionPatient`) or *absolute* (z coordinates); the tool accepts both and requires the offsets to be equidistant. `DoseUnits` must be `GY`; a `DoseSummationType` other than `PLAN` (e.g., a single beam or fraction) is accepted with a warning, because the indices then describe a partial dose. The frame of reference must match the RTSTRUCT.
+
+The voxel-to-patient mapping uses the same affine convention as the CT modules (see *Voxel-to-Patient Affine Matrix*), with the frame step from the GFOV:
+
+```math
+\mathbf{p} = \mathbf{A} \begin{pmatrix} k \\ j \\ i \\ 1 \end{pmatrix}, \qquad
+\mathbf{A} = \begin{pmatrix} \Delta_k \hat{\mathbf{n}} & \Delta_r \hat{\mathbf{c}} & \Delta_c \hat{\mathbf{r}} & \mathbf{p}_0 \\ 0 & 0 & 0 & 1 \end{pmatrix}
+```
+
+where $k$ is the frame index, $\hat{\mathbf{n}}$ the slice normal, $\Delta_k$ the GFOV step and $\mathbf{p}_0$ the position of the first frame. The dose is never resampled onto a coarser grid; all evaluation points are obtained by interpolating the native grid.
+
+**Prescription.** The reference dose $D_{\mathrm{Rx}}$ is taken from the RTPLAN `DoseReferenceSequence` (`TargetPrescriptionDose` of the `TARGET` reference, the total plan dose), unless `--rx` (absolute Gy) or `--rx-pct-of-max` (percentage of the grid maximum, the usual SRS convention) is given. **Target selection.** Without `--target`, all ROIs that the analyzer classifies as targets and whose name starts with `PTV` are evaluated; if the plan's `DoseReferenceDescription` (a 16-character DICOM SH string, i.e. usually a truncated ROI name) is a prefix of exactly one of them, only that one is used.
+
+## Evaluation Grid
+
+All masks live on **one** fine grid so that intersections and Dice coefficients are exact set operations:
+
+- **In-plane resolution** `--grid` (default 0.25 mm). The axes are snapped to multiples of 1 mm so that the 1.0 / 0.5 / 0.25 / 0.1 mm grids nest; voxel centres lie at $x_0 + (i + \tfrac{1}{2}) \Delta$.
+- **z axis** = the native dose planes, restricted to planes that also exist in the CT series (the exported contours must reference a CT slice). Contour planes must coincide with grid planes; if they do not, the z axis is refined by an integer factor (up to 8), otherwise the run stops with an error.
+- **Bounding box** = union of the target contours and the native voxels reaching the lowest requested isodose level, plus a margin. If an isodose touches the grid boundary a warning is printed.
+- **Dose interpolation** `--dose-interp`: trilinear (default) or cubic B-spline (the spline coefficients are computed once on a cropped copy of the native array, as in the modifier). Cubic interpolation follows a smooth dose field more faithfully than trilinear interpolation (see *Resolution and Convergence*) but overshoots near steep gradients; it tends to give a slightly larger prescription isodose volume and a slightly lower Paddick CI.
+
+A 60 mm cube at 0.25 mm in-plane and 1 mm slices is 3.5 million voxels (14 MB of float32 dose per copy). Grids above 40 million voxels are refused with a hint to use a coarser `--grid`.
+
+## Contour Rasterisation and Volume Models
+
+Each target is rasterised with the analyzer's `rasterize_contours`: every contour ring is tested against the voxel centres of its plane and combined by XOR, so nested contours are holes and islands add up (the same even-odd rule as the planimetric volume). The volume is the weighted voxel sum
+
+```math
+V = \Delta z \sum_{k} w_k \, N_k \, \Delta^2
+```
+
+where $N_k$ is the number of voxels inside the structure on plane $k$ and $w_k$ the *slab weight* of that plane. Two conventions are available:
+
+- **`slab`** (default, consistent with the analyzer): every contour plane represents a full slab, $w_k = 1$.
+- **`eclipse`**: the first and the last plane of every contiguous run of contour planes count half, $w_k = 1/2$. This reproduces the volumes Eclipse reports in its DVH statistics; the difference to the planimetric volume is half the area of the first and the last contour times the slice spacing, which is noticeable for small targets on few slices.
+
+The weights are applied to everything derived from the *target* (its volume, the intersection with the isodose, the underdosed part and every DVH statistic), never to the isodose regions themselves, so that $V_{\mathrm{TV} \cap \mathrm{PIV}} \le \min(\mathrm{TV}, \mathrm{PIV})$ always holds. Both models are always evaluated; the report shows the chosen one and a comparison line for the other. Isodose regions are simply the fine-grid voxels whose interpolated dose is $\ge$ the level.
+
+**DVH statistics.** The target's dose values are the interpolated doses at its voxel centres, weighted with $w_k$. $D_x$ is the dose received by at least $x$ % of the weighted target volume (a weighted percentile with linear interpolation; $D_{98}$ is the 2nd percentile, $D_2$ the 98th, $D_{50}$ the median). $V_{95}$ and $V_{100}$ are the weighted fractions of the target receiving at least $0.95 D_{\mathrm{Rx}}$ and $D_{\mathrm{Rx}}$. $D_{\min}$ and $D_{\max}$ are the extreme interpolated samples and therefore depend on the grid resolution.
+
+## Index Definitions
+
+With $\mathrm{TV}$ the target volume, $\mathrm{PIV}$ the prescription isodose volume ($D \ge D_{\mathrm{Rx}}$), $\mathrm{TV}_{\mathrm{PIV}}$ their intersection and $\mathrm{PIV}_{50}$ the volume receiving at least half the prescription dose (all in cm³):
+
+```math
+\mathrm{CI}_{\mathrm{Paddick}} = \frac{\mathrm{TV}_{\mathrm{PIV}}^{\,2}}{\mathrm{TV} \cdot \mathrm{PIV}}
+= \underbrace{\frac{\mathrm{TV}_{\mathrm{PIV}}}{\mathrm{TV}}}_{\text{coverage}} \cdot
+  \underbrace{\frac{\mathrm{TV}_{\mathrm{PIV}}}{\mathrm{PIV}}}_{\text{selectivity}}
+```
+
+The Paddick index [Paddick 2000] is identical to the conformation number of van't Riet [van't Riet 1997]; it is 1 only for a perfectly conformal plan and penalises both under-coverage and spill. The RTOG index [Shaw 1993] $\mathrm{CI}_{\mathrm{RTOG}} = \mathrm{PIV}/\mathrm{TV}$ and the Dice coefficient $2 \mathrm{TV}_{\mathrm{PIV}} / (\mathrm{TV} + \mathrm{PIV})$ are reported alongside.
+
+```math
+\mathrm{GI} = \frac{\mathrm{PIV}_{50}}{\mathrm{PIV}}, \qquad
+\mathrm{GM} = r_{\mathrm{eq}}(\mathrm{PIV}_{50}) - r_{\mathrm{eq}}(\mathrm{PIV}), \qquad
+r_{\mathrm{eq}}(V) = \left( \frac{3V}{4\pi} \right)^{1/3}
+```
+
+The gradient index [Paddick & Lippitt 2006] measures the dose fall-off outside the target; the gradient measure GM (in cm) is the difference of the equivalent-sphere radii of the two isodose volumes, which is what Eclipse displays.
+
+```math
+\mathrm{HI}_{\mathrm{ICRU\,83}} = \frac{D_{2\%} - D_{98\%}}{D_{50\%}}
+```
+
+The ICRU 83 homogeneity index is 0 for a perfectly uniform target dose; SRS plans that prescribe to a low isodose line (e.g. 20 Gy at the 80 % line, so $D_{\max}$ = 25 Gy) have values around 0.2 by design. All quantities are `NaN` (written as `null` in the JSON) when a denominator is zero, e.g. when the prescription dose exceeds the grid maximum.
+
+## PIV Scoping for Multi-Target Plans
+
+In a plan with several targets in one dose grid the prescription isodose consists of several disconnected components. With `--piv-scope component` (default) the PIV of a target is the union of the components (6-connectivity) of the Rx isodose that overlap the target; the same rule is applied to the 50 % isodose for the gradient index. If no component overlaps the target the nearest one is used and flagged. The global PIV is always reported too, and with more than one target an additional block evaluates the union of all targets against the global isodoses. `--piv-scope global` uses the whole isodose for every target, which is the textbook definition and what a TPS reports.
+
+## Eclipse Compatibility Mode
+
+Inspecting contours exported by Eclipse reveals how the TPS stores its structures: for structures at *High* resolution every contour vertex has one coordinate exactly on the CT pixel-centre lattice $x_0 + k \cdot \Delta_{\mathrm{px}}$ ($\Delta_{\mathrm{px}}$ = CT pixel spacing) while the other coordinate is freely interpolated, and the median vertex spacing is one CT pixel; structures at *Default* resolution (Eclipse's own `Dose …[Gy]` isodose structures among them) use a lattice of two CT pixels offset by half a pixel. This is the signature of an isoline traced on a raster whose cells are centred on the CT pixels: the contour crosses the grid lines of that raster.
+
+`--eclipse-compat high` (or `default`) therefore sets every parameter that influences the comparison with the TPS at once:
+
+| Parameter | `high` | `default` |
+|---|---|---|
+| evaluation grid | CT pixel spacing, voxel centres on the CT pixel centres | 2 × pixel spacing, centres offset by half a pixel |
+| volume model | `eclipse` (end slabs half) | `eclipse` |
+| PIV scope | `global` | `global` |
+| dose interpolation | linear | linear |
+| isodose contours | isolines of the sampled dose field, no simplification | same |
+
+On a clinical SRS case this mode reproduced Eclipse's DVH statistics of the target (coverage, $D_{98}$ / $D_{50}$ / $D_2$, HI, target volume) to within about 1 %. The Paddick index, however, came out several hundredths above the TPS value; the difference lay entirely in the prescription isodose volume, i.e. in how the TPS samples the isodose, not in the target statistics. The report prints every component so the comparison can be completed once the TPS values are known.
+
+## RTSTRUCT Export
+
+The exported file is built from scratch (not a modified copy): patient, study and frame-of-reference attributes are copied from the original RTSTRUCT so the file imports next to the original CT series, everything else — UIDs, series number (+1000), `StructureSetLabel` (original label plus suffix, cut to 16 characters), dates, a summary of the indices in `StructureSetDescription` — is new. Each ROI is written as `CLOSED_PLANAR` contours, one per ring, on the CT slice planes with a `ContourImageSequence` reference to that slice; holes are separate rings with negative signed area, which is the convention Eclipse itself uses. The isodose ROIs carry the `RTROIInterpretedType` `CONTROL` like Eclipse's own dose structures. The file is written as explicit VR little endian with a complete file-meta header under pydicom's strict validation mode and immediately re-read and checked (`verify_rtstruct`: UID consistency, VR lengths, unique names, planar contours, slice references). Contours are extracted from the masks by marching squares at the 0.5 level, so their vertices lie on the voxel boundaries; the Douglas–Peucker simplification (`--simplify-mm`, default 0.1 mm) stays below half a voxel so that re-rasterising the contours reproduces the mask exactly (the self-test checks Dice = 1.0). With `--iso-contours field` the isodose contours are instead the isolines of the sampled dose field, which gives sub-voxel accuracy and the Eclipse vertex convention.
+
+## Resolution and Convergence
+
+The analytic phantom of the self-test (see *Validation*), evaluated through the same code path as a real case: a spherical target of radius $R$ contoured on 1 mm planes inside a smooth radial dose field whose prescription isodose (radius 10.5 mm resp. 5.8 mm) is shifted by 2 mm against the target, so TV, PIV, their intersection and the DVH have closed forms. The field is sampled from a 1 mm native dose grid like a TPS export; slab volume model, prescription 20 Gy. The rows marked *analytic* are the closed-form values; the second phantom is the same construction with the radius of a small SRS target:
+
+| Target | Grid (in-plane) | Interpolation | TV cm³ | PIV cm³ | TV∩PIV cm³ | CI Paddick | GI | HI |
+|---|---|---|---|---|---|---|---|---|
+| R = 10 mm | 1.0 mm | linear | 4.224 | 4.776 | 3.820 | 0.723 | 2.46 | 0.298 |
+| R = 10 mm | 0.5 mm | linear | 4.210 | 4.806 | 3.822 | 0.722 | 2.47 | 0.299 |
+| R = 10 mm | 0.25 mm | linear | 4.190 | 4.801 | 3.808 | 0.721 | 2.48 | 0.296 |
+| R = 10 mm | 0.25 mm | cubic | 4.190 | 4.843 | 3.823 | 0.720 | 2.45 | 0.294 |
+| R = 10 mm | analytic | — | 4.194 | 4.838 | 3.824 | 0.721 | 2.46 | 0.294 |
+| R = 5.5 mm | 1.0 mm | linear | 0.672 | 0.840 | 0.548 | 0.532 | 2.39 | 0.457 |
+| R = 5.5 mm | 0.5 mm | linear | 0.680 | 0.792 | 0.538 | 0.537 | 2.54 | 0.462 |
+| R = 5.5 mm | 0.25 mm | linear | 0.690 | 0.802 | 0.544 | 0.535 | 2.50 | 0.471 |
+| R = 5.5 mm | 0.25 mm | cubic | 0.690 | 0.816 | 0.549 | 0.536 | 2.46 | 0.467 |
+| R = 5.5 mm | analytic | — | 0.691 | 0.819 | 0.551 | 0.536 | 2.45 | 0.466 |
+
+At 1 mm in-plane the voxel discretisation alone moves the individual volumes by about 1 % for the 10 mm sphere and by about 3 % for the small target (TV −2.7 %, PIV +2.6 %), and the gradient index of the small target by 0.06. At 0.25 mm both target volumes are within 0.1 % of the closed form; the remaining PIV gap of the linear rows (−0.8 % resp. −2 %) is the interpolation error of the 1 mm dose grid, which the cubic model removes for this smooth field. The Paddick index is more forgiving — the errors of TV, PIV and their intersection partly cancel, so it stays within 0.005 of the closed form on every row — but the comparison with a TPS is made on the components, not on the ratio, and only the fine grid makes them trustworthy individually, which is why 0.25 mm is the default. The remaining spread between interpolation schemes and volume models is not a numerical error but the genuine ambiguity of a sub-millimetre index; a report that hides it is not more accurate, only less honest.
+
+## Validation
+
+`python -m dicom_file_modifier.dose_indices --self-test` builds an analytic phantom in memory — a spherical target of radius 10 mm contoured on 1 mm planes and a smooth radial dose field $D(r) = D_{\max} / (1 + (r/r_0)^6)$ around a centre offset by 2 mm — for which TV, PIV, their intersection (a stack of circle–circle lenses), the DVH and hence every index have closed-form values. The 23 checks cover the RTDOSE loader (relative and absolute GFOV), the sampler (a linear field must be reproduced to 1e-6 Gy by both interpolation orders; points outside the grid give NaN), all volumes and indices at 0.25 mm (within 0.5 % / ±0.005) and 1.0 mm, both volume models, the sampling from a native 0.5 mm grid, a ring-shaped target with holes, the component scoping with two separate hot spots, and the mask → contour → mask round trip. `python -m dicom_file_modifier.rtstruct_writer --self-test` writes synthetic masks (sphere, annulus, islands, border-touching block, single voxel) to a temporary RTSTRUCT and verifies orientation, volumes, name uniqueness and the file-meta consistency.
+
+## Limitations
+
+- **The dose grid is the limit.** A 1 mm dose grid cannot locate an isodose surface better than its interpolation model allows; the fine evaluation grid removes the discretisation error of the volumes, not the uncertainty of the dose itself. Cubic interpolation is offered as a second model, not as the truth.
+- **TPS agreement is empirical.** The volume model and the Eclipse-compatibility mode were tuned to reproduce the target statistics of one TPS (Eclipse) on clinical data; the prescription isodose volume of the TPS could not be reproduced from the exported data (see above). Index values should be compared with the TPS on each installation before they are used to judge plans.
+- **Contour planes must coincide with dose planes** (up to an integer refinement); non-uniform GFOVs, relative dose units and tilted dose grids are rejected.
+- **$D_{\min}$ / $D_{\max}$ are sample extremes** on the evaluation grid and therefore resolution dependent; the percentile values are robust.
+- **Component scoping is a heuristic** for multi-target plans; targets that share one isodose component get the same PIV and are flagged.
+- **Not a clinical tool.** See the disclaimer at the top: nothing here replaces the plan evaluation in the TPS by a medical physicist.
+
+---
+
 # References
 
 Standards and reports:
@@ -914,12 +1104,17 @@ Standards and reports:
 
 Publications:
 
+- Feuvret, L., Noël, G., Mazeron, J.-J., & Bey, P. (2006). *Conformity index: a review.* International Journal of Radiation Oncology, Biology, Physics, 64(2), 333–342.
 - Heimann, T., van Ginneken, B., Styner, M. A., et al. (2009). *Comparison and evaluation of methods for liver segmentation from CT datasets.* IEEE Transactions on Medical Imaging, 28(8), 1251–1265.
 - Huttenlocher, D. P., Klanderman, G. A., & Rucklidge, W. J. (1993). *Comparing images using the Hausdorff distance.* IEEE Transactions on Pattern Analysis and Machine Intelligence, 15(9), 850–863.
 - Lehmann, T. M., Gönner, C., & Spitzer, K. (1999). *Survey: Interpolation methods in medical image processing.* IEEE Transactions on Medical Imaging, 18(11), 1049–1075.
 - Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm.* ACM SIGGRAPH Computer Graphics, 21(4), 163–169.
+- Paddick, I. (2000). *A simple scoring ratio to index the conformity of radiosurgical treatment plans.* Journal of Neurosurgery, 93(Suppl 3), 219–222.
+- Paddick, I., & Lippitt, B. (2006). *A simple dose gradient measurement tool to complement the conformity index.* Journal of Neurosurgery, 105(Suppl), 194–201.
+- Shaw, E., Kline, R., Gillin, M., et al. (1993). *Radiation Therapy Oncology Group: radiosurgery quality assurance guidelines.* International Journal of Radiation Oncology, Biology, Physics, 27(5), 1231–1239.
 - Taha, A. A., & Hanbury, A. (2015). *Metrics for evaluating 3D medical image segmentation: analysis, selection, and tool.* BMC Medical Imaging, 15(1), 29.
 - Thévenaz, P., Blu, T., & Unser, M. (2000). *Interpolation revisited.* IEEE Transactions on Medical Imaging, 19(7), 739–758.
+- van't Riet, A., Mak, A. C. A., Moerland, M. A., Elders, L. H., & van der Zee, W. (1997). *A conformation number to quantify the degree of conformality in brachytherapy and external beam irradiation: application to the prostate.* International Journal of Radiation Oncology, Biology, Physics, 37(3), 731–736.
 - Wadell, H. (1935). *Volume, shape, and roundness of quartz particles.* The Journal of Geology, 43(3), 250–280.
 
 

@@ -40,17 +40,39 @@ python -m dicom_file_modifier.case_modifier data/<case-id> \
 python -m dicom_file_modifier.case_modifier data/<case-id> --list-markers
 # Identity-transform self-test (exit 0 = pass)
 python -m dicom_file_modifier.case_modifier data/<case-id> --self-test
+
+# Dose indices (Paddick CI, GI, ICRU 83 HI, ...) from RS + RD (+ RP) → console/JSON/TXT/CSV
+# plus a separate RTSTRUCT with isodose ROIs and the intersection/underdosed/spill helper contours
+python -m dicom_file_modifier.dose_indices data/<case-id> --output output/
+# Every setting on Eclipse conventions (CT-pixel-aligned grid, half end slabs, global PIV, field isolines)
+python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high --label _ECL
+# ROI table + prescriptions, analytic phantom self-test, writer self-test (exit 0 = pass)
+python -m dicom_file_modifier.dose_indices data/<case-id> --list
+python -m dicom_file_modifier.dose_indices --self-test
+python -m dicom_file_modifier.rtstruct_writer --self-test
 ```
+
+`dose_indices` flags: `--target NAME[,NAME]` (default: PTVs classified as targets; a RTPLAN `DoseReferenceDescription` prefix narrows to one), `--rx GY` / `--rx-pct-of-max PCT` (default: RTPLAN `TargetPrescriptionDose`), `--isodose 100,50[,80,12Gy]`, `--grid {1.0,0.5,0.25,0.1}` (in-plane mm, default 0.25; z stays on the dose planes), `--dose-interp {linear,cubic}`, `--volume-model {slab,eclipse}` (eclipse = end slabs count half), `--piv-scope {global,component}` (default component: only the Rx-isodose component(s) overlapping the target), `--iso-contours {mask,field}`, `--eclipse-compat {high,default}` (sets grid = 1 or 2 CT pixels aligned to the CT pixel raster, eclipse volume model, global PIV, linear, field isolines, no simplification), `--label` (default `_IDX`), `--no-rs`, `--include-target`, `--simplify-mm`, `--transfer-syntax`, `--max-name-len`, `--append-csv PATH` (cross-case collection table).
 
 Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `resample`; `metadata` keeps pixel data byte-identical and only rewrites IPP/IOP), `--order {0,1,3}` (interpolation order; 0 preserves exact discrete HU values), `--no-viz` to skip the Plotly HTML output.
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no pytest suite, lint config, or build step in this repo. The only automated checks are `python -m dicom_file_modifier.analyzer --self-test` (synthetic geometry: XOR holes, keyhole contours, z-gaps) and `python -m dicom_file_modifier.case_modifier <case> --self-test` (rigid-body round trip).
+There is no pytest suite, lint config, or build step in this repo. The only automated checks are `python -m dicom_file_modifier.analyzer --self-test` (synthetic geometry: XOR holes, keyhole contours, z-gaps), `python -m dicom_file_modifier.case_modifier <case> --self-test` (rigid-body round trip), `python -m dicom_file_modifier.dose_indices --self-test` (analytic sphere phantom with closed-form CI/GI/HI expectations) and `python -m dicom_file_modifier.rtstruct_writer --self-test` (mask → contour → RTSTRUCT round trip).
 
 ## Architecture
 
-Four runnable modules. `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep.
+Five runnable modules plus two libraries. `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics) and `rtstruct_writer.py` (isodose RTSTRUCT export).
+
+### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` — dose indices
+Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → report/JSON/TXT/CSV.
+
+Key conventions:
+- All volumes come from the same fine grid; target-derived volumes (TV, TV∩PIV, underdosed) carry the slab weights, isodose-derived ones (PIV, PIV50, spill) do not, so TV∩PIV ≤ min(TV, PIV) always holds. Comparisons are inclusive (`>=`). `D_x` = dose received by x % of the weighted target volume (D98 = 2nd weighted percentile).
+- Both volume models are always evaluated (only the weights differ); the report prints the chosen one and one line for the other. NaN → `null` in JSON, empty cell in CSV.
+- `rtstruct_writer.write_isodose_rtstruct` builds a *fresh* Dataset (patient/study/FoR copied from the original RS, everything else new), one `CLOSED_PLANAR` contour per ring (holes are separate rings with negative area, Eclipse convention), `ContourImageSequence` referencing the CT slice at that z, explicit VR LE with a proper `FileMetaDataset`, written under `writing_validation_mode = RAISE`, then re-read by `verify_rtstruct`. Isodose contours come from `dose.mask_to_contours` (marching squares at 0.5) or, with `--iso-contours field` / `--eclipse-compat`, from `dose.field_to_contours` (isoline of the sampled dose; one vertex coordinate lies exactly on the grid lines, which is how Eclipse exports its "High"/"Default" resolution contours).
+- ROI names: `ISO_100%_20.0Gy`, `<Ziel>_x_ISO100`, `<Ziel>_minus_ISO100`, `ISO100_minus_<Ziel>`; `analyzer.classify_structure` files CONTROL/DOSE_REGION types and these name patterns under HELPER so they stay out of the clinical plots.
+- New-module console output is pure ASCII (`TV&PIV`, `>=`, `cm3`): the Windows console is cp1252 and `∩`/`≥` would raise `UnicodeEncodeError`. Files are UTF-8.
 
 ### `analyzer.py` — RTSTRUCT geometric analysis
 Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions → `run_analysis` aggregates everything into a single results dict that is also written as `<rtstruct-stem>_analysis.json`.
