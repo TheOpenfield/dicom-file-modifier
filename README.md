@@ -15,7 +15,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 ## Features
 
 - **Analyzer**: Extract and compute geometric properties (volume, centroid, shape metrics, distances) from RTSTRUCT files
-- **Modifier**: Rigid body transformation of CT DICOM series (translation + rotation) with HU preservation and 3D visualisation
+- **Modifier**: Rigid body transformation of CT DICOM series (translation + rotation), either resampled onto the original axial grid or HU-exact by rewriting only the geometry tags, with 3D visualisation
 - **Case Modifier**: Lockstep rigid body transformation of a CT series **and** its companion RTSTRUCT in a single pass — contour points are transformed alongside the pixel data, UID references are rewritten so the new RS links to the new CT, and an optional `Drehpunkt` POINT marker is inserted at the rotation centre for easy identification in the TPS
 - **Visualizer**: Generate plots and statistics from analysis results
 
@@ -74,11 +74,11 @@ python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm \
 ```
 
 This creates:
-- `volumes.png`: Horizontal bar chart of all structure volumes, colour-coded by type
+- `volumes.png`: Horizontal bar chart (log scale) of all analysed structure volumes, grouped and colour-coded by category
 - `shape_metrics.png`: Category-grouped heatmap of sphericity, solidity, elongation (anatomical structures)
 - `distances.png`: Lollipop of min-distance + HD95 for Target↔serial-OAR pairs, with 3/5 mm thresholds
 - `proximity_matrix.png`, `nearest_critical_oar.png`, `sphericity_vs_elongation.png`, `gtv_ptv_margin.png`: additional SRS / multi-metastasis plots
-- `centroids_3d.png`: 3D scatter of structure centroids in patient space, marker size ∝ volume
+- `centroids_3d.png`: 3D scatter of structure centroids in patient space, marker size ∝ √volume
 - `statistics.txt`: Full numerical summary of all metrics
 
 ### Modifier – CT Rigid Body Transformer
@@ -93,7 +93,7 @@ python -m dicom_file_modifier.modifier data/<case-id>/CT \
 ```
 
 This produces:
-- `CT_0000.dcm … CT_NNNN.dcm`: Transformed CT series with standard axial geometry, importable into a TPS
+- `CT_0000.dcm … CT_NNNN.dcm`: Transformed CT series on the original axial grid (with `--method metadata` the pixels are unchanged and the slices become oblique instead)
 - `visualization_3d.html`: Interactive 3D comparison (original vs. transformed)
 
 **All CLI options:**
@@ -159,8 +159,8 @@ Visualisation is on by default; pass `--no-viz` to skip it (e.g., for batch/CI r
 - `SeriesDescription = "<orig>_RB"` (LO, ≤ 64 chars)
 - `StructureSetLabel = "<orig>_RB"` (SH, truncated to 16 chars with the suffix preserved)
 - `StructureSetName = "<orig>_RB"`
-- `StructureSetDescription = "rigid t=(10,0,-5) r=(0,0,15) c=Marker 'HS1' m=res FoR=keep"` (LO, ≤ 64 chars, full transform parameters)
-- `SeriesNumber += 1000` so the transformed series sorts adjacent to the original
+- `StructureSetDescription = "rigid t=(10,0,-5) r=(0,0,15) c=Marker 'HS1' m=res FoR=keep"` (VR ST; the tool truncates it to 64 chars) — translation, rotation, centre label, method and FoR strategy
+- `SeriesNumber += 1000` so the transformed series is easy to tell apart from the original (e.g. 2 → 1002)
 - `--label` overrides the suffix (e.g., `--label _SHIFT_LR10`)
 
 ## Dependencies
@@ -203,8 +203,8 @@ Relevant DICOM fields:
 ICRU Reports 50, 62, and 83 define a hierarchy of target volumes:
 
 - **GTV** (*Gross Tumor Volume*): Macroscopically visible tumour tissue.
-- **CTV** (*Clinical Target Volume*): GTV plus safety margin for microscopic spread.
-- **PTV** (*Planning Target Volume*): CTV plus safety margin for setup uncertainties and organ motion.
+- **CTV** (*Clinical Target Volume*): GTV plus the surrounding tissue that may contain subclinical (microscopic) disease.
+- **PTV** (*Planning Target Volume*): CTV plus a geometric margin for setup uncertainties and organ motion.
 
 Organs at risk (OAR) are structures whose radiation dose must be limited, e.g., spinal cord, parotid, or bladder. Classification is stored in the `RTROIInterpretedType` field.
 
@@ -214,25 +214,31 @@ Organs at risk (OAR) are structures whose radiation dose must be limited, e.g., 
 
 The volume of a structure is calculated slice-by-slice by summing contour areas:
 
-$$V = \sum_{i=1}^{N} A_i \cdot \Delta z$$
+```math
+V = \sum_{i=1}^{N} A_i \cdot \Delta z
+```
 
-Where $A_i$ is the area of the contour in slice $i$ and $\Delta z$ is the mean slice spacing. The area of each contour is determined using the **Shoelace formula** (Gauss's area formula, also known as the surveyor's formula):
+Where $A_i$ is the area of contour $i$ (summed over all $N$ contours of the structure) and $\Delta z$ is the mean spacing between the distinct contour z-positions, i.e. each contour represents a slab one slice thick. The area of each contour is determined using the **Shoelace formula** (Gauss's area formula, also known as the surveyor's formula), with the vertex index taken cyclically ($x_n = x_0$, $y_n = y_0$):
 
-$$A = \frac{1}{2} \left| \sum_{j=0}^{n-1} (x_j \, y_{j+1} - x_{j+1} \, y_j) \right|$$
+```math
+A = \frac{1}{2} \left| \sum_{j=0}^{n-1} (x_j \, y_{j+1} - x_{j+1} \, y_j) \right|
+```
 
-If a slice contains multiple contours (e.g., for ring-shaped or fragmented structures), their areas are added.
+If a slice contains several contours, their areas are added. This is correct for the separate islands of a fragmented structure, but **not for holes**: DICOM may encode a ring-shaped or hollow structure as an outer contour plus a nested inner contour whose area should be *subtracted*, but the analyzer adds it (a synthetic ring with radii 10/20 mm measured 34.5 cm³ instead of 20.7 cm³). A hole encoded with the keyhole technique (a single contour) is measured correctly.
 
 **Unit:** Results are converted from mm³ to cm³ (division by 1000).
 
-**Limitation:** This method is a planimetric approximation. It is more accurate with thinner CT slices. For exact voxel-based volume calculation, the associated CT image would be required as a reference grid.
+**Limitation:** This method is a planimetric approximation. It is more accurate with thinner CT slices. A voxel-based volume on the CT's own grid (as a TPS computes it) would require the associated CT image; the analyzer's voxel cross-check uses a local grid of its own (see *Sphericity*).
 
 ### Centroid Calculation
 
 The centroid is calculated as the **area-weighted average** of contour centroids:
 
-$$\vec{C} = \frac{\sum_{i=1}^{N} A_i \cdot \vec{c}_i}{\sum_{i=1}^{N} A_i}$$
+```math
+\vec{C} = \frac{\sum_{i=1}^{N} A_i \cdot \vec{c}_i}{\sum_{i=1}^{N} A_i}
+```
 
-Where $\vec{c}_i$ is the centre of the contour in slice $i$ and $A_i$ is the corresponding contour area as weight. Note that $\vec{c}_i$ is approximated by the arithmetic mean of the contour vertices; this equals the true polygon area-centroid only when the vertices are sampled uniformly around the contour and is biased slightly towards densely sampled segments otherwise.
+Where $\vec{c}_i$ is the centroid of contour $i$ — the area centroid (first area moment) of the polygon, computed with Shapely, placed at the contour's z-position — and $A_i$ is the corresponding contour area as weight. The polygon area centroid is used rather than the arithmetic mean of the vertices, which would be biased towards densely sampled segments of the contour.
 
 Weighting by area ensures that larger cross-sections contribute more to the overall centroid than small edge slices. The result is three coordinates *(x, y, z)* in millimeters in the DICOM patient coordinate system.
 
@@ -244,77 +250,102 @@ Shape metrics quantify the geometric shape of a structure independently of its a
 
 Sphericity describes how closely a structure resembles a sphere (Wadell's definition [Wadell 1935]). It is defined as the ratio of the surface area of a volume-equivalent sphere to the actual surface area:
 
-$$\Psi = \frac{\pi^{1/3} \cdot (6V)^{2/3}}{A_{\text{surface}}}$$
+```math
+\Psi = \frac{\pi^{1/3} \cdot (6V)^{2/3}}{A_{\text{surface}}}
+```
 
 A value of 1.0 corresponds to a perfect sphere; smaller values indicate irregular or elongated shapes. By the isoperimetric inequality $\Psi \le 1$ for **any** solid, but this holds only when $V$ and $A$ describe the *same* body. The volume $V$ and surface area $A$ are therefore both taken from a **single consistent voxel mask**: the stacked contours are rasterised onto a local grid (in-plane via `matplotlib.path`, slice spacing in z), the volume is the filled voxel volume, and the surface area is obtained from a marching-cubes mesh of that mask (`skimage.measure`). The result is clamped to $(0,1]$. If rasterisation is unavailable the code falls back to a convex-hull-consistent estimate.
+
+Because the surface is measured on a discretised, slice-stacked mask (terraces between slices, marching-cubes facets), the surface area is systematically over-estimated and $\Psi$ is **biased low**: a perfect sphere contoured on 1–3 mm slices scores only about 0.79–0.92, lower for small structures and thick slices. Sphericity values are therefore meaningful for comparing structures of similar size and slice spacing, not as absolute values.
 
 #### Solidity
 
 Solidity (the scikit-image / ImageJ name for this metric) relates the actual volume to the volume of the convex hull:
 
-$$S = \frac{V_{\text{mask}}}{V_{\text{convex}}}$$
+```math
+S = \frac{V_{\text{mask}}}{V_{\text{convex}}}
+```
 
-A value of 1.0 means the structure is convex (few indentations or cavities); lower values indicate concave or highly irregular shapes, which may be clinically relevant for tumours that wrap around other structures. Because a body is contained in its convex hull, $S \le 1$ by definition; the numerator uses the rasterised voxel volume (not the inflated planimetric volume) and the result is clamped to $(0,1]$. For multi-component unions / dose shells / optimisation structures (flagged `n_components > 1` / `shape_valid = false`) the convex-hull metrics are not meaningful and are excluded from the shape plots.
+A value of 1.0 means the structure is convex; lower values indicate concave or highly irregular shapes, which may be clinically relevant for tumours that wrap around other structures. For the true body $S \le 1$, because a body is contained in its convex hull. The implementation, however, divides the voxel-mask volume — the same slab stack as the planimetric volume, which extends half a slice beyond the outermost contours — by the convex hull of the contour *vertices*, which ends at the outermost contour planes. The raw ratio is therefore biased upwards (exactly $N/(N-1)$ for a prism spanning $N$ slices; 1.01–1.13 for spheres in synthetic tests) and is clamped to $(0,1]$. As a result convex structures read 1.0, and moderate concavities of small, few-slice structures can be masked. For multi-component unions / dose shells / optimisation structures (flagged `n_components > 1` / `shape_valid = false`) the convex-hull metrics are not meaningful and are excluded from the shape plots.
 
 #### Elongation
 
 Elongation describes the stretching of a structure along its principal axes. It is determined via **principal component analysis** (PCA) of the 3D point cloud:
 
-$$E = \sqrt{\frac{\lambda_{\max}}{\lambda_{\min}}}$$
+```math
+E = \sqrt{\frac{\lambda_{\max}}{\lambda_{\min}}}
+```
 
-Where *λ_max* and *λ_min* are the largest and smallest eigenvalues of the covariance matrix. A value of 1.0 corresponds to isotropic (spherical) extension, larger values show increasing stretching in a preferred direction.
+Where $\lambda_{\max}$ and $\lambda_{\min}$ are the largest and smallest eigenvalues of the covariance matrix of the contour vertices, so $E$ is the ratio of the standard deviations along the longest and shortest principal axes. A value of 1.0 corresponds to isotropic extension, larger values show increasing stretching in a preferred direction.
+
+The vertices sample the *surface*, and not uniformly, so $E$ depends on how the structure was contoured. With a constant vertex spacing along each contour (vertex count ∝ perimeter) the small polar slices are under-represented and even a perfect sphere yields $E \approx 1.2$; with a fixed vertex count per contour it yields $E \approx 1.0$. Compare elongation values only between structures contoured the same way.
 
 #### Bounding Box
 
 The axis-aligned bounding box gives the extent of the structure in all three spatial directions:
 
-$$\Delta x = x_{\max} - x_{\min}, \quad \Delta y = y_{\max} - y_{\min}, \quad \Delta z = z_{\max} - z_{\min}$$
+```math
+\Delta x = x_{\max} - x_{\min}, \quad \Delta y = y_{\max} - y_{\min}, \quad \Delta z = z_{\max} - z_{\min}
+```
 
 It provides a quick overview of the spatial extent in millimeters.
 
 ## Distance Calculations
 
-Distances between structures are central to evaluating the radiotherapy plan: How close is an organ at risk to the target? Do structures overlap?
+Distances between structures are central to evaluating the radiotherapy plan: How close is an organ at risk to the target? All distances below are computed between the contour **vertices** of the two structures, i.e. between point samples of their surfaces. They are never negative and do not by themselves detect overlap (see *Minimum Distance*).
 
 ### Minimum Distance
 
 The minimum distance between two structures *A* and *B* is defined as:
 
-$$d_{\min}(A, B) = \min_{a \in A, \, b \in B} \| a - b \|_2$$
+```math
+d_{\min}(A, B) = \min_{a \in A, \, b \in B} \| a - b \|_2
+```
 
 Calculation is performed efficiently using a **KD-tree** (`scipy.spatial.cKDTree`): For each point of structure *A*, the nearest neighbour in *B* is found and the global minimum determined.
 
-A value of 0 mm means the contours touch or overlap. Clinically, this value is particularly relevant for assessing whether a safety margin between PTV and adjacent organs at risk is maintained.
+Clinically, this value is particularly relevant for assessing whether a safety margin between PTV and adjacent organs at risk is maintained. Two properties matter when reading it:
+
+- **It is a surface-to-surface distance and cannot indicate overlap.** Structures whose surfaces intersect give a value close to, but generally not exactly, 0 mm. A structure lying entirely *inside* another gives a clearly positive value although the two overlap completely: an OAR sphere of radius 5 mm centred in a PTV sphere of radius 20 mm reports 15 mm. Overlap has to be checked separately (e.g. via an intersection volume).
+- **Only vertices are compared.** The result can over-estimate the distance between the continuous surfaces by up to about the in-plane vertex spacing, or about one slice spacing where the closest approach falls between contour planes. That is the unsafe direction for OAR clearance.
 
 ### Hausdorff Distance
 
 The Hausdorff distance [Huttenlocher et al. 1993] is a measure of the maximum deviation between two point sets:
 
-$$d_H(A, B) = \max\!\Big(\,\sup_{a \in A} \inf_{b \in B} \|a - b\|, \;\sup_{b \in B} \inf_{a \in A} \|a - b\|\,\Big)$$
+```math
+d_H(A, B) = \max\!\Big(\,\sup_{a \in A} \inf_{b \in B} \|a - b\|, \;\sup_{b \in B} \inf_{a \in A} \|a - b\|\,\Big)
+```
 
-Intuitively: The Hausdorff distance indicates how far one must travel in the worst case from a point of one structure to the nearest point of the other structure. It is thus more sensitive to local outliers than the minimum distance and is well-suited for assessing shape agreement between two structures.
+Intuitively: The Hausdorff distance indicates how far one must travel in the worst case from a point of one structure to the nearest point of the other structure. Like the minimum distance it is set by a single point pair, so it is highly sensitive to outliers. It is the standard worst-case measure for comparing two delineations of the *same* structure; between two different structures (e.g. Target ↔ OAR) it mainly reflects their size and separation rather than a clinically meaningful margin.
 
 ### 95th-Percentile Hausdorff Distance (HD95)
 
 Because the raw Hausdorff distance is fixed by a single worst-case point, it is dominated by isolated outliers. The 95th-percentile Hausdorff distance replaces the outer suprema with the 95th percentile of the directed nearest-neighbour distances, then takes the larger of the two directions:
 
-$$d_{H95}(A, B) = \max\!\Big(\,P_{95}\big\{\inf_{b \in B}\|a - b\| : a \in A\big\}, \; P_{95}\big\{\inf_{a \in A}\|b - a\| : b \in B\big\}\,\Big)$$
+```math
+d_{H95}(A, B) = \max\!\Big(\,P_{95}\big\{\inf_{b \in B}\|a - b\| : a \in A\big\}, \; P_{95}\big\{\inf_{a \in A}\|b - a\| : b \in B\big\}\,\Big)
+```
 
-This is the robust variant recommended for segmentation comparison [Taha & Hanbury 2015] and is the companion metric reported in `distances.png`.
+This is the robust variant recommended for segmentation comparison [Taha & Hanbury 2015] and is the companion metric reported in `distances.png`. Other implementations take the 95th percentile of the *pooled* distances of both directions instead, which gives slightly different values, so HD95 figures are only comparable between tools that use the same definition.
 
 ### Average Symmetric Surface Distance (ASSD)
 
 ASSD is the mean nearest-neighbour distance, averaged symmetrically over both directions:
 
-$$d_{\text{ASSD}}(A, B) = \frac{\sum_{a \in A} \inf_{b \in B}\|a - b\| + \sum_{b \in B} \inf_{a \in A}\|b - a\|}{|A| + |B|}$$
+```math
+d_{\text{ASSD}}(A, B) = \frac{\sum_{a \in A} \inf_{b \in B}\|a - b\| + \sum_{b \in B} \inf_{a \in A}\|b - a\|}{|A| + |B|}
+```
 
-Unlike the (95th-percentile) Hausdorff distance, ASSD reflects the *typical* separation over the whole boundary rather than its extremes [Taha & Hanbury 2015].
+This is the definition used by [Heimann et al. 2009]. Unlike the (95th-percentile) Hausdorff distance, ASSD reflects the *typical* separation over the whole boundary rather than its extremes [Taha & Hanbury 2015].
 
 ### Centroid Distance
 
 The Euclidean distance between the centroids of two structures:
 
-$$d_C = \| \vec{C}_A - \vec{C}_B \|_2$$
+```math
+d_C = \| \vec{C}_A - \vec{C}_B \|_2
+```
 
 This value provides a rough but robust estimate of spatial separation. It is insensitive to outliers and suitable as a quick comparison value.
 
@@ -324,9 +355,10 @@ All distance metrics are computed **exactly on the full point clouds**: a single
 
 ## Limitations
 
-- **No inter-structure overlap metrics:** Distance/volume work from contour points (the reported volume is the planimetric slice-stack volume). Sphericity/solidity additionally rasterise each structure onto its **own** local voxel grid, but **Dice / Jaccard / Conformity Number** between two structures still require a *common* reference grid (the associated CT) and are not implemented.
-- **Surface approximation:** Sphericity's surface area is taken from a marching-cubes mesh of the rasterised voxel mask (consistent with the mask volume, so $\Psi \le 1$). The mask resolution is bounded for performance, so the surface is a discretised approximation; very thin or sub-voxel features may be under-resolved.
-- **Planimetric volume:** The reported volume assumes equidistant slice spacing; with non-equidistant slices the mean spacing is used, which can introduce small inaccuracies. (A voxel-volume cross-check is reported alongside in `statistics.txt`.)
+- **No inter-structure overlap metrics:** Distance/volume work from contour points (the reported volume is the planimetric slice-stack volume). Sphericity/solidity additionally rasterise each structure onto its **own** local voxel grid, but overlap measures such as **Dice / Jaccard** need both structures on a *common* grid and are not implemented. The distance metrics cannot substitute for them (see *Minimum Distance*).
+- **Vertex-based distances:** All distances are computed between contour vertices, a discrete sample of the surfaces, so they approximate the continuous surface distances only to within roughly the vertex and slice spacing.
+- **Surface approximation:** Sphericity's surface area is taken from a marching-cubes mesh of the rasterised voxel mask. The mask resolution is bounded for performance, so the surface is a discretised approximation that over-estimates the true area ($\Psi$ biased low, see *Sphericity*); very thin or sub-voxel features may be under-resolved.
+- **Planimetric volume:** $\Delta z$ is the mean spacing between the distinct contour z-positions. This is appropriate for contiguous, equidistant contours, but a structure that has a **gap in z** (e.g. a union of lesions at different heights) gets an inflated $\Delta z$ and hence an inflated volume. Two spheres of radius 10 mm with centres 60 mm apart, stored in one ROI, measured 2.06× their true volume. The voxel cross-check in `statistics.txt` uses the same mean spacing, so it does not catch this error. Nested inner (hole) contours are added rather than subtracted (see *Volume Calculation*).
 - **Not a clinical diagnostic tool:** The script serves geometric analysis and does not replace clinical evaluation by a medical physicist or radiation therapist.
 
 ## Used Libraries
@@ -347,7 +379,7 @@ All distance metrics are computed **exactly on the full point clouds**: a single
 
 ## Overview
 
-The **CT Rigid Body Transformer** (`modifier.py`) applies a rigid body transformation — consisting of a translation in three spatial directions and a rotation around three spatial axes — to a CT DICOM series. The result is a new DICOM series that can be imported into any treatment planning system (TPS). The central design goal is to preserve the original Hounsfield Unit (HU) values as accurately as possible while guaranteeing that no geometric distortion of the image is introduced.
+The **CT Rigid Body Transformer** (`modifier.py`) applies a rigid body transformation — consisting of a translation in three spatial directions and a rotation around three spatial axes — to a CT DICOM series. The result is a new DICOM series for import into a treatment planning system (TPS). The central design goal is to preserve the original Hounsfield Unit (HU) values as accurately as possible while guaranteeing that no geometric distortion of the image is introduced.
 
 ## Data Foundation: CT DICOM Geometry
 
@@ -368,7 +400,7 @@ All positions and distances in the DICOM standard are specified in millimetres w
 | Tag | Name | Content |
 |---|---|---|
 | `(0020,0037)` | `ImageOrientationPatient` (IOP) | Six direction cosines defining row and column orientation |
-| `(0020,0032)` | `ImagePositionPatient` (IPP) | 3D position of the first pixel (row 0, col 0) in mm |
+| `(0020,0032)` | `ImagePositionPatient` (IPP) | 3D position of the centre of the first transmitted pixel (row 0, col 0) in mm |
 | `(0028,0030)` | `PixelSpacing` | In-plane pixel size [row spacing, col spacing] in mm |
 | `(0028,1053)` | `RescaleSlope` | Linear HU conversion: HU = stored × slope + intercept |
 | `(0028,1052)` | `RescaleIntercept` | See above |
@@ -378,23 +410,31 @@ All positions and distances in the DICOM standard are specified in millimetres w
 
 The spatial position of any voxel $(k, j, i)$ — where $k$ is the slice index, $j$ the row index, and $i$ the column index — in patient coordinates is given by the following affine transformation:
 
-$$\begin{pmatrix} x \\ y \\ z \\ 1 \end{pmatrix} = \mathbf{A} \begin{pmatrix} k \\ j \\ i \\ 1 \end{pmatrix}$$
+```math
+\begin{pmatrix} x \\ y \\ z \\ 1 \end{pmatrix} = \mathbf{A} \begin{pmatrix} k \\ j \\ i \\ 1 \end{pmatrix}
+```
 
 where the $4 \times 4$ affine matrix $\mathbf{A}$ is constructed from the DICOM tags as:
 
-$$\mathbf{A} = \begin{pmatrix} n_x \cdot \Delta z & F_4 \cdot \Delta r & F_1 \cdot \Delta c & \text{IPP}_x \\ n_y \cdot \Delta z & F_5 \cdot \Delta r & F_2 \cdot \Delta c & \text{IPP}_y \\ n_z \cdot \Delta z & F_6 \cdot \Delta r & F_3 \cdot \Delta c & \text{IPP}_z \\ 0 & 0 & 0 & 1 \end{pmatrix}$$
+```math
+\mathbf{A} = \begin{pmatrix} n_x \cdot \Delta z & F_4 \cdot \Delta r & F_1 \cdot \Delta c & \text{IPP}_x \\ n_y \cdot \Delta z & F_5 \cdot \Delta r & F_2 \cdot \Delta c & \text{IPP}_y \\ n_z \cdot \Delta z & F_6 \cdot \Delta r & F_3 \cdot \Delta c & \text{IPP}_z \\ 0 & 0 & 0 & 1 \end{pmatrix}
+```
 
 Here $\mathbf{F} = (F_1, F_2, F_3, F_4, F_5, F_6)$ is the `ImageOrientationPatient` vector, $(F_1, F_2, F_3)$ are the direction cosines of the row direction (increasing column index) and $(F_4, F_5, F_6)$ are the direction cosines of the column direction (increasing row index). The slice normal $\mathbf{n} = (n_x, n_y, n_z) = (F_1, F_2, F_3) \times (F_4, F_5, F_6)$ is computed as the cross product of the two IOP vectors. $\Delta z$ is the slice spacing, $\Delta r$ the row pixel spacing, and $\Delta c$ the column pixel spacing.
 
 The inverse $\mathbf{A}^{-1}$ maps patient coordinates back to voxel indices and is used during resampling.
 
+**Slice ordering assumption.** The loader sorts slices by increasing IPP z and takes the slice axis of $\mathbf{A}$ along $\mathbf{n}$. The two agree only when $\mathbf{n}$ points superiorly, as it does for head-first acquisitions (HFS `[1,0,0,0,1,0]`, HFP `[-1,0,0,0,-1,0]`). For feet-first series (FFS `[-1,0,0,0,1,0]`, FFP `[1,0,0,0,-1,0]`) $\mathbf{n}$ points inferiorly, so the slice axis of $\mathbf{A}$ is reversed and the modelled geometry is wrong; in a synthetic test the computed volume centre lay outside the volume. Such series are currently **not supported**.
+
 ### HU Conversion
 
 Stored integer pixel values are converted to Hounsfield Units via a linear mapping defined per slice:
 
-$$\text{HU} = \text{stored} \times \text{RescaleSlope} + \text{RescaleIntercept}$$
+```math
+\text{HU} = \text{stored} \times \text{RescaleSlope} + \text{RescaleIntercept}
+```
 
-For modern CT scanners the slope is typically 1 and the intercept −1024, so that water maps to 0 HU and air to roughly −1000 HU (by definition), with −1024 HU being the lowest representable value. The full diagnostic CT range spans approximately −1024 HU to +3071 HU (dense bone / metal) — the 4096 levels of a 12-bit acquisition.
+For modern CT scanners the slope is typically 1 and the intercept −1024. By definition of the Hounsfield scale, water is 0 HU and air −1000 HU. With the common 12-bit storage (`BitsStored = 12`, 4096 levels) this gives a range of −1024 to +3071 HU. Cortical bone lies well inside that range, while metal implants usually saturate at the upper end unless the scanner's extended HU scale is used. Values below −1024 HU can occur with signed pixel data, e.g. as padding outside the reconstruction circle.
 
 ## Rigid Body Transformation
 
@@ -402,21 +442,31 @@ For modern CT scanners the slope is typically 1 and the intercept −1024, so th
 
 A rigid body transformation in three-dimensional Euclidean space preserves all pairwise distances and angles. It comprises exactly six degrees of freedom: three translational $(t_x, t_y, t_z)$ and three rotational $(r_x, r_y, r_z)$. Formally it is an element of the special Euclidean group $SE(3)$:
 
-$$\mathbf{T} : \mathbf{p} \mapsto \mathbf{R}\,\mathbf{p} + \mathbf{t}$$
+```math
+\mathbf{T} : \mathbf{p} \mapsto \mathbf{R}\,\mathbf{p} + \mathbf{t}
+```
 
 where $\mathbf{R} \in SO(3)$ is a $3 \times 3$ rotation matrix satisfying $\mathbf{R}^T \mathbf{R} = \mathbf{I}$ and $\det(\mathbf{R}) = +1$, and $\mathbf{t} \in \mathbb{R}^3$ is the translation vector. In homogeneous coordinates this becomes the $4 \times 4$ matrix:
 
-$$\mathbf{T} = \begin{pmatrix} \mathbf{R} & \mathbf{t} \\ \mathbf{0}^T & 1 \end{pmatrix}$$
+```math
+\mathbf{T} = \begin{pmatrix} \mathbf{R} & \mathbf{t} \\ \mathbf{0}^T & 1 \end{pmatrix}
+```
 
 ### Rotation Matrix Construction
 
 The rotation matrix is constructed from three rotation angles using **intrinsic Euler angles in XYZ order** (SciPy's uppercase convention): each successive rotation acts about the axes of the already-rotated, body-fixed frame — first by $r_x$ about the X axis, then by $r_y$ about the new Y axis, then by $r_z$ about the resulting Z axis. The combined rotation matrix is:
 
-$$\mathbf{R} = \mathbf{R}_x(r_x)\,\mathbf{R}_y(r_y)\,\mathbf{R}_z(r_z)$$
+```math
+\mathbf{R} = \mathbf{R}_x(r_x)\,\mathbf{R}_y(r_y)\,\mathbf{R}_z(r_z)
+```
 
 with the elementary rotation matrices:
 
-$$\mathbf{R}_x(\alpha) = \begin{pmatrix} 1 & 0 & 0 \\ 0 & \cos\alpha & -\sin\alpha \\ 0 & \sin\alpha & \cos\alpha \end{pmatrix}, \quad \mathbf{R}_y(\beta) = \begin{pmatrix} \cos\beta & 0 & \sin\beta \\ 0 & 1 & 0 \\ -\sin\beta & 0 & \cos\beta \end{pmatrix}, \quad \mathbf{R}_z(\gamma) = \begin{pmatrix} \cos\gamma & -\sin\gamma & 0 \\ \sin\gamma & \cos\gamma & 0 \\ 0 & 0 & 1 \end{pmatrix}$$
+```math
+\mathbf{R}_x(\alpha) = \begin{pmatrix} 1 & 0 & 0 \\ 0 & \cos\alpha & -\sin\alpha \\ 0 & \sin\alpha & \cos\alpha \end{pmatrix}, \quad \mathbf{R}_y(\beta) = \begin{pmatrix} \cos\beta & 0 & \sin\beta \\ 0 & 1 & 0 \\ -\sin\beta & 0 & \cos\beta \end{pmatrix}, \quad \mathbf{R}_z(\gamma) = \begin{pmatrix} \cos\gamma & -\sin\gamma & 0 \\ \sin\gamma & \cos\gamma & 0 \\ 0 & 0 & 1 \end{pmatrix}
+```
+
+These are active rotations following the right-hand rule: a positive angle turns counter-clockwise when viewed from the positive end of the axis towards the origin. For example, a positive $r_z$ turns the +X (left) axis towards +Y (posterior).
 
 Equivalently, this is the same rotation matrix as an *extrinsic* ZYX rotation about the fixed patient axes. For a single non-zero angle the intrinsic and extrinsic conventions coincide; they differ only when two or more rotation angles are applied simultaneously.
 
@@ -426,11 +476,15 @@ The implementation uses `scipy.spatial.transform.Rotation.from_euler("XYZ", ...)
 
 The rotation is performed about the **geometric centre** of the CT volume in patient coordinates:
 
-$$\mathbf{c} = \mathbf{A}\, \begin{pmatrix} (N_z-1)/2 \\ (N_y-1)/2 \\ (N_x-1)/2 \\ 1 \end{pmatrix}$$
+```math
+\mathbf{c} = \mathbf{A}\, \begin{pmatrix} (N_z-1)/2 \\ (N_y-1)/2 \\ (N_x-1)/2 \\ 1 \end{pmatrix}
+```
 
 Rotating around the volume centre ensures that the patient body remains approximately centred within the output voxel grid and does not drift outside the field of view for small angles. The full forward transformation applied to a point $\mathbf{p}$ is therefore:
 
-$$\mathbf{p}' = \mathbf{R}\,(\mathbf{p} - \mathbf{c}) + \mathbf{c} + \mathbf{t} = \mathbf{R}\,\mathbf{p} + \underbrace{(-\mathbf{R}\,\mathbf{c} + \mathbf{c} + \mathbf{t})}_{\mathbf{t}_{\text{eff}}}$$
+```math
+\mathbf{p}' = \mathbf{R}\,(\mathbf{p} - \mathbf{c}) + \mathbf{c} + \mathbf{t} = \mathbf{R}\,\mathbf{p} + \underbrace{(-\mathbf{R}\,\mathbf{c} + \mathbf{c} + \mathbf{t})}_{\mathbf{t}_{\text{eff}}}
+```
 
 which is stored compactly in the upper-right column of the $4 \times 4$ matrix $\mathbf{T}$.
 
@@ -438,19 +492,23 @@ which is stored compactly in the upper-right column of the $4 \times 4$ matrix $
 
 ### Principle: Inverse Mapping
 
-When a rigid body transformation moves a patient, a new CT scan of the patient in their new position is simulated. The standard approach in medical image processing is **inverse mapping** (also called pull-back or backward mapping): instead of pushing each source voxel into the output grid — which would leave holes — each output voxel asks "where in the source volume did this intensity come from?"
+When a rigid body transformation moves a patient, a new CT scan of the patient in their new position is simulated. Note that the *entire* image content is transformed, including the couch and any immobilisation devices. The result therefore corresponds to moving the whole scene, not the patient relative to a fixed couch, and the couch appears shifted or tilted in the output. The standard approach in medical image processing is **inverse mapping** (also called pull-back or backward mapping): instead of pushing each source voxel into the output grid — which would leave holes — each output voxel asks "where in the source volume did this intensity come from?"
 
-For each output voxel at voxel index $(k, j, i)$, the corresponding patient position is $\mathbf{p}_{\text{out}} = \mathbf{A}\,[k,j,i,1]^T$. The source position in the original (untransformed) volume is:
+For each output voxel at voxel index $(k, j, i)$, the corresponding patient position is $\mathbf{p}_{\text{out}} = \mathbf{A}[k,j,i,1]^T$. The source position in the original (untransformed) volume is:
 
-$$\mathbf{p}_{\text{in}} = \mathbf{T}^{-1}\,\mathbf{p}_{\text{out}}$$
+```math
+\mathbf{p}_{\text{in}} = \mathbf{T}^{-1}\,\mathbf{p}_{\text{out}}
+```
 
-Converting back to voxel indices: $\mathbf{v}_{\text{in}} = \mathbf{A}^{-1}\,\mathbf{p}_{\text{in}}$. Combining these steps, the complete voxel-to-voxel mapping is:
+Converting back to voxel indices: $\mathbf{v}_{\text{in}} = \mathbf{A}^{-1}\mathbf{p}_{\text{in}}$. Combining these steps, the complete voxel-to-voxel mapping is:
 
-$$\mathbf{v}_{\text{in}} = \underbrace{\mathbf{A}^{-1} \mathbf{T}^{-1} \mathbf{A}}_{\mathbf{M}}\, \mathbf{v}_{\text{out}}$$
+```math
+\mathbf{v}_{\text{in}} = \underbrace{\mathbf{A}^{-1} \mathbf{T}^{-1} \mathbf{A}}_{\mathbf{M}}\, \mathbf{v}_{\text{out}}
+```
 
-The matrix $\mathbf{M}$ is computed once before the loop and applied to all voxel coordinates simultaneously. The source coordinates $\mathbf{v}_{\text{in}}$ are generally non-integer; the HU value is obtained by **interpolation** in the source volume.
+The matrix $\mathbf{M}$ is computed once and then applied to the coordinates of every output voxel (chunk by chunk, see below). The source coordinates $\mathbf{v}_{\text{in}}$ are generally non-integer; the HU value is obtained by **interpolation** in the source volume.
 
-Voxels whose source coordinates fall outside the original volume boundaries are assigned −1000 HU (air), which corresponds to the physical situation where the patient body has moved out of the detector field.
+Voxels whose source coordinates fall outside the original volume are assigned −1000 HU (air). This is a fill convention for regions that were never imaged, which may in reality contain anatomy. For example, after a z-shift the vacated slab at one end of the scan range becomes air, although the patient continues beyond it. This matters for dose calculation if beams pass through such regions.
 
 ### Why Inverse Rather Than Forward Mapping?
 
@@ -458,7 +516,7 @@ Forward mapping (pushing each source voxel to its new position) suffers from two
 
 ### Memory-Efficient Chunk Processing
 
-For a typical CT volume of $512 \times 512 \times 320$ voxels, a whole-volume homogeneous coordinate array (shape $4 \times N$, float64) would occupy approximately 2.5 GB of RAM — and the inverse mapping needs two such arrays simultaneously (the output-voxel coordinates and their mapped source coordinates). The implementation therefore processes the volume in **chunks of 20 slices at a time**, generating the coordinate arrays only for the current chunk: each per-chunk array occupies approximately 160 MB, for a transient peak of roughly 320 MB of coordinate data in addition to the volume data itself.
+For a typical CT volume of $512 \times 512 \times 320$ voxels, a whole-volume homogeneous coordinate array (shape $4 \times N$, float64) would occupy approximately 2.5 GiB of RAM. The inverse mapping needs two such arrays at the same time (the output-voxel coordinates and their mapped source coordinates), plus the integer index grids and SciPy's internal copy of the coordinates. The implementation therefore processes the volume in **chunks of 20 slices at a time**, generating the coordinate arrays only for the current chunk. Each per-chunk $4 \times N$ array occupies approximately 160 MiB, and the measured transient working set per chunk, all coordinate-related arrays included, is about 0.55 GiB. The volume data comes on top of that: the float32 input and output plus a float64 working copy, about 1.25 GiB for $512 \times 512 \times 320$.
 
 ### Interpolation
 
@@ -466,42 +524,48 @@ The source-volume lookup at non-integer coordinates requires interpolation. Thre
 
 #### Nearest Neighbour (order 0)
 
-$$\text{HU}(\mathbf{v}) = \text{HU}\bigl(\text{round}(\mathbf{v})\bigr)$$
+```math
+\text{HU}(\mathbf{v}) = \text{HU}\bigl(\text{round}(\mathbf{v})\bigr)
+```
 
-No weighted averaging; the nearest voxel value is taken directly. This guarantees that **only HU values that actually exist in the original volume appear in the output**. The disadvantage is blocky staircase (aliasing) artefacts at structure boundaries. Suitable when exact discrete HU preservation is strictly required (e.g., for lookup-table-based TPS dose calculations).
+No weighted averaging; the nearest voxel value is taken directly. This guarantees that **only HU values that actually exist in the original volume appear in the output** (plus the −1000 HU fill outside it). The disadvantages are blocky staircase artefacts at structure boundaries and a positional error of up to half a voxel along each axis. It suits cases where the exact discrete values must be kept, e.g. synthetic phantoms or label-like images with only a few distinct values. Dose calculation does not require it: a TPS's HU-to-density calibration curve handles interpolated HU values without difficulty.
 
 #### Trilinear Interpolation (order 1, default)
 
-For a point at fractional position $(k + \delta_k,\, j + \delta_j,\, i + \delta_i)$ with $\delta \in [0,1)$, the value is the weighted average of the eight surrounding voxels:
+For a point at fractional position $(k + \delta_k, j + \delta_j, i + \delta_i)$ with $\delta \in [0,1)$, the value is the weighted average of the eight surrounding voxels:
 
-$$\text{HU}(\mathbf{v}) = \sum_{a \in \{0,1\}} \sum_{b \in \{0,1\}} \sum_{c \in \{0,1\}} w_{abc}\,\text{HU}(k{+}a,\, j{+}b,\, i{+}c)$$
+```math
+\text{HU}(\mathbf{v}) = \sum_{a \in \{0,1\}} \sum_{b \in \{0,1\}} \sum_{c \in \{0,1\}} w_{abc}\,\text{HU}(k{+}a,\, j{+}b,\, i{+}c)
+```
 
-with trilinear weights $w_{abc} = |1-\delta_k-a|\cdot|1-\delta_j-b|\cdot|1-\delta_i-c|$. Trilinear interpolation is continuous and cannot overshoot the original value range — each interpolated value is a convex combination of the eight surrounding voxels, so it lies between their minimum and maximum — and the interpolation error at a point is at most about half the HU difference between the adjacent voxels straddling it. For soft tissue with smooth HU gradients, deviations are typically **< 2 HU** — well within clinical relevance thresholds and scanner reproducibility (5–10 HU). Trilinear interpolation is the clinical standard in image registration (e.g. in Eclipse, RayStation); see [Lehmann et al. 1999] and [Thévenaz et al. 2000] for surveys of interpolation methods in medical imaging.
+with trilinear weights $w_{abc} = |1-\delta_k-a|\cdot|1-\delta_j-b|\cdot|1-\delta_i-c|$. Trilinear interpolation is continuous and cannot overshoot the original value range: each interpolated value is a convex combination of the eight surrounding voxels, so it lies between their minimum and maximum. Where HU varies smoothly, the interpolation error is typically **< 2 HU** (well below 1 HU in a synthetic soft-tissue test); larger errors are confined to about one voxel at sharp boundaries. Regional mean HU values, which the TPS density lookup and the dose calculation effectively depend on, are preserved. Individual voxel values do change, however. The weighted averaging acts as a mild low-pass filter that reduces uncorrelated image noise (σ = 12 HU → 6.6 HU in a single pass of the test) and slightly blurs edges. A voxel-by-voxel comparison of noisy CT therefore shows differences comparable to the noise level, not < 2 HU. Trilinear interpolation is a common default in image registration software; see [Lehmann et al. 1999] and [Thévenaz et al. 2000] for surveys of interpolation methods in medical imaging.
 
 #### Tricubic B-Spline Interpolation (order 3)
 
-A continuous piecewise cubic approximation, computed via a separable recursive spline filter applied once to the entire volume before sampling. Produces the smoothest output and lowest systematic HU error (typically **< 0.5 HU** for smooth tissue regions), but introduces slight overshoot — Gibbs-like ringing — near sharp boundaries (e.g. bone–air interfaces), which can generate HU values marginally outside the original range. Recommended when maximum interpolation quality is required and the slight computational overhead is acceptable.
+A $C^2$-continuous piecewise-cubic **interpolant** that passes exactly through the original voxel values. Its B-spline coefficients are computed by a separable recursive prefilter applied once to the entire volume before sampling. It blurs less than trilinear interpolation, preserving fine detail and noise texture better (σ = 12 HU → 9.8 HU in the same test), and it has the smallest error in smooth regions away from high-contrast edges. It is, however, not bounded by the neighbouring values: near sharp boundaries it overshoots (Gibbs-like ringing) and produces HU values outside the original range. The overshoot is about 11 % of the step height for an ideal step edge. For the PSF-blurred edges of real CT it is a few percent; a synthetic test with realistic edge blur went about 10–20 HU beyond the input range. Recommended when interpolation quality matters more than strict range preservation and the extra computation and memory (a float64 coefficient volume) are acceptable.
 
 ### HU Value Preservation: Verification
 
-The implementation verifies HU preservation by comparing the minimum and maximum HU values of the original and transformed volumes:
+`modifier.py` prints the minimum and maximum HU values of the original and transformed volumes as a quick sanity check (it does not fail on a mismatch):
 
 ```
 HU range original:     [-1024, 3071] HU
 HU range transformed:  [-1024, 3071] HU
 ```
 
-For trilinear (order 1) interpolation the output is guaranteed **not to exceed** the original range (no overshoot); the extreme values may shrink slightly, and regions the body moved out of are filled with −1000 HU. For cubic (order 3) interpolation marginal overshoot at high-contrast boundaries is theoretically possible but bounded and clinically irrelevant. Nearest-neighbour (order 0) interpolation is lossless by definition.
+For trilinear (order 1) interpolation the output is guaranteed **not to exceed** the original range (no overshoot); the extreme values may shrink slightly, and regions without source data are filled with −1000 HU. For cubic (order 3) interpolation the range can widen by the overshoot described above, typically by 10–20 HU at the PSF-blurred edges of real CT. Nearest-neighbour (order 0) interpolation introduces no new values.
 
 Note that a voxel-wise difference map between original and transformed volumes is **not a meaningful quality metric** in this context: after a rigid body motion the same tissue appears at different voxel positions in the two volumes, so direct subtraction compares different anatomical structures. A correct interpolation quality assessment requires a round-trip test (apply T then T⁻¹) or comparison within a co-registered reference frame.
 
 ### Output DICOM Structure
 
-The resampled volume is written back to DICOM using the metadata of the original slices. The output geometry (IPP, IOP, pixel spacing, slice spacing) is **identical** to the input, meaning the output slices occupy the same spatial positions as the original. The transformed patient body appears shifted/rotated *within* the fixed voxel grid. Regions that the body moved into contain the resampled HU values; regions it moved out of contain −1000 HU (air).
+The resampled volume is written back to DICOM using the metadata of the original slices. The output geometry (IPP, IOP, pixel spacing, slice spacing) is **identical** to the input, meaning the output slices occupy the same spatial positions as the original. The transformed patient body appears shifted/rotated *within* the fixed voxel grid. Every output voxel shows whatever lay at its source position: regions the body moved out of therefore show the surrounding air, or the −1000 HU fill where the source position is outside the original volume.
 
 The HU-to-stored conversion is the exact inverse of the loading step:
 
-$$\text{stored} = \text{round}\!\left(\frac{\text{HU} - \text{RescaleIntercept}}{\text{RescaleSlope}}\right)$$
+```math
+\text{stored} = \text{round}\!\left(\frac{\text{HU} - \text{RescaleIntercept}}{\text{RescaleSlope}}\right)
+```
 
 Values are clipped to the valid int16 range $[-32768, 32767]$ and stored as signed 16-bit integers (`PixelRepresentation = 1`), which is common for CT. (Some scanners instead store unsigned pixels with `PixelRepresentation = 0` and a matching intercept; the output here is written as signed int16 regardless.) The original `RescaleSlope` and `RescaleIntercept` are preserved unchanged so the output is correctly calibrated in any TPS.
 
@@ -515,21 +579,25 @@ For the metadata-only approach, **no pixel data is modified**. Instead, the spat
 
 **ImagePositionPatient (IPP):** The position of the first pixel of each slice is mapped through the forward transformation:
 
-$$\text{IPP}'_k = \mathbf{T}\,\begin{pmatrix}\text{IPP}_k \\ 1\end{pmatrix}$$
+```math
+\text{IPP}'_k = \mathbf{T}\,\begin{pmatrix}\text{IPP}_k \\ 1\end{pmatrix}
+```
 
 **ImageOrientationPatient (IOP):** The six direction cosines (row direction and column direction) are rotated by $\mathbf{R}$:
 
-$$\mathbf{F}'_{\text{row}} = \mathbf{R}\,\mathbf{F}_{\text{row}}, \qquad \mathbf{F}'_{\text{col}} = \mathbf{R}\,\mathbf{F}_{\text{col}}$$
+```math
+\mathbf{F}'_{\text{row}} = \mathbf{R}\,\mathbf{F}_{\text{row}}, \qquad \mathbf{F}'_{\text{col}} = \mathbf{R}\,\mathbf{F}_{\text{col}}
+```
 
 Since $\mathbf{R} \in SO(3)$ preserves norms, the transformed direction cosines remain unit vectors and their cross product continues to define the correct slice normal.
 
 ### Advantages and Limitations
 
-The metadata-only method guarantees **exact HU preservation** because no interpolation is performed. It is also significantly faster since no resampling loop is needed. However, after an arbitrary rotation the IOP vectors are no longer aligned with the standard axial orientation `[1,0,0,0,1,0]`. Some treatment planning systems (particularly older versions) require strictly axial CT imports and will reject datasets with oblique IOP — such a check rejects *any* non-axial orientation regardless of the rotation magnitude, so a small angle is no guarantee of acceptance. Modern systems such as RayStation and Eclipse generally handle oblique orientations correctly; when in doubt, use `--method resample` for guaranteed-axial output.
+The metadata-only method guarantees **exact HU preservation** because no interpolation is performed. It is also significantly faster since no resampling loop is needed. However, after an arbitrary rotation the IOP vectors are no longer aligned with the standard axial orientation `[1,0,0,0,1,0]`. Many treatment planning systems require the planning CT to be axial. They reject oblique datasets, or accept them only as secondary images for registration. Such a check rejects *any* non-axial orientation regardless of the rotation magnitude, so a small angle is no guarantee of acceptance. Support differs between systems and versions, so verify it for your TPS; when in doubt, use `--method resample` for guaranteed-axial output.
 
 ## No-Distortion Guarantee
 
-A geometric distortion would occur if different regions of the anatomy were scaled, sheared, or mapped non-linearly. The transformation used here is strictly rigid: $\mathbf{R}$ is orthonormal ($\det \mathbf{R} = 1$, $\|\mathbf{R}\,\mathbf{v}\| = \|\mathbf{v}\|$ for all $\mathbf{v}$), so all distances and angles between any two anatomical points are preserved exactly **in patient space** — the space in which the no-distortion guarantee is defined. The voxel-index mapping $\mathbf{M} = \mathbf{A}^{-1}\mathbf{T}^{-1}\mathbf{A}$, by contrast, has an orthonormal linear part only for isotropic voxels: with anisotropic spacing (e.g. 1 × 1 mm in-plane, 2 mm slices) a physical rotation legitimately appears as a combination of rotation, scaling, and shear in index space, because the same millimetre displacement spans a different number of voxels along each axis. This is precisely why interpolation is needed during resampling; it is a property of the grid representation, not an anatomical distortion.
+A geometric distortion would occur if different regions of the anatomy were scaled, sheared, or mapped non-linearly. The transformation used here is strictly rigid: $\mathbf{R}$ is orthonormal ($\det \mathbf{R} = 1$, $\lVert\mathbf{R}\mathbf{v}\rVert = \lVert\mathbf{v}\rVert$ for all $\mathbf{v}$), so all distances and angles between any two anatomical points are preserved exactly **in patient space** — the space in which the no-distortion guarantee is defined. The voxel-index mapping $\mathbf{M} = \mathbf{A}^{-1}\mathbf{T}^{-1}\mathbf{A}$, by contrast, has an orthonormal linear part only for isotropic voxels: with anisotropic spacing (e.g. 1 × 1 mm in-plane, 2 mm slices) a physical rotation legitimately appears as a combination of rotation, scaling, and shear in index space, because the same millimetre displacement spans a different number of voxels along each axis. This is a property of the grid representation, not an anatomical distortion. Interpolation is needed in any case, because the mapped source positions are generally non-integer; it affects the image *sharpness* (see *Interpolation*), not the geometry.
 
 ## 3D Visualisation
 
@@ -539,7 +607,7 @@ The 3D body surface is extracted from the CT volume using the **Marching Cubes a
 
 Two surfaces are extracted:
 - **Body surface**: threshold −300 HU, separating soft tissue from air
-- **Bone surface**: threshold +400 HU, isolating bone and other dense tissue (cortical bone alone is typically ≥ ~700 HU; the +400 HU level also captures trabecular bone and contrast-enhanced structures)
+- **Bone surface**: threshold +400 HU, isolating cortical bone and other dense material. Cortical bone is typically ≳ +700 HU. Most cancellous (trabecular) bone, at roughly +100 to +400 HU, lies below this level, while strongly contrast-enhanced vessels and metal lie above it.
 
 A **downsampling factor of 2** is applied before running Marching Cubes on the body surface (every second voxel in each direction) to reduce computation time and triangle count; the bone surface uses a factor of 3. This lowers the spatial resolution of the surface mesh but has no effect on the underlying DICOM data.
 
@@ -547,23 +615,25 @@ A **downsampling factor of 2** is applied before running Marching Cubes on the b
 
 The Marching Cubes algorithm returns vertices in voxel index space $(k, j, i)$. These are converted to patient coordinates in millimetres by the affine matrix $\mathbf{A}$:
 
-$$\mathbf{p}_{\text{patient}} = \mathbf{A}\, \begin{pmatrix} k \\ j \\ i \\ 1 \end{pmatrix}$$
+```math
+\mathbf{p}_{\text{patient}} = \mathbf{A}\, \begin{pmatrix} k \\ j \\ i \\ 1 \end{pmatrix}
+```
 
 For the metadata-only method, where pixel data is unchanged, the transformed surface is obtained by applying the forward transformation $\mathbf{T}$ to the original vertices directly — no second surface extraction from a resampled volume is needed.
 
 ### Interactive Visualisation
 
-The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-style lighting. All layers (original body, transformed body, original bone, rotation axes) are independently toggleable via the legend. The scene uses `aspectmode='data'` to ensure that spatial distances are displayed without distortion, i.e., 1 mm in X, Y, and Z corresponds to the same pixel length on screen.
+The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-style lighting. The layers (original body, transformed body, original bone, rotation centre) are independently toggleable via the legend; the coordinate axes at the rotation centre are always shown. The scene uses `aspectmode='data'` to ensure that spatial distances are displayed without distortion, i.e., 1 mm in X, Y, and Z corresponds to the same pixel length on screen.
 
 ## Summary of Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Mapping direction | Inverse (pull-back) | Avoids holes and compositing problems inherent to forward mapping |
-| Default interpolation | Trilinear (order 1) | Clinically standard; no overshoot; < 2 HU error in soft tissue |
+| Default interpolation | Trilinear (order 1) | Common default; no overshoot; regional mean HU preserved, small error in smooth tissue |
 | Rotation convention | Intrinsic XYZ (≡ extrinsic ZYX) | SciPy's uppercase `"XYZ"`; coincides with the extrinsic convention for any single-axis rotation, so an $r_z$-only correction is always a pure axial-plane rotation |
-| Rotation centre | Volume centroid | Body stays within the output FOV for typical small-angle corrections |
-| Output geometry | Same grid as input | Standard axial IOP preserved; compatible with all TPS without reconfiguration |
+| Rotation centre | Geometric centre of the CT grid | Body stays within the output FOV for typical small-angle corrections |
+| Output geometry | Same grid as input | Standard axial IOP preserved (for axial input); broadly TPS-compatible |
 | HU back-conversion | Per-slice slope/intercept | Preserves original calibration; no re-calibration artefacts |
 | UIDs | New Series + SOP UIDs | TPS/PACS recognises output as independent series; no confusion with original |
 
@@ -573,18 +643,18 @@ The extracted meshes are rendered using **Plotly's Mesh3d** trace with Gouraud-s
 
 ## Overview
 
-The **Case Modifier** (`case_modifier.py`) extends the CT Rigid Body Transformer to operate on a **complete case** — both the CT series and its companion RTSTRUCT — in a single invocation. Where `modifier.py` only moves the pixel data, `case_modifier.py` additionally transforms every contour point in the structure set so that ROIs continue to enclose the same anatomy after rigid motion. UID references between RS and CT are rewritten so the transformed pair links correctly in any TPS.
+The **Case Modifier** (`case_modifier.py`) extends the CT Rigid Body Transformer to operate on a **complete case** — both the CT series and its companion RTSTRUCT — in a single invocation. Where `modifier.py` only moves the pixel data, `case_modifier.py` additionally transforms every contour point in the structure set so that ROIs continue to enclose the same anatomy after rigid motion. UID references between RS and CT are rewritten so the transformed pair links to each other.
 
 The module is built on top of `modifier.py` and `analyzer.py`; it adds no new geometric mathematics, only orchestration, RTSTRUCT-specific bookkeeping, and metadata management.
 
 ## Why the RTSTRUCT Must Move with the CT
 
-A DICOM RTSTRUCT stores ROI contours as flat lists of (x, y, z) coordinates in the **patient frame** (LPS, mm). When the CT is rigidly transformed, the patient anatomy at original coordinate $\mathbf{p}$ now appears at $\mathbf{p}' = \mathbf{T}\,\mathbf{p}$. A contour that was drawn on a structure at $\mathbf{p}$ remains stored at $\mathbf{p}$ in the RTSTRUCT — so without a corresponding RS update, the contour no longer encloses the moved anatomy. After applying the same $\mathbf{T}$ to every `ContourData` triple, the contours follow the anatomy exactly.
+A DICOM RTSTRUCT stores ROI contours as flat lists of (x, y, z) coordinates in the **patient frame** (LPS, mm). When the CT is rigidly transformed, the patient anatomy at original coordinate $\mathbf{p}$ now appears at $\mathbf{p}' = \mathbf{T}\mathbf{p}$. A contour that was drawn on a structure at $\mathbf{p}$ remains stored at $\mathbf{p}$ in the RTSTRUCT — so without a corresponding RS update, the contour no longer encloses the moved anatomy. After applying the same $\mathbf{T}$ to every `ContourData` triple, the contours follow the anatomy exactly.
 
-Because $\mathbf{T}$ is a rigid transformation, $\|\mathbf{R}\,\mathbf{p}_1 - \mathbf{R}\,\mathbf{p}_2\| = \|\mathbf{p}_1 - \mathbf{p}_2\|$ for all pairs of points, and consequently:
+Because $\mathbf{T}$ is a rigid transformation, $\lVert\mathbf{R}\mathbf{p}_1 - \mathbf{R}\mathbf{p}_2\rVert = \lVert\mathbf{p}_1 - \mathbf{p}_2\rVert$ for all pairs of points, and consequently:
 
 - Contour shapes are not distorted (no shearing, no anisotropic scaling).
-- The **true 3D volume** is preserved exactly, since a rigid transform has $|\det \mathbf{R}| = 1$. Note, however, that the volume *re-measured* afterwards by the planimetric Shoelace + mean-slice-spacing formula is invariant only for translations and pure Z-rotations; for X/Y rotations the re-measured value drifts by an O(1 %) artefact of the per-axial-slice convention (see [The `resample` vs `metadata` Trade-Off](#the-resample-vs-metadata-trade-off)).
+- The **true 3D volume** is preserved exactly, since a rigid transform has $|\det \mathbf{R}| = 1$. Note, however, that the volume *re-measured* afterwards by the planimetric Shoelace + mean-slice-spacing formula is invariant only for translations and pure Z-rotations. For X/Y rotations that tilt the contour planes by an angle $\theta$, it shrinks by roughly $\cos^2\theta$ (−0.8 % at 5°, −3 % at 10°, −7 % at 15°). The Shoelace formula measures the area projected onto the axial plane ($A\cos\theta$), and the z-spacing of the tilted contours shrinks by the same factor. This is an artefact of the per-axial-slice convention (see [The `resample` vs `metadata` Trade-Off](#the-resample-vs-metadata-trade-off)), not a change of the true volume.
 - Centroids transform linearly: $\mathbf{T}(\overline{\mathbf{p}}) = \overline{\mathbf{T}(\mathbf{p}_i)}$, which is exploited by `--verify` as a per-ROI sanity check.
 
 The implementation reads `ContourData`, reshapes the flat list into an $N \times 3$ matrix, applies $\mathbf{T}$ to every row in homogeneous coordinates, formats the result back into the flat string list with six-decimal precision, and writes it back. `NumberOfContourPoints` is unchanged.
@@ -599,7 +669,7 @@ A DICOM RTSTRUCT references its companion CT through three layers of UIDs:
 
 When `save_ct_series` writes the transformed CT, every output slice receives a fresh `SOPInstanceUID` and the series receives a fresh `SeriesInstanceUID`. Without rewriting, the original RS would now reference SOPs and a series UID that no longer exist — the planning system would report "missing image references" or refuse to link the structure set at all.
 
-`save_ct_series` returns a mapping `{old_sop: new_sop, ...}` for all transformed slices. `transform_rtstruct` walks the RS and substitutes:
+`save_ct_series` returns, among other things, a mapping `sop_map = {old_sop: new_sop, ...}` for all transformed slices. `transform_rtstruct` walks the RS and substitutes:
 
 - Per-contour `ContourImageSequence[*].ReferencedSOPInstanceUID` via the SOP map (raises `KeyError` if a referenced SOP is not in the map — this is a hard error, since it means the RS is referencing slices outside the input CT folder).
 - Top-level `RTReferencedSeriesSequence[*].SeriesInstanceUID` to the new CT series UID.
@@ -614,11 +684,15 @@ The `FrameOfReferenceUID` (DICOM tag `(0020,0052)`) declares "all series with th
 - **Default (keep):** the original FoR is preserved on both the transformed CT and the transformed RS. They link correctly to each other because both carry the same FoR. **Caveat:** any existing RTPLAN, RTDOSE, or sibling RTSTRUCT that also references this FoR will be auto-overlaid by Aria/Eclipse onto the transformed CT, even though they were planned in the un-transformed coordinate system. The case modifier prints a clear runtime warning whenever this default is used.
 - **`--new-frame-of-reference`:** a fresh FoR UID is minted and applied to both the transformed CT and the transformed RS. They still link to each other, but they are now in a coordinate system distinct from the original CT's. Existing plans/doses keep their old FoR and are not auto-overlaid. Any cross-frame comparison must go through an explicit registration object — this is the safer choice for clinical workflows where the transformed dataset is meant to represent a different geometric situation rather than an alternate view of the same one. It is **not** the tool's default, however: the default is **keep**, for backward compatibility with existing plan/dose linkage.
 
+Note that *new* is also the choice consistent with DICOM semantics. Series that share a `FrameOfReferenceUID` are declared spatially related in one patient coordinate system. Because the transformed anatomy no longer coincides with the original, keeping the FoR asserts an identity registration that does not hold. *keep* is a pragmatic compatibility default, not the DICOM-conformant one.
+
 ## Variable Rotation Centre
 
 Rotation is performed about a configurable centre $\mathbf{c}$, with the offset folded into the same $4 \times 4$ matrix used for the CT:
 
-$$\mathbf{p}' = \mathbf{R}\,(\mathbf{p} - \mathbf{c}) + \mathbf{c} + \mathbf{t}$$
+```math
+\mathbf{p}' = \mathbf{R}\,(\mathbf{p} - \mathbf{c}) + \mathbf{c} + \mathbf{t}
+```
 
 Three centre-selection modes are provided:
 
@@ -643,17 +717,17 @@ To make the transformed series identifiable in the planning system without openi
 | `SeriesDescription` (CT + RS) | LO | 64 | `<orig>_RB` (or custom suffix) |
 | `StructureSetLabel` | SH | 16 | `<orig>_RB` truncated; suffix preserved if `<orig>` is too long |
 | `StructureSetName` | LO | 64 | `<orig>_RB` |
-| `StructureSetDescription` | LO | 64 | `rigid t=(tx,ty,tz) r=(rx,ry,rz) c=<centre> m=<method> FoR=<keep\|new>` |
+| `StructureSetDescription` | ST | 1024 (tool truncates to 64) | `rigid t=(tx,ty,tz) r=(rx,ry,rz) c=<centre> m=<method> FoR=<keep\|new>` |
 | `SeriesNumber` | IS | — | original + 1000 |
 
-All length limits follow DICOM VR specifications. The label suffix is configurable via `--label`. The full transform description always lands in `StructureSetDescription` regardless of the suffix.
+The label suffix is configurable via `--label`. The transform description always lands in `StructureSetDescription` regardless of the suffix. It names the rotation centre (`Marker 'HS1'`, `Volumenmitte`, `manuell`, `interaktiv`) but does not give its coordinates; the position is recorded by the `Drehpunkt` marker at $\mathbf{c} + \mathbf{t}$.
 
 ## Pre-Flight Validation
 
 Before any data is written, the case modifier validates the input:
 
 1. **Folder layout.** The case directory must exist and contain a `CT/` subfolder. Exactly one `RS*.dcm` file must be present at the case root (or `--rs PATH` must be given). Sibling `RP*.dcm`/`RD*.dcm` files trigger a hint warning.
-2. **CT geometry.** All slices must share the same `ImageOrientationPatient` (within 1e-3) and `PixelSpacing` (within 1e-4 mm). Slice spacing must be uniform within 1 % relative deviation. At least 2 slices are required.
+2. **CT geometry.** All slices must share the same `ImageOrientationPatient` (within 1e-3) and `PixelSpacing` (within 1e-4 mm). Slice spacing must be uniform within 1 % relative deviation. At least 2 slices are required. The orientation is only checked for consistency across slices, not for being axial (see *Limitations and Out-of-Scope*).
 3. **FoR consistency.** The CT slices must all carry the same `FrameOfReferenceUID`, and the RTSTRUCT must reference this FoR through its `ReferencedFrameOfReferenceSequence`. A mismatch raises a clear error — almost always indicating that the user picked an RS file that does not belong to this CT.
 
 Any failure terminates the run with exit code 2 before any output is written.
@@ -665,15 +739,15 @@ Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication t
 **`--method metadata`:** the CT's `ImagePositionPatient`/`ImageOrientationPatient` are rotated by $\mathbf{R}$, so the slice planes themselves become tilted in patient space. The contour points (which were originally on axial slices at constant $z$) are also rotated; their new positions lie exactly on the new tilted slice planes. **The relative geometry between CT slices and RS contours is preserved exactly.** No clipping, no discretisation artefacts.
 - ✓ True rigid-body fidelity. Pure 3D mathematics, no resampling.
 - ✓ HU values byte-identical to the source.
-- ✗ Output IOP is no longer `[1,0,0,0,1,0]`. Older TPS versions and some PACS browsers reject oblique RTSTRUCT/CT. Modern Eclipse and RayStation handle it correctly.
+- ✗ Output IOP is no longer `[1,0,0,0,1,0]`. Many TPS require an axial planning CT, and some PACS viewers mishandle oblique CT/RTSTRUCT; check your system.
 
 **`--method resample` (default):** the CT's voxel grid stays axial, and pixels are inverse-mapped from the source. The contour points are still rotated by $\mathbf{T}$ in 3D, which means **after a non-axial rotation, the contours are tilted polygons that no longer lie on the axial slice planes** of the new CT. DICOM RTSTRUCT is conventionally per-axial-slice, so this is technically off-spec. Two consequences:
-- *Clipping at the field-of-view boundaries.* Anatomy that rotates outside the (fixed) voxel grid is lost — output voxels there contain −1000 HU. Contour points in those regions still exist but reference air. The case modifier detects this automatically and prints a per-ROI warning at the end of the run.
-- *Volume measurements via the planar Shoelace + mean-Z-spacing formula are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure volume differences of up to a few percent for moderate non-Z rotations. This is a measurement artefact of the formula, not a transformation error.
-- *Z-only rotations are immune* to both effects, because $r_z$ leaves contour Z values unchanged and the contour stays planar in the original axial slice.
+- *Clipping at the grid boundaries.* The output grid is fixed, so anatomy moved beyond it is lost. Grid regions whose source lies outside the original scan are filled with −1000 HU. A contour point that stays inside the grid always has the correct anatomy beneath it, because it samples exactly its original source position. A contour point moved *outside* the grid has no image data at all. The case modifier detects such points automatically and prints a per-ROI warning at the end of the run.
+- *Volume measurements via the planar Shoelace + mean-Z-spacing formula are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure a volume reduced by roughly $\cos^2\theta$ (−3 % at 10°, −7 % at 15°). This is a measurement artefact of the formula, not a transformation error.
+- *Z-only rotations are immune* to the tilt and volume effects, because $r_z$ leaves contour Z values unchanged and each contour stays in its original axial slice. They can still move anatomy out of the in-plane grid when the rotation centre is far from the image centre or a translation is added.
 
 **Practical guidance:**
-- Pure translations: both methods are equivalent in correctness; resample produces standard axial output.
+- Pure translations: contours and anatomy stay exactly aligned with both methods. Resample keeps standard axial output, but on its fixed grid it discards whatever is shifted out and fills the vacated margin with air (for a z-shift, one end of the scan range).
 - Z-rotation only: both methods are exactly equivalent in geometric fidelity; resample is preferable for TPS compatibility.
 - X/Y rotation: prefer **metadata** for analytic correctness if your TPS accepts oblique CT/RS; otherwise accept the resample artefacts and verify on critical structures.
 
@@ -682,10 +756,10 @@ Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication t
 Three orthogonal modes are provided to verify correctness:
 
 - **`--dry-run`** — runs all input validation, computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. No files are written.
-- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI centroids, and compares with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Centroids transform linearly under rigid motion, so a deviation greater than ~1e-4 mm indicates a bug in the transform pipeline. The maximum norm and the worst ROI are reported.
-- **`--self-test`** — runs three independent checks on a temporary copy and reports PASS/FAIL each:
+- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI vertex centroids (the mean of all contour points), and compares them with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Vertex centroids transform linearly under rigid (indeed any affine) motion, so a deviation well above the ~1e-6 mm rounding floor (e.g. > 1e-4 mm) indicates a bug in the transform pipeline. The maximum norm and the worst ROI are reported; the check is informational and does not change the exit code.
+- **`--self-test`** — runs three independent checks, each writing to a temporary directory with `--method metadata` (so the CT resampling path is not exercised), and reports PASS/FAIL each:
   1. *Identity round-trip*: zero translation, zero rotation; every contour point matches the original within 1e-4 mm. Catches accidental side effects in the pipeline.
-  2. *Z-rotation pairwise distance drift* (15°): point-to-point distances within each ROI are preserved within 1e-3 mm. Validates the trivially-volume-preserving direction.
+  2. *Z-rotation pairwise distance drift* (15°): point-to-point distances within each ROI (up to 200 randomly sampled points per ROI) are preserved within 1e-3 mm. Validates the trivially-volume-preserving direction.
   3. *X-rotation pairwise distance drift* (5°): same test on a non-axial rotation. This is the **definitive rigid-body check** — distances are coordinate-system-invariant and are preserved even when the planar Shoelace formula no longer yields invariant volumes.
 
   Pairwise distances are the right invariant to check: they are preserved by every rigid transform regardless of orientation, whereas the analyzer's planar-axial volume formula is not (see *resample vs metadata trade-off* above).
@@ -694,24 +768,24 @@ The case modifier additionally runs an automatic **clipping check** after every 
 
 ## Numerical Verification
 
-Run on a representative clinical case (a few hundred CT slices, several dozen ROIs including POINT markers) — and reproducible on any case via `--self-test` — the implementation achieves the following typical precision:
+Run on a representative clinical case (a few hundred CT slices, several dozen ROIs including POINT markers), the implementation achieves the following typical precision. The first three rows are reproducible on any case via `--self-test`, the centroid row via `--verify`:
 
 | Test | Result | Tolerance |
 |---|---|---|
 | Identity round-trip — max contour-point deviation | 5 × 10⁻⁷ mm | < 1 × 10⁻⁴ mm |
-| Z-rotation 15° — max pairwise distance drift | < 1 × 10⁻⁶ mm | < 1 × 10⁻³ mm |
+| Z-rotation 15° — max pairwise distance drift | 1.3 × 10⁻⁶ mm | < 1 × 10⁻³ mm |
 | X-rotation 5° — max pairwise distance drift | 1.3 × 10⁻⁶ mm | < 1 × 10⁻³ mm |
-| Centroid linearity under non-trivial $\mathbf{T}$ | < 7 × 10⁻⁷ mm (worst ROI) | < 1 × 10⁻³ mm |
+| Centroid linearity under non-trivial $\mathbf{T}$ | < 1 × 10⁻⁶ mm (worst ROI) | < 1 × 10⁻⁴ mm (guideline) |
 | Marker fixpoint (rotation about itself) | 0 mm | < 1 × 10⁻⁶ mm |
 | Drehpunkt position | exact | — |
 | FoR consistency CT ↔ RS (both modes) | preserved | — |
 
-The numerical floor (~1e-7…1e-6 mm) is set by the float-to-six-decimal-string round trip in `ContourData`, not by the transform mathematics. Note that **volume preservation as measured by the planar-axial Shoelace formula is *not* a tolerance to claim** — it holds exactly only for Z-rotations and translations; for X/Y rotations the formula's measurement error is an O(1%) artefact of the per-slice convention, not a transformation error.
+The numerical floor (~1e-7…1e-6 mm) is set by the float-to-six-decimal-string round trip in `ContourData`, not by the transform mathematics. Note that **volume preservation as measured by the planar-axial Shoelace formula is *not* a tolerance to claim** — it holds exactly only for Z-rotations and translations. For X/Y rotations the formula under-reads by roughly $\cos^2\theta$ (see above), an artefact of the per-slice convention, not a transformation error.
 
 ## Limitations and Out-of-Scope
 
 - **RTPLAN and RTDOSE are not transformed.** Sibling `RP*.dcm` and `RD*.dcm` files are detected and reported but their geometry is left untouched. Transforming a plan would require also transforming beam isocentres, gantry angles, and couch positions, which is out of scope for this tool.
-- **Non-axial CT input is rejected** at the geometry-validation stage. Tilted or step-and-shoot acquisitions need to be re-sampled to standard axial first.
+- **Head-first axial CT input is assumed but not enforced.** `validate_ct_geometry` rejects non-uniform orientation, pixel spacing and slice spacing, but it does not check that the orientation is axial or that the slice positions advance along the slice normal. Two kinds of series therefore pass validation although their voxel geometry is modelled incorrectly: gantry-tilted series, whose slice positions do not advance along the normal, and feet-first series, whose normal points inferiorly (see *Voxel-to-Patient Affine Matrix*). Resample them to a standard head-first axial grid first.
 - **Single RTSTRUCT per case.** When multiple `RS*.dcm` files are present, the user must select one with `--rs`.
 - **No dose recomputation.** The transformed CT can be re-imported into a TPS for fresh dose calculation, but no dose is recomputed in this tool.
 - **No re-projection of tilted contours onto axial slices in resample mode.** A semantically clean solution for X/Y rotations under resample would extract a 3D mesh from the original axial contours, rotate the mesh, and slice it with the new axial planes. This is not implemented; metadata mode is the recommended path when contour-on-axial-slice fidelity matters.
@@ -722,15 +796,15 @@ The numerical floor (~1e-7…1e-6 mm) is set by the float-to-six-decimal-string 
 
 ## Overview
 
-The **RTSTRUCT Visualizer** (`visualizer.py`) generates a set of purpose-built static plots from the analysis results produced by the RTSTRUCT Analyzer. Each plot is designed to answer a specific clinical question and avoids chart types that are misleading at the typical structure counts encountered in radiotherapy planning (usually 5–30 structures per patient). The visualizer calls `run_analysis` internally, so only the RTSTRUCT file path is required — no intermediate JSON file is needed.
+The **RTSTRUCT Visualizer** (`visualizer.py`) generates a set of purpose-built static plots from the analysis results produced by the RTSTRUCT Analyzer. Each plot is designed to answer a specific clinical question and avoids chart types that are misleading at the typical structure counts encountered in radiotherapy planning (typically 5–40 structures per case). The visualizer calls `run_analysis` internally, so only the RTSTRUCT file path is required — no intermediate JSON file is needed.
 
 ## Output Files and Clinical Motivation
 
 ### 1. `volumes.png` – Structure Volume Bar Chart
 
-**Chart type:** Horizontal bar chart, sorted descending by volume.
+**Chart type:** Horizontal bar chart on a logarithmic volume axis, grouped by category. Targets come first (GTV/PTV of the same lesion adjacent), then serial OARs, parallel OARs and, hatched, helper structures; each OAR/helper group is sorted by descending volume. The external contour and POINT markers are not shown.
 
-A sorted bar chart is used because each bar represents one named anatomical structure (a histogram would only be meaningful for many samples drawn from an unknown distribution, which is not the case here). It makes immediately apparent which structures are largest, how Targets and OARs compare in size, and whether any structure has an unexpectedly small or large volume (which can indicate a contouring error). Targets are shown in blue, OARs in red. Volume values are annotated on each bar.
+A bar chart is used because each bar represents one named anatomical structure (a histogram would only be meaningful for many samples drawn from an unknown distribution, which is not the case here). The log axis keeps small SRS targets (≈ 0.03 cm³) visible next to the whole brain (> 1000 cm³). The chart makes immediately apparent which structures are largest, how Targets and OARs compare in size, and whether any structure has an unexpectedly small or large volume (which can indicate a contouring error). Colours follow the shared category palette: Targets blue, serial OARs red, parallel OARs orange, helpers grey. Volume values are annotated on each bar.
 
 **Clinical relevance:** Volume is a primary descriptor for both Target coverage and OAR sparing (e.g., mean dose to a parallel organ correlates with the irradiated volume). Unexpected outliers in volume are a common QA flag for contouring errors.
 
@@ -740,14 +814,14 @@ A sorted bar chart is used because each bar represents one named anatomical stru
 
 A heatmap is used because it stays readable at the typical ~40 structures per case (grouped bar charts become an unreadable tangle of rotated x-axis labels at that count) and lets outliers (e.g. a highly elongated spinal cord) be spotted at a glance. Sphericity and solidity use a 0→1 diverging colormap (green = round / convex), elongation a sequential map (darker = more stretched). **Only single-component anatomical structures** (Targets + OARs with `shape_valid = true`) are shown; multi-component helper/union/shell structures are excluded because their convex-hull metrics are meaningless (they remain listed in `statistics.txt`).
 
-**Sphericity** quantifies how closely the structure resembles a sphere (round PTVs near 1; complex shapes lower → may need more beam arrangements). **Solidity** (volume / convex-hull volume) detects concavity: below ~0.85 suggests the structure wraps around other anatomy (e.g. a C-shaped PTV around the brainstem). **Elongation** (sqrt of largest-to-smallest PCA eigenvalue ratio) measures directional stretching; high elongation with low sphericity in the spinal cord confirms its cylindrical nature, while unexpectedly high elongation in a GTV may indicate a drawing artefact.
+**Sphericity** quantifies how closely the structure resembles a sphere: round PTVs score highest, about 0.8–0.9 rather than 1 because of the discretisation bias (see *Sphericity*); complex shapes score lower and may need more beam arrangements. **Solidity** (volume / convex-hull volume) detects concavity. As a rough heuristic, a value below ~0.85 suggests the structure wraps around other anatomy, e.g. a C-shaped PTV around the brainstem (small structures read high, see *Solidity*). **Elongation** (sqrt of largest-to-smallest PCA eigenvalue ratio) measures directional stretching; high elongation with low sphericity in the spinal cord confirms its cylindrical nature, while unexpectedly high elongation in a GTV may indicate a drawing artefact.
 
 ### 3. `distances.png` – Critical Target↔OAR Distance Lollipop
 
 **Chart type:** Horizontal lollipop plot — one row per Target↔**serial-OAR** pair, sorted ascending by minimum distance (most critical on top). The filled dot is the minimum distance, the open marker is HD95, and a connecting line spans the two. Dashed lines mark the 3 mm and 5 mm thresholds (pragmatic planning-margin conventions used here as visual guides, not a formal dosimetric standard); rows below 5 mm are highlighted red.
 
 **Design decisions:**
-- **Only Target↔serial-OAR pairs** (brainstem, cord, optic nerves, chiasm, pituitary) are shown — these are the proximity-critical, dose-limiting organs. Category-aware filtering keeps out clinically meaningless *containment* pairs (a PTV inside its own union, or inside the whole brain — ~0 mm by construction). Broader proximity is covered by `proximity_matrix.png`.
+- **Only Target↔serial-OAR pairs** (brainstem, cord, optic nerves, chiasm, pituitary) are shown — these are the proximity-critical, dose-limiting organs. Category-aware filtering keeps out clinically meaningless *containment* pairs. For a PTV and the union structure that contains it, the distance is ~0 mm by construction because they share boundary points. For a PTV inside the whole brain, the surface-to-surface distance says nothing about clearance. If no serial OAR is found, all Target↔OAR pairs are shown instead. Broader proximity is covered by `proximity_matrix.png`.
 - **HD95 instead of raw Hausdorff** as the companion metric: the raw maximum Hausdorff is dominated by single outliers, so the 95th-percentile variant is shown for robustness.
 - Min/HD95/Hausdorff/ASSD/centroid distances for all pairs remain available in `statistics.txt`.
 
@@ -761,18 +835,18 @@ Structure centroids are plotted in the DICOM patient coordinate system (X=left, 
 
 **Clinical relevance:** This plot answers the question "where is everything relative to everything else?" at a glance. It is particularly useful for multi-metastasis cases (several GTV/PTV pairs plus critical OARs): one can verify that all GTV/PTV pairs are spatially co-located and that the OARs (brainstem, optic chiasm, cochleae) are in the expected positions.
 
-**Limitation:** The 3D scatter is static (not interactive). For interactive exploration, the CT Transformer's `visualization_3d.html` (Plotly) is the better tool.
+**Limitation:** The 3D scatter is static (not interactive). The repo's only interactive 3D views are the Plotly HTML files of the modifier (`visualization_3d.html`, CT surfaces) and the case modifier (`transform_3d.html`, contour point clouds); neither shows centroids.
 
 ### 5. `statistics.txt` – Numerical Summary
 
-A structured plain-text file, grouped by category (Targets, serial OARs, parallel OARs, helper structures), with per-structure details (volume + voxel cross-check, equivalent-sphere diameter, max 3D diameter, centroid, bounding box, sphericity, solidity, elongation, component count) and aggregated Target↔OAR distance statistics (mean/std/min/max of min, HD95, Hausdorff and ASSD), the most critical pairs, and a GTV→PTV margin check. Suitable for copy-paste into clinical reports or further spreadsheet analysis.
+A structured plain-text file, grouped by category (Targets, serial OARs, parallel OARs, helper structures), with per-structure details (volume + voxel cross-check, equivalent-sphere diameter, max 3D diameter, centroid, bounding box, sphericity, solidity, elongation, and a flag for multi-component / invalid shape metrics). It also contains aggregated Target↔OAR distance statistics (mean/std/min/max of min, HD95, Hausdorff and ASSD over *all* Target↔OAR pairs, including containment pairs such as Target↔whole brain), the most critical pairs, and a GTV→PTV margin check (minimum distance, HD95 and ASSD per lesion). Suitable for copy-paste into reports or further spreadsheet analysis.
 
 ### 6. Additional clinical plots (multi-metastasis / SRS)
 
-- **`proximity_matrix.png`** – heatmap of minimum distance (mm) for every PTV (rows) × critical OAR (columns: serial OARs plus eyes/lenses/hippocampi), colour-banded (red ≤2, orange ≤5, yellow ≤10, light-green ≤20, green >20 mm). One glance shows which metastasis threatens which organ.
+- **`proximity_matrix.png`** – heatmap of minimum distance (mm) for every PTV (rows) × critical OAR (columns: serial OARs plus eyes/lenses/hippocampi), colour-banded (red < 2, orange 2–5, yellow 5–10, light-green 10–20, green ≥ 20 mm). One glance shows which metastasis threatens which organ.
 - **`nearest_critical_oar.png`** – per-PTV triage bar of the single nearest serial OAR (labelled with the organ and distance), sorted, with 3 mm / 5 mm threshold lines.
 - **`sphericity_vs_elongation.png`** – scatter of shape character for anatomical structures (x = elongation, y = sphericity, marker size ∝ √volume, colour = category); round targets cluster top-left, elongated serial OARs (cord, optic nerves) sit far right.
-- **`gtv_ptv_margin.png`** – per-lesion GTV vs PTV volume (log axis) with the implied isotropic margin (from equivalent-sphere radii), a quick check that every metastasis received a consistent CTV→PTV expansion.
+- **`gtv_ptv_margin.png`** – per-lesion GTV vs PTV volume (log axis) with the implied isotropic margin (difference of the equivalent-sphere radii), a quick check that every metastasis received a consistent GTV→PTV expansion. The implied margin is exact only for spherical lesions. For a less round lesion it over-estimates the true margin by roughly a factor $1/\Psi$, because the volume gained per millimetre of margin equals the lesion's surface area, which exceeds that of the volume-equivalent sphere by $1/\Psi$.
 
 ### Structure classification
 
@@ -794,7 +868,7 @@ The original contour points (grey-blue) and transformed contour points (red) are
 - **DICOM-Achsen** — an L/P/S triad at the rotation centre (off by default).
 - **CT-Koerperoberflaeche** — only present with `--viz-ct-surface`; hidden until toggled.
 
-The scene uses `aspectmode='data'` so 1 mm is the same on-screen length in X, Y, and Z. Point clouds are deterministically sub-sampled (≈ 9000 points per layer) so the file stays responsive even with dozens of ROIs.
+The scene uses `aspectmode='data'` so 1 mm is the same on-screen length in X, Y, and Z. Point clouds are deterministically sub-sampled (at most 600 points per ROI and 9000 per layer) so the file stays responsive even with dozens of ROIs.
 
 ### B. `transform_overview.png` – Static Tri-Planar Projection
 
@@ -806,7 +880,7 @@ A headless, report/CI-friendly companion to the HTML. Each panel overlays the or
 
 **Chart type:** Horizontal bar chart, sorted descending, limited to the 40 most-displaced ROIs.
 
-For each ROI the centroid displacement `‖T(c) − c‖` is plotted, with a dashed reference line at the pure-translation magnitude `‖t‖`. Because a rotation about the chosen centre leaves that centre fixed, structures near the rotation centre move by ≈ `‖t‖`, while structures far from it move more (the rotational lever arm). This makes it a quick QA check: an unexpectedly large displacement flags a structure that swings a long way under the requested rotation.
+For each ROI the displacement $\lVert\mathbf{T}(\bar{\mathbf{p}}) - \bar{\mathbf{p}}\rVert$ of its vertex centroid $\bar{\mathbf{p}}$ is plotted, with a dashed reference line at the pure-translation magnitude $\lVert\mathbf{t}\rVert$. A point $\mathbf{p}$ is displaced by $(\mathbf{R} - \mathbf{I})(\mathbf{p} - \mathbf{c}) + \mathbf{t}$, where $\mathbf{c}$ is the rotation centre. The rotational part has magnitude $2 d_\perp \sin(\theta/2)$, with $\theta$ the net rotation angle and $d_\perp$ the distance of $\mathbf{p}$ from the rotation axis through $\mathbf{c}$. Structures on or near that axis therefore move by ≈ $\lVert\mathbf{t}\rVert$. Structures farther from it get an additional lever-arm displacement that can add to, or partly cancel, the translation, so their bars may lie on either side of the reference line. This makes it a quick QA check: an unexpectedly large displacement flags a structure that swings a long way under the requested rotation.
 
 ## Implementation Notes
 
@@ -836,6 +910,7 @@ Standards and reports:
 
 Publications:
 
+- Heimann, T., van Ginneken, B., Styner, M. A., et al. (2009). *Comparison and evaluation of methods for liver segmentation from CT datasets.* IEEE Transactions on Medical Imaging, 28(8), 1251–1265.
 - Huttenlocher, D. P., Klanderman, G. A., & Rucklidge, W. J. (1993). *Comparing images using the Hausdorff distance.* IEEE Transactions on Pattern Analysis and Machine Intelligence, 15(9), 850–863.
 - Lehmann, T. M., Gönner, C., & Spitzer, K. (1999). *Survey: Interpolation methods in medical image processing.* IEEE Transactions on Medical Imaging, 18(11), 1049–1075.
 - Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm.* ACM SIGGRAPH Computer Graphics, 21(4), 163–169.
