@@ -102,9 +102,13 @@ _SERIAL_OAR_KEYWORDS = (
 # NICHT als Hilfsstruktur gelten. Die Konvention dieses Datensatzes präfixt
 # Hilfsstrukturen mit "h_" bzw. "opt"; zusätzlich generische Shell-/Margin-Namen.
 _HELPER_NAME_RE = re.compile(
-    r"(^h_|opt[\s_]*system|^opt_|\bring\b|\bshell\b|\+\s*\d+\s*mm)",
+    r"(^h_|opt[\s_]*system|^opt_|\bring\b|\bshell\b|\+\s*\d+\s*mm"
+    r"|^iso_?\d|_x_iso\d|_minus_iso\d|^iso\d+_minus_)",   # dose_indices-ROIs
     re.IGNORECASE,
 )
+# RT-Typen, die nie klinische Strukturen sind (TPS-Isodosen, Optimierungs-/
+# Kontrollstrukturen): Eclipse exportiert Isodosen-Strukturen als CONTROL.
+_HELPER_RT_TYPES = ("CONTROL", "DOSE_REGION")
 # Echte Zielvolumina: Name beginnt mit GTV/PTV/CTV/ITV (gefolgt von _ oder Ziffer)
 _TARGET_NAME_RE = re.compile(r"^(gtv|ptv|ctv|itv)[ _0-9]", re.IGNORECASE)
 # Läsions-Schlüssel zum Paaren von GTV mit seinem PTV (z.B. "01M_BM_frontal_li")
@@ -130,8 +134,9 @@ def classify_structure(name: str, rt_type: str, geom_types: set[str]) -> str:
     if rt == "EXTERNAL" or re.search(r"aussenkontur|außenkontur|external|\bbody\b|koerper|körper",
                                      nm, re.IGNORECASE):
         return CAT_EXTERNAL
-    # 3) Hilfs-/Planungsstrukturen (Name-basiert, überschreibt fehlerhaftes RT-Type)
-    if _HELPER_NAME_RE.search(nm):
+    # 3) Hilfs-/Planungsstrukturen (Name-basiert, überschreibt fehlerhaftes RT-Type;
+    #    CONTROL/DOSE_REGION = TPS-Isodosen und Kontrollstrukturen)
+    if _HELPER_NAME_RE.search(nm) or rt in _HELPER_RT_TYPES:
         return CAT_HELPER
     # 4) Echte Zielvolumina
     if _TARGET_NAME_RE.match(nm) or rt in ("PTV", "CTV", "GTV", "ITV", "TV"):

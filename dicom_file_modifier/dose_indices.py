@@ -1,0 +1,1491 @@
+"""
+dose_indices.py - Automatische Indexberechnung aus RTSTRUCT + RTDOSE (+ RTPLAN)
+
+Berechnet je Zielvolumen:
+  - Paddick Conformity Index   CI = (TV&PIV)^2 / (TV * PIV)
+  - Coverage, Selektivitaet, RTOG-CI (PIV/TV), Dice
+  - Gradient Index             GI = PIV50 / PIV100
+  - Gradient Measure           GM = r_eq(PIV50) - r_eq(PIV100)  [cm]
+  - Homogenitaetsindex ICRU83  HI = (D2 - D98) / D50
+  - Dmin/Dmax/Dmean, D95, V95/V100 des Ziels
+und schreibt eine separate RTSTRUCT mit Isodosen-ROIs (100 %, 50 %, ...) und
+den fuer den Index benutzten Hilfskonturen (Schnitt, Unterdosierung, Spill).
+
+Verwendung:
+  python -m dicom_file_modifier.dose_indices data/<case-id> [Optionen]
+  python -m dicom_file_modifier.dose_indices --rs RS.dcm --rd RD.dcm [--rp RP.dcm] [Optionen]
+  python -m dicom_file_modifier.dose_indices --self-test
+
+Ausgaben in output/<case-id><label>/:
+  RS_<case-id><label>.dcm, <case-id>_indices.json, indices.txt, indices.csv
+
+Alle Volumina in cm3, Dosen in Gy, LPS-Koordinaten in mm.  Konsolenausgabe
+ist ASCII (Windows-Konsole), Dateien sind UTF-8.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _dt
+import json
+import math
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pydicom
+
+from . import analyzer as ana
+from . import dose as dm
+
+TOOL_NAME = "dose_indices"
+TOOL_VERSION = "1.0.0"
+DEFAULT_ISODOSE = "100,50"
+GRID_CHOICES = (1.0, 0.5, 0.25, 0.1)
+INTERP_ORDER = {"linear": 1, "cubic": 3}
+
+CSV_COLUMNS = [
+    "case_id", "target", "rx_gy", "rx_source", "grid_mm", "dose_interp", "volume_model",
+    "piv_scope", "tv_cm3", "piv_cm3", "tv_piv_cm3", "piv50_cm3", "ci_paddick", "ci_rtog",
+    "coverage", "dice", "gi", "gm_cm", "hi_icru83", "d2_gy", "d50_gy", "d98_gy", "dmin_gy",
+    "dmax_gy", "dmean_gy", "d95_gy", "v95_pct", "v100_pct", "rs_file", "rd_sop_uid",
+    "run_timestamp",
+]
+
+# Farbvorschlaege (RGB) fuer Isodosen-ROIs nach Prozent-Level
+LEVEL_COLORS = {
+    100: (255, 0, 255), 95: (255, 128, 255), 90: (255, 105, 180), 80: (255, 165, 0),
+    70: (255, 215, 0), 60: (0, 200, 100), 50: (0, 255, 255), 30: (0, 128, 255), 20: (0, 0, 255),
+}
+HELPER_COLORS = {"inter": (0, 255, 0), "under": (255, 255, 0), "spill": (255, 0, 0)}
+
+
+# ---------------------------------------------------------------------------
+# 1. Discovery, Zielauswahl, Verschreibung, Level
+# ---------------------------------------------------------------------------
+
+def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = None,
+                       rd_override: Optional[str] = None,
+                       rp_override: Optional[str] = None) -> dict:
+    """
+    ``{'case_id', 'case_dir', 'rs', 'rd', 'rp'|None, 'ct_dir'|None}``.
+    Sucht ``RS*.dcm``/``RD*.dcm``/``RP*.dcm`` im Case-Ordner; Overrides haben
+    Vorrang.  Bei mehreren RD-Kandidaten wird die PLAN-Summendosis bevorzugt,
+    die den RP referenziert; bleibt es mehrdeutig -> ``ValueError``.
+    """
+    def _pick(kind: str, override: Optional[str], required: bool):
+        if override is not None:
+            p = Path(override)
+            if not p.is_file():
+                raise FileNotFoundError(f"{kind}-Datei nicht gefunden: {override!r}")
+            return p
+        if case_dir is None:
+            if required:
+                raise ValueError(f"Ohne Case-Ordner muss --{kind.lower()} angegeben werden.")
+            return None
+        cands = sorted(Path(case_dir).glob(f"{kind}*.dcm"))
+        if not cands:
+            if required:
+                raise FileNotFoundError(
+                    f"Keine '{kind}*.dcm'-Datei in {case_dir!r} gefunden "
+                    f"(anderes Praefix? dann --{kind.lower()} <pfad>)."
+                )
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        if kind == "RD":
+            plans = []
+            for c in cands:
+                try:
+                    h = pydicom.dcmread(str(c), stop_before_pixels=True)
+                except Exception:
+                    continue
+                if str(h.get("DoseSummationType", "")).upper() == "PLAN":
+                    plans.append(c)
+            if len(plans) == 1:
+                return plans[0]
+        joined = "\n  ".join(str(p) for p in cands)
+        raise ValueError(
+            f"Mehrere '{kind}*.dcm'-Kandidaten in {case_dir!r}:\n  {joined}\n"
+            f"Bitte mit --{kind.lower()} <pfad> explizit auswaehlen."
+        )
+
+    if case_dir is not None and not Path(case_dir).is_dir():
+        raise FileNotFoundError(f"Case-Ordner nicht gefunden: {case_dir!r}")
+    rs = _pick("RS", rs_override, True)
+    rd = _pick("RD", rd_override, True)
+    rp = _pick("RP", rp_override, False)
+    base = Path(case_dir) if case_dir is not None else rd.parent
+    ct_dir = base / "CT"
+    return {
+        "case_id": base.resolve().name,
+        "case_dir": base,
+        "rs": rs, "rd": rd, "rp": rp,
+        "ct_dir": ct_dir if ct_dir.is_dir() else None,
+    }
+
+
+def _roi_table(rs_ds: pydicom.Dataset) -> list:
+    """[(roi_number, name, rt_type, category)] fuer alle ROIs."""
+    names = ana.get_structure_names(rs_ds)
+    types = ana.get_structure_type(rs_ds)
+    geoms = ana.get_structure_geom_types(rs_ds)
+    out = []
+    for num, name in names.items():
+        cat = ana.classify_structure(name, types.get(num, ""), geoms.get(num, set()))
+        out.append((int(num), name, types.get(num, ""), cat))
+    return out
+
+
+def select_targets(rs_ds: pydicom.Dataset, target_arg: Optional[str],
+                   rp_refs: Optional[list] = None) -> tuple:
+    """
+    Liefert ``([(roi_number, name), ...], hinweise)``.
+    ``--target``: exakter Name, sonst eindeutiger case-insensitiver Teilstring.
+    Auto: Kategorie TARGET und Name beginnt mit PTV; ist eine RTPLAN-
+    ``DoseReferenceDescription`` (SH, 16 Zeichen) Praefix genau eines
+    Kandidaten, wird nur dieser genommen.
+    """
+    table = _roi_table(rs_ds)
+    notes = []
+    if target_arg:
+        chosen = []
+        for token in [t.strip() for t in target_arg.split(",") if t.strip()]:
+            exact = [r for r in table if r[1] == token]
+            if not exact:
+                exact = [r for r in table if r[1].lower() == token.lower()]
+            if not exact:
+                exact = [r for r in table if token.lower() in r[1].lower()]
+            if len(exact) != 1:
+                cands = ", ".join(repr(r[1]) for r in exact) if exact else "keine"
+                raise ValueError(
+                    f"--target {token!r} ist nicht eindeutig (Kandidaten: {cands}). "
+                    "Verfuegbare ROIs mit --list anzeigen."
+                )
+            if exact[0] not in chosen:
+                chosen.append(exact[0])
+        return [(r[0], r[1]) for r in chosen], notes
+
+    targets = [r for r in table if r[3] == ana.CAT_TARGET]
+    ptvs = [r for r in targets if r[1].upper().startswith("PTV")]
+    if not ptvs:
+        listing = ", ".join(f"{r[1]!r}" for r in targets) or "keine"
+        raise ValueError(
+            "Kein PTV gefunden. Zielvolumen mit --target NAME waehlen "
+            f"(TARGET-Kandidaten: {listing})."
+        )
+    chosen = ptvs
+    for ref in rp_refs or []:
+        desc = (ref.get("description") or "").strip()
+        if not desc:
+            continue
+        hits = [r for r in ptvs if r[1].lower().startswith(desc.lower())]
+        if len(hits) == 1 and len(ptvs) > 1:
+            chosen = hits
+            rest = ", ".join(repr(r[1]) for r in ptvs if r not in hits)
+            notes.append(
+                f"RTPLAN-Verschreibung '{desc}' passt auf {hits[0][1]!r}; "
+                f"weitere PTVs ({rest}) nicht ausgewertet (--target fuer alle)."
+            )
+            break
+    return [(r[0], r[1]) for r in chosen], notes
+
+
+def resolve_prescription(rx_cli: Optional[float], rx_pct_of_max: Optional[float],
+                         rp_refs: Optional[list], dose: dm.DoseGrid,
+                         target_names: list) -> tuple:
+    """(rx_gy, source in {'cli','pct_of_max','rtplan'}, detail_text)."""
+    if rx_cli is not None and rx_pct_of_max is not None:
+        raise ValueError("--rx und --rx-pct-of-max schliessen sich aus.")
+    if rx_cli is not None:
+        if rx_cli <= 0:
+            raise ValueError("--rx muss > 0 sein.")
+        return float(rx_cli), "cli", f"{rx_cli:.2f} Gy per --rx"
+    if rx_pct_of_max is not None:
+        if not (0 < rx_pct_of_max <= 100):
+            raise ValueError("--rx-pct-of-max muss in (0, 100] liegen.")
+        rx = rx_pct_of_max / 100.0 * dose.dmax
+        return float(rx), "pct_of_max", f"{rx_pct_of_max:g} % von Dmax {dose.dmax:.2f} Gy"
+    refs = [r for r in (rp_refs or [])
+            if r.get("target_prescription_dose_gy") is not None
+            and (r.get("reference_type", "").upper() in ("TARGET", ""))]
+    if not refs:
+        raise ValueError(
+            "Keine Verschreibung gefunden (RTPLAN fehlt oder ohne TargetPrescriptionDose). "
+            "Bitte --rx <Gy> oder --rx-pct-of-max <Prozent> angeben."
+        )
+    if len(refs) > 1:
+        lowered = [n.lower() for n in target_names]
+        pref = [r for r in refs if r.get("description")
+                and any(n.startswith(r["description"].lower()) for n in lowered)]
+        if len(pref) == 1:
+            refs = pref
+        else:
+            listing = "; ".join(f"{r['description']!r}: {r['target_prescription_dose_gy']:g} Gy"
+                                for r in refs)
+            raise ValueError(
+                f"Mehrere Verschreibungen im RTPLAN ({listing}). Bitte --rx angeben."
+            )
+    r = refs[0]
+    return (float(r["target_prescription_dose_gy"]), "rtplan",
+            f"DoseReferenceSequence '{r['description']}'")
+
+
+def parse_isodose_levels(spec: str, rx_gy: float) -> tuple:
+    """
+    ``'100,50,80,12Gy'`` -> ``[{'key','label','pct','gy'}, ...]`` absteigend
+    nach Gy; 100 und 50 werden bei Bedarf ergaenzt (Hinweis in ``notes``).
+    """
+    levels, notes = [], []
+    for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
+        low = tok.lower()
+        try:
+            if low.endswith("gy"):
+                gy = float(low[:-2])
+                pct = gy / rx_gy * 100.0
+                key, label = f"{gy:g}Gy", f"{gy:g} Gy"
+            else:
+                pct = float(low.rstrip("%"))
+                gy = pct / 100.0 * rx_gy
+                key, label = f"{pct:g}", f"{pct:g}%"
+        except ValueError:
+            raise ValueError(f"Ungueltiges Isodosen-Level: {tok!r} (z.B. 100,50,80 oder 12Gy)")
+        if gy <= 0:
+            raise ValueError(f"Isodosen-Level muss > 0 sein: {tok!r}")
+        levels.append({"key": key, "label": label, "pct": pct, "gy": gy})
+    for need, lab in ((100.0, "100"), (50.0, "50")):
+        if not any(abs(lv["pct"] - need) < 1e-6 for lv in levels):
+            levels.append({"key": lab, "label": f"{lab}%", "pct": need, "gy": need / 100.0 * rx_gy})
+            notes.append(f"Isodosen-Level {lab} % ergaenzt (fuer CI/GI erforderlich).")
+    # Duplikate (gleiches Gy) entfernen, absteigend sortieren
+    uniq = {}
+    for lv in levels:
+        uniq.setdefault(round(lv["gy"], 6), lv)
+    out = sorted(uniq.values(), key=lambda lv: -lv["gy"])
+    return out, notes
+
+
+# ---------------------------------------------------------------------------
+# 2. Reine Indexfunktionen (cm3; NaN bei Nenner 0)
+# ---------------------------------------------------------------------------
+
+def _safe_div(a: float, b: float) -> float:
+    return float(a) / float(b) if b else float("nan")
+
+
+def paddick_ci(tv: float, piv: float, tv_piv: float) -> float:
+    return _safe_div(tv_piv * tv_piv, tv * piv)
+
+
+def coverage(tv: float, tv_piv: float) -> float:
+    return _safe_div(tv_piv, tv)
+
+
+def selectivity(piv: float, tv_piv: float) -> float:
+    return _safe_div(tv_piv, piv)
+
+
+def rtog_ci(tv: float, piv: float) -> float:
+    return _safe_div(piv, tv)
+
+
+def dice_index(tv: float, piv: float, tv_piv: float) -> float:
+    return _safe_div(2.0 * tv_piv, tv + piv)
+
+
+def gradient_index(piv50: float, piv100: float) -> float:
+    return _safe_div(piv50, piv100)
+
+
+def equivalent_radius_cm(v_cm3: float) -> float:
+    return (3.0 * v_cm3 / (4.0 * math.pi)) ** (1.0 / 3.0) if v_cm3 > 0 else float("nan")
+
+
+def gradient_measure_cm(piv50: float, piv100: float) -> float:
+    return equivalent_radius_cm(piv50) - equivalent_radius_cm(piv100)
+
+
+def homogeneity_index(d2: float, d98: float, d50: float) -> float:
+    return _safe_div(d2 - d98, d50)
+
+
+# ---------------------------------------------------------------------------
+# 3. Ergebnisobjekte und Auswertung auf dem Feingitter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IsodoseLevel:
+    key: str
+    label: str
+    pct: float
+    gy: float
+    mask: np.ndarray
+    labels: np.ndarray
+    n_components: int
+    volume_cm3: float
+    color: tuple
+    roi_name: Optional[str] = None
+
+
+@dataclass
+class TargetMasks:
+    name: str
+    roi_number: int
+    color: tuple
+    rt_type: str
+    contours: list
+    structure: dm.StructureMask
+    structure_alt: dm.StructureMask
+    piv: np.ndarray
+    piv50: np.ndarray
+    inter: np.ndarray
+    under: np.ndarray
+    spill: np.ndarray
+    dose_samples: np.ndarray
+    sample_weights: np.ndarray
+    piv_info: dict
+    result: dict
+    helper_names: dict = field(default_factory=dict)
+
+
+@dataclass
+class DoseIndexArtifacts:
+    grid: dm.FineGrid
+    dose_fine: np.ndarray
+    dose: dm.DoseGrid
+    rs_ds: pydicom.Dataset
+    rx_gy: float
+    rx_source: str
+    levels: dict                      # key -> IsodoseLevel (absteigend nach Gy)
+    targets: dict                     # name -> TargetMasks
+    global_result: Optional[dict]
+    settings: dict
+    warnings: list
+    results: dict = field(default_factory=dict)
+
+
+def _roi_color(rs_ds: pydicom.Dataset, roi_number: int) -> tuple:
+    for rc in rs_ds.ROIContourSequence:
+        if int(rc.ReferencedROINumber) == int(roi_number):
+            col = rc.get("ROIDisplayColor")
+            if col is not None and len(col) == 3:
+                return tuple(int(v) for v in col)
+    return (255, 0, 0)
+
+
+def _level_color(pct: float) -> tuple:
+    best = min(LEVEL_COLORS, key=lambda p: abs(p - pct))
+    return LEVEL_COLORS[best] if abs(best - pct) < 5 else (160, 160, 160)
+
+
+def evaluate_target(name: str, roi_number: int, contours: list, color: tuple, rt_type: str,
+                    grid: dm.FineGrid, dose_fine: np.ndarray, rx_gy: float, levels: dict,
+                    volume_model: str, piv_scope: str) -> TargetMasks:
+    """Komponenten, Indizes, DVH-Statistik und Hilfsmasken fuer EIN Ziel."""
+    alt_model = "eclipse" if volume_model == "slab" else "slab"
+    sm = dm.rasterize_structure(contours, grid, volume_model, name, roi_number)
+    sm_alt = dm.rasterize_structure(contours, grid, alt_model, name, roi_number)
+    warnings = []
+
+    lv100, lv50 = levels["100"], levels["50"]
+    if piv_scope == "component":
+        piv, info = dm.scope_mask_to_structure(lv100.mask, sm.mask, lv100.labels, grid)
+        piv50, info50 = dm.scope_mask_to_structure(lv50.mask, sm.mask, lv50.labels, grid)
+        if info["fallback"]:
+            warnings.append(
+                f"Keine 100%-Isodosen-Komponente ueberlappt {name!r}; naechste Komponente "
+                f"({info['fallback_distance_mm']:.1f} mm) verwendet."
+            )
+        info["piv50_components_used"] = info50["components_used"]
+    else:
+        piv, piv50 = lv100.mask, lv50.mask
+        info = {"n_components_total": lv100.n_components,
+                "components_used": list(range(1, lv100.n_components + 1)),
+                "fallback": False, "fallback_distance_mm": None,
+                "piv50_components_used": list(range(1, lv50.n_components + 1))}
+    info["scope"] = piv_scope
+
+    w = sm.weighted()
+    w_alt = sm_alt.weighted()
+    tv = dm.mask_volume_cm3(w, grid)
+    tv_alt = dm.mask_volume_cm3(w_alt, grid)
+    piv_v = dm.mask_volume_cm3(piv, grid)
+    tv_piv = dm.intersection_volume_cm3(w, piv, grid)
+    tv_piv_alt = dm.intersection_volume_cm3(w_alt, piv, grid)
+    piv50_v = dm.mask_volume_cm3(piv50, grid)
+
+    inter = sm.mask & piv
+    under = sm.mask & ~piv
+    spill = piv & ~sm.mask
+
+    k_idx = np.nonzero(sm.mask)[0]
+    samples = dose_fine[sm.mask]
+    stats = dm.weighted_dose_statistics(samples, sm.slab_w[k_idx], rx_gy)
+    stats_alt = dm.weighted_dose_statistics(samples, sm_alt.slab_w[k_idx], rx_gy)
+
+    if piv_v <= 0:
+        warnings.append(f"PIV leer: Rx {rx_gy:.2f} Gy liegt ueber der Maximaldosis im Gitter.")
+    elif tv_piv <= 0:
+        warnings.append(f"Kein Ueberlapp zwischen {name!r} und der Rx-Isodose.")
+    if stats["outside_fraction"] > 0:
+        warnings.append(
+            f"{stats['outside_fraction'] * 100:.1f} % des Zielvolumens liegen ausserhalb "
+            "des Dosisgitters (ohne Dosiswerte)."
+        )
+    if sm.n_gaps:
+        warnings.append(f"{sm.n_gaps} z-Luecke(n) in den Konturen von {name!r} (nicht ueberbrueckt).")
+
+    def _indices(tv_, tv_piv_, st):
+        return {
+            "ci_paddick": paddick_ci(tv_, piv_v, tv_piv_),
+            "coverage": coverage(tv_, tv_piv_),
+            "selectivity": selectivity(piv_v, tv_piv_),
+            "ci_rtog": rtog_ci(tv_, piv_v),
+            "dice": dice_index(tv_, piv_v, tv_piv_),
+            "gi": gradient_index(piv50_v, piv_v),
+            "gm_cm": gradient_measure_cm(piv50_v, piv_v),
+            "hi_icru83": homogeneity_index(st["d2"], st["d98"], st["d50"]),
+        }
+
+    indices = _indices(tv, tv_piv, stats)
+    indices_alt = _indices(tv_alt, tv_piv_alt, stats_alt)
+    v100_cm3 = stats["v100_pct"] / 100.0 * tv if not math.isnan(stats["v100_pct"]) else float("nan")
+
+    result = {
+        "roi_number": int(roi_number),
+        "n_contours": sm.n_contours,
+        "n_slices": sm.n_slices,
+        "slice_spacing_mm": sm.slice_spacing_mm,
+        "n_holes": sm.n_holes,
+        "n_gaps": sm.n_gaps,
+        "outside_dose_grid_fraction": stats["outside_fraction"],
+        "volumes_cm3": {
+            "planimetric_slab": dm.planimetric_volume_cm3(contours, "slab"),
+            "planimetric_eclipse": dm.planimetric_volume_cm3(contours, "eclipse"),
+            "raster_slab": tv if volume_model == "slab" else tv_alt,
+            "raster_eclipse": tv if volume_model == "eclipse" else tv_alt,
+        },
+        "components": {
+            "tv_cm3": tv, "piv_cm3": piv_v, "piv_global_cm3": lv100.volume_cm3,
+            "tv_piv_cm3": tv_piv, "piv50_cm3": piv50_v,
+            "piv50_global_cm3": lv50.volume_cm3,
+        },
+        "indices": indices,
+        "dvh_stats": {
+            "d2_gy": stats["d2"], "d50_gy": stats["d50"], "d95_gy": stats["d95"],
+            "d98_gy": stats["d98"], "dmin_gy": stats["dmin"], "dmax_gy": stats["dmax"],
+            "dmean_gy": stats["dmean"], "v95_pct": stats["v95_pct"],
+            "v100_pct": stats["v100_pct"], "v100_cm3": v100_cm3,
+            "n_samples": stats["n_samples"],
+        },
+        "volume_models": {
+            volume_model: {"tv_cm3": tv, "tv_piv_cm3": tv_piv,
+                           "ci_paddick": indices["ci_paddick"],
+                           "hi_icru83": indices["hi_icru83"]},
+            alt_model: {"tv_cm3": tv_alt, "tv_piv_cm3": tv_piv_alt,
+                        "ci_paddick": indices_alt["ci_paddick"],
+                        "hi_icru83": indices_alt["hi_icru83"]},
+        },
+        "piv": info,
+        "helper_rois": {
+            "intersection": {"volume_cm3": dm.mask_volume_cm3(inter, grid)},
+            "underdosed": {"volume_cm3": dm.mask_volume_cm3(under, grid)},
+            "spill": {"volume_cm3": dm.mask_volume_cm3(spill, grid)},
+        },
+        "warnings": warnings,
+    }
+    return TargetMasks(
+        name=name, roi_number=int(roi_number), color=color, rt_type=rt_type,
+        contours=contours, structure=sm, structure_alt=sm_alt, piv=piv, piv50=piv50,
+        inter=inter, under=under, spill=spill, dose_samples=samples,
+        sample_weights=sm.slab_w[k_idx], piv_info=info, result=result,
+    )
+
+
+def evaluate_global(targets: dict, grid: dm.FineGrid, dose_fine: np.ndarray,
+                    rx_gy: float, levels: dict) -> dict:
+    """Union aller Ziele gegen die globalen Isodosen (nur bei > 1 Ziel)."""
+    w = None
+    for tm in targets.values():
+        wt = tm.structure.weighted()
+        w = wt if w is None else np.maximum(w, wt)
+    union_mask = w > 0
+    lv100, lv50 = levels["100"], levels["50"]
+    tv = dm.mask_volume_cm3(w, grid)
+    piv = lv100.volume_cm3
+    tv_piv = dm.intersection_volume_cm3(w, lv100.mask, grid)
+    piv50 = lv50.volume_cm3
+    stats = dm.weighted_dose_statistics(dose_fine[union_mask], w[union_mask], rx_gy)
+    return {
+        "targets": list(targets.keys()),
+        "components": {"tv_cm3": tv, "piv_cm3": piv, "tv_piv_cm3": tv_piv, "piv50_cm3": piv50},
+        "indices": {
+            "ci_paddick": paddick_ci(tv, piv, tv_piv),
+            "coverage": coverage(tv, tv_piv),
+            "selectivity": selectivity(piv, tv_piv),
+            "ci_rtog": rtog_ci(tv, piv),
+            "dice": dice_index(tv, piv, tv_piv),
+            "gi": gradient_index(piv50, piv),
+            "gm_cm": gradient_measure_cm(piv50, piv),
+            "hi_icru83": homogeneity_index(stats["d2"], stats["d98"], stats["d50"]),
+        },
+        "dvh_stats": {
+            "d2_gy": stats["d2"], "d50_gy": stats["d50"], "d95_gy": stats["d95"],
+            "d98_gy": stats["d98"], "dmin_gy": stats["dmin"], "dmax_gy": stats["dmax"],
+            "dmean_gy": stats["dmean"], "v95_pct": stats["v95_pct"],
+            "v100_pct": stats["v100_pct"],
+        },
+    }
+
+
+def evaluate_on_grid(grid: dm.FineGrid, dose_fine: np.ndarray, dose: dm.DoseGrid,
+                     rs_ds: Optional[pydicom.Dataset], target_specs: list, rx_gy: float,
+                     rx_source: str, level_specs: list, volume_model: str,
+                     piv_scope: str, settings: Optional[dict] = None) -> DoseIndexArtifacts:
+    """
+    Numerischer Kern ohne I/O.  ``target_specs`` = Liste von Dicts
+    ``{name, roi_number, contours, color, rt_type}``; ``level_specs`` aus
+    ``parse_isodose_levels``.  Der Self-Test injiziert hier ein analytisches Feld.
+    """
+    warnings = []
+    levels = {}
+    for lv in level_specs:
+        mask = dm.isodose_mask(dose_fine, lv["gy"])
+        labels, n = dm.label_components(mask)
+        levels[lv["key"]] = IsodoseLevel(
+            key=lv["key"], label=lv["label"], pct=lv["pct"], gy=lv["gy"], mask=mask,
+            labels=labels, n_components=n, volume_cm3=dm.mask_volume_cm3(mask, grid),
+            color=_level_color(lv["pct"]),
+        )
+        if not mask.any():
+            warnings.append(f"Isodose {lv['label']} ({lv['gy']:.2f} Gy) ist im Gitter leer.")
+    lowest = min(levels.values(), key=lambda l: l.gy).mask
+    if lowest.any() and (lowest[0].any() or lowest[-1].any() or lowest[:, 0, :].any()
+                         or lowest[:, -1, :].any() or lowest[:, :, 0].any()
+                         or lowest[:, :, -1].any()):
+        warnings.append("Isodose beruehrt den Gitterrand (BBox oder Dosisgitter zu klein).")
+
+    targets = {}
+    for spec in target_specs:
+        tm = evaluate_target(
+            spec["name"], spec["roi_number"], spec["contours"], spec.get("color", (255, 0, 0)),
+            spec.get("rt_type", ""), grid, dose_fine, rx_gy, levels, volume_model, piv_scope,
+        )
+        targets[spec["name"]] = tm
+    global_result = (evaluate_global(targets, grid, dose_fine, rx_gy, levels)
+                     if len(targets) > 1 else None)
+    return DoseIndexArtifacts(
+        grid=grid, dose_fine=dose_fine, dose=dose, rs_ds=rs_ds, rx_gy=rx_gy,
+        rx_source=rx_source, levels=levels, targets=targets, global_result=global_result,
+        settings=dict(settings or {}), warnings=warnings,
+    )
+
+
+def compute_dose_indices(rs_ds: pydicom.Dataset, dose: dm.DoseGrid, target_list: list,
+                         rx_gy: float, rx_source: str, level_specs: list,
+                         grid_mm: float = 0.25, dose_interp: str = "linear",
+                         volume_model: str = "slab", piv_scope: str = "component",
+                         restrict_z_to: Optional[np.ndarray] = None,
+                         align: Optional[tuple] = None,
+                         extra_settings: Optional[dict] = None) -> DoseIndexArtifacts:
+    """BBox -> Feingitter -> Dosis-Sampling -> ``evaluate_on_grid``."""
+    order = INTERP_ORDER[dose_interp]
+    types = ana.get_structure_type(rs_ds)
+    specs, contour_sets = [], []
+    for num, name in target_list:
+        contours = dm.closed_planar_contours(rs_ds, num)
+        if not contours:
+            raise ValueError(f"Zielvolumen {name!r} (ROI {num}) hat keine CLOSED_PLANAR-Konturen.")
+        specs.append({"name": name, "roi_number": int(num), "contours": contours,
+                      "color": _roi_color(rs_ds, num), "rt_type": types.get(num, "")})
+        contour_sets.append(contours)
+
+    lo, hi = dm.contours_bbox(contour_sets)
+    min_gy = min(lv["gy"] for lv in level_specs)
+    lvl_bbox = dm.native_level_bbox(dose, min_gy, margin_voxels=2)
+    if lvl_bbox is not None:
+        lo, hi = np.minimum(lo, lvl_bbox[0]), np.maximum(hi, lvl_bbox[1])
+    contour_z = np.array(sorted({round(float(c[0, 2]), 3) for cs in contour_sets for c in cs}))
+    grid = dm.build_fine_grid(dose, lo, hi, grid_mm, contour_z=contour_z,
+                              restrict_z_to=restrict_z_to, align=align)
+    dose_fine = dm.sample_dose_on_grid(dose, grid, order)
+    settings = {
+        "rx_gy": rx_gy, "rx_source": rx_source, "grid_mm": float(grid_mm),
+        "dz_mm": float(grid.dz), "dose_interp": dose_interp, "volume_model": volume_model,
+        "piv_scope": piv_scope,
+        "grid_align": [float(v) for v in align] if align else None,
+        "isodose_levels": [{"key": lv["key"], "pct": lv["pct"], "gy": lv["gy"]} for lv in level_specs],
+    }
+    settings.update(extra_settings or {})
+    return evaluate_on_grid(grid, dose_fine, dose, rs_ds, specs, rx_gy, rx_source,
+                            level_specs, volume_model, piv_scope, settings)
+
+
+# ---------------------------------------------------------------------------
+# 4. Report (JSON-Struktur, Konsole/TXT, CSV)
+# ---------------------------------------------------------------------------
+
+def _r(v, nd: int):
+    """Rundung mit NaN/None-Durchreichung."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return round(f, nd)
+
+
+def _round_block(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out[k] = _round_block(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [_round_block(x) if isinstance(x, dict) else x for x in v]
+        elif isinstance(v, (float, np.floating)):
+            if k.endswith("_cm3"):
+                out[k] = _r(v, 3)
+            elif k.endswith("_gy") or k == "slice_spacing_mm" or k.endswith("_mm"):
+                out[k] = _r(v, 2 if k.endswith("_gy") else 3)
+            elif k.endswith("_pct") or k.endswith("_fraction"):
+                out[k] = _r(v, 1 if k.endswith("_pct") else 4)
+            else:
+                out[k] = _r(v, 3)
+        elif isinstance(v, (np.integer,)):
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
+
+def build_report(art: DoseIndexArtifacts, meta: dict, outputs: dict) -> dict:
+    """Vollstaendige JSON-Struktur (gerundet) aus den Artefakten."""
+    dose = art.dose
+    grid = art.grid
+    lo, hi = grid.bbox
+    report = {
+        "meta": {
+            "tool": TOOL_NAME, "tool_version": TOOL_VERSION,
+            "timestamp": meta.get("timestamp"),
+            "case_id": meta.get("case_id"),
+            "files": {"rs": meta.get("rs_path"), "rd": meta.get("rd_path"), "rp": meta.get("rp_path")},
+            "rtstruct": {"label": meta.get("rs_label"), "sop_instance_uid": meta.get("rs_sop_uid"),
+                         "n_rois": meta.get("rs_n_rois")},
+            "frame_of_reference_uid": dose.frame_of_reference_uid,
+            "rtplan": meta.get("rtplan"),
+            "notes": list(meta.get("notes", [])),
+            "settings": dict(art.settings),
+            "fine_grid": {"shape": list(grid.shape), "res_xy_mm": grid.res_xy, "dz_mm": grid.dz,
+                          "bbox_mm": [[round(float(v), 3) for v in lo], [round(float(v), 3) for v in hi]],
+                          "n_voxels": grid.n_voxels},
+        },
+        "dose_grid": {
+            "shape": list(dose.shape), "spacing_mm": [round(float(s), 4) for s in dose.spacing],
+            "origin_mm": [round(float(v), 3) for v in dose.origin], "dmax_gy": _r(dose.dmax, 3),
+            "units": dose.units, "dose_type": dose.dose_type, "summation_type": dose.summation_type,
+            "gfov_mode": dose.gfov_mode, "sop_instance_uid": dose.sop_instance_uid,
+        },
+        "isodoses": {
+            lv.key: {"label": lv.label, "pct": _r(lv.pct, 3), "level_gy": _r(lv.gy, 2),
+                     "volume_cm3": _r(lv.volume_cm3, 3), "r_eq_cm": _r(equivalent_radius_cm(lv.volume_cm3), 3),
+                     "n_components": lv.n_components, "roi_name": lv.roi_name}
+            for lv in art.levels.values()
+        },
+        "targets": {},
+        "global": None,
+        "outputs": dict(outputs),
+        "warnings": list(art.warnings),
+    }
+    for name, tm in art.targets.items():
+        block = _round_block(tm.result)
+        block["helper_rois"] = {
+            kind: {"roi_name": tm.helper_names.get(kind),
+                   "volume_cm3": block["helper_rois"][kind]["volume_cm3"]}
+            for kind in ("intersection", "underdosed", "spill")
+        }
+        report["targets"][name] = block
+    if art.global_result is not None:
+        report["global"] = _round_block(art.global_result)
+    return report
+
+
+def _fmt(v, nd: int = 3, width: int = 0) -> str:
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        s = "n/a"
+    else:
+        s = f"{float(v):.{nd}f}"
+    return s.rjust(width) if width else s
+
+
+def format_report(report: dict) -> list:
+    """Zeilen fuer Konsole und ``indices.txt`` (ASCII)."""
+    m = report["meta"]
+    s = m["settings"]
+    dg = report["dose_grid"]
+    L = []
+    L.append("=" * 60)
+    L.append(f"Dosisindex-Berechnung: {m.get('case_id')}")
+    L.append("=" * 60)
+    rs = m["rtstruct"]
+    L.append(f"  RTSTRUCT : {Path(m['files']['rs']).name if m['files']['rs'] else '-'}  "
+             f"({rs.get('n_rois')} ROIs, Label '{rs.get('label')}')")
+    L.append(f"  RTDOSE   : {Path(m['files']['rd']).name if m['files']['rd'] else '-'}  "
+             f"({dg['summation_type']}, {dg['units']}, "
+             f"{dg['shape'][0]} x {dg['shape'][1]} x {dg['shape'][2]} Voxel @ "
+             f"{dg['spacing_mm'][0]:.2f}/{dg['spacing_mm'][1]:.2f}/{dg['spacing_mm'][2]:.2f} mm, "
+             f"Dmax {_fmt(dg['dmax_gy'], 2)} Gy)")
+    rp = m.get("rtplan") or {}
+    if m["files"].get("rp"):
+        L.append(f"  RTPLAN   : {Path(m['files']['rp']).name}  (Label '{rp.get('label')}', "
+                 f"{rp.get('fractions') if rp.get('fractions') is not None else '?'} Fraktion(en))")
+    else:
+        L.append("  RTPLAN   : -")
+    L.append(f"  Rx       : {_fmt(s['rx_gy'], 2)} Gy  (Quelle: {s['rx_source']}"
+             f"{', ' + m['rx_detail'] if m.get('rx_detail') else ''})")
+    fg = m["fine_grid"]
+    L.append(f"  Einstellungen: Gitter {s['grid_mm']:.4g} mm (z {s['dz_mm']:.2f} mm), "
+             f"Interpolation {s['dose_interp']}, Volumenmodell {s['volume_model']}, "
+             f"PIV-Scope {s['piv_scope']}, Isodosen-Konturen {s.get('iso_contours', 'mask')}"
+             f"{' (Eclipse-kompatibel: ' + s['eclipse_compat'] + ')' if s.get('eclipse_compat') else ''}")
+    L.append(f"  Feingitter: {fg['shape'][2]} x {fg['shape'][1]} x {fg['shape'][0]} Voxel "
+             f"({fg['n_voxels'] / 1e6:.2f} M), BBox x[{fg['bbox_mm'][0][0]:.1f},{fg['bbox_mm'][1][0]:.1f}] "
+             f"y[{fg['bbox_mm'][0][1]:.1f},{fg['bbox_mm'][1][1]:.1f}] "
+             f"z[{fg['bbox_mm'][0][2]:.1f},{fg['bbox_mm'][1][2]:.1f}]")
+    for n in m.get("notes", []):
+        L.append(f"  Hinweis: {n}")
+
+    L.append("")
+    L.append("ISODOSEN (global)")
+    L.append("-" * 60)
+    L.append(f"  {'Level':<9}{'Gy':>8}{'Volumen cm3':>14}{'r_eq cm':>10}{'Komponenten':>13}   ROI")
+    for key, lv in report["isodoses"].items():
+        L.append(f"  {lv['label']:<9}{_fmt(lv['level_gy'], 2, 8)}{_fmt(lv['volume_cm3'], 3, 14)}"
+                 f"{_fmt(lv['r_eq_cm'], 3, 10)}{lv['n_components']:>13}   {lv.get('roi_name') or '-'}")
+
+    for name, t in report["targets"].items():
+        c, ix, dv = t["components"], t["indices"], t["dvh_stats"]
+        L.append("")
+        L.append(f"ZIELVOLUMEN: {name}  (ROI {t['roi_number']}, {t['n_contours']} Konturen auf "
+                 f"{t['n_slices']} Schichten, dz {_fmt(t.get('slice_spacing_mm'), 2)} mm, "
+                 f"{t['n_holes']} Loecher)")
+        L.append("-" * 60)
+        L.append(f"  Komponenten [cm3]  TV {_fmt(c['tv_cm3'])} | PIV {_fmt(c['piv_cm3'])} | "
+                 f"TV&PIV {_fmt(c['tv_piv_cm3'])} | PIV50 {_fmt(c['piv50_cm3'])}")
+        L.append(f"  Konformitaet       CI Paddick {_fmt(ix['ci_paddick'])} "
+                 f"(Coverage {_fmt(ix['coverage'])} x Selektivitaet {_fmt(ix['selectivity'])}) | "
+                 f"RTOG {_fmt(ix['ci_rtog'])} | Dice {_fmt(ix['dice'])}")
+        L.append(f"  Gradient           GI {_fmt(ix['gi'], 2)} | GM {_fmt(ix['gm_cm'], 2)} cm")
+        L.append(f"  Homogenitaet       HI ICRU83 {_fmt(ix['hi_icru83'])} | D2 {_fmt(dv['d2_gy'], 2)} | "
+                 f"D50 {_fmt(dv['d50_gy'], 2)} | D98 {_fmt(dv['d98_gy'], 2)} Gy")
+        L.append(f"  Ziel-DVH           Dmin {_fmt(dv['dmin_gy'], 2)} | Dmax {_fmt(dv['dmax_gy'], 2)} | "
+                 f"Dmean {_fmt(dv['dmean_gy'], 2)} | D95 {_fmt(dv['d95_gy'], 2)} Gy | "
+                 f"V95 {_fmt(dv['v95_pct'], 1)} % | V100 {_fmt(dv['v100_pct'], 1)} %")
+        cur = s["volume_model"]
+        alt = "eclipse" if cur == "slab" else "slab"
+        va = t["volume_models"].get(alt, {})
+        L.append(f"  Volumenmodell      {alt}: TV {_fmt(va.get('tv_cm3'))} | "
+                 f"TV&PIV {_fmt(va.get('tv_piv_cm3'))} | CI {_fmt(va.get('ci_paddick'))} | "
+                 f"HI {_fmt(va.get('hi_icru83'))}")
+        p = t["piv"]
+        L.append(f"  PIV-Scope          {p.get('scope')}: Komponente(n) {p.get('components_used')} "
+                 f"von {p.get('n_components_total')}"
+                 f"{'  [Fallback: naechste Komponente]' if p.get('fallback') else ''}"
+                 f"  (global PIV {_fmt(c.get('piv_global_cm3'))} cm3)")
+        h = t["helper_rois"]
+        L.append(f"  Hilfs-ROIs [cm3]   Schnitt {_fmt(h['intersection']['volume_cm3'])}"
+                 f" ({h['intersection'].get('roi_name') or '-'}) | "
+                 f"Unterdos. {_fmt(h['underdosed']['volume_cm3'])}"
+                 f" ({h['underdosed'].get('roi_name') or '-'}) | "
+                 f"Spill {_fmt(h['spill']['volume_cm3'])} ({h['spill'].get('roi_name') or '-'})")
+        if t.get("warnings"):
+            for w in t["warnings"]:
+                L.append(f"  ! WARNUNG !        {w}")
+        else:
+            L.append("  Warnungen          -")
+
+    g = report.get("global")
+    if g:
+        c, ix, dv = g["components"], g["indices"], g["dvh_stats"]
+        L.append("")
+        L.append(f"GESAMT (Union aller Ziele: {', '.join(g['targets'])})")
+        L.append("-" * 60)
+        L.append(f"  Komponenten [cm3]  TV {_fmt(c['tv_cm3'])} | PIV {_fmt(c['piv_cm3'])} | "
+                 f"TV&PIV {_fmt(c['tv_piv_cm3'])} | PIV50 {_fmt(c['piv50_cm3'])}")
+        L.append(f"  Konformitaet       CI Paddick {_fmt(ix['ci_paddick'])} | RTOG {_fmt(ix['ci_rtog'])} | "
+                 f"Dice {_fmt(ix['dice'])} | GI {_fmt(ix['gi'], 2)} | GM {_fmt(ix['gm_cm'], 2)} cm | "
+                 f"HI {_fmt(ix['hi_icru83'])}")
+
+    if report.get("warnings"):
+        L.append("")
+        for w in report["warnings"]:
+            L.append(f"! WARNUNG ! {w}")
+
+    o = report.get("outputs", {})
+    L.append("")
+    L.append("AUSGABEN")
+    L.append("-" * 60)
+    L.append(f"  RTSTRUCT : {o.get('rs_path') or '-'}")
+    L.append(f"  JSON     : {o.get('json_path') or '-'}")
+    L.append(f"  TXT      : {o.get('txt_path') or '-'}")
+    L.append(f"  CSV      : {o.get('csv_path') or '-'}"
+             f"{'  (+ ' + o['append_csv_path'] + ')' if o.get('append_csv_path') else ''}")
+    return L
+
+
+def csv_rows(report: dict) -> list:
+    """Eine Zeile je Ziel (Dicts mit ``CSV_COLUMNS``)."""
+    m, s = report["meta"], report["meta"]["settings"]
+    rows = []
+    for name, t in report["targets"].items():
+        c, ix, dv = t["components"], t["indices"], t["dvh_stats"]
+        rows.append({
+            "case_id": m.get("case_id"), "target": name, "rx_gy": s["rx_gy"],
+            "rx_source": s["rx_source"], "grid_mm": s["grid_mm"], "dose_interp": s["dose_interp"],
+            "volume_model": s["volume_model"], "piv_scope": s["piv_scope"],
+            "tv_cm3": c["tv_cm3"], "piv_cm3": c["piv_cm3"], "tv_piv_cm3": c["tv_piv_cm3"],
+            "piv50_cm3": c["piv50_cm3"], "ci_paddick": ix["ci_paddick"], "ci_rtog": ix["ci_rtog"],
+            "coverage": ix["coverage"], "dice": ix["dice"], "gi": ix["gi"], "gm_cm": ix["gm_cm"],
+            "hi_icru83": ix["hi_icru83"], "d2_gy": dv["d2_gy"], "d50_gy": dv["d50_gy"],
+            "d98_gy": dv["d98_gy"], "dmin_gy": dv["dmin_gy"], "dmax_gy": dv["dmax_gy"],
+            "dmean_gy": dv["dmean_gy"], "d95_gy": dv["d95_gy"], "v95_pct": dv["v95_pct"],
+            "v100_pct": dv["v100_pct"],
+            "rs_file": Path(report["outputs"]["rs_path"]).name if report["outputs"].get("rs_path") else "",
+            "rd_sop_uid": report["dose_grid"]["sop_instance_uid"],
+            "run_timestamp": m.get("timestamp"),
+        })
+    return rows
+
+
+def write_csv(rows: list, path: Path, append: bool = False) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    need_header = not append or not path.exists() or path.stat().st_size == 0
+    with open(path, "a" if append else "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        if need_header:
+            w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in CSV_COLUMNS})
+
+
+def _json_safe(obj):
+    """NaN/Inf -> None, numpy -> Python (ergaenzt analyzer._results_to_jsonable)."""
+    obj = ana._results_to_jsonable(obj)
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def write_json(report: dict, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(report), fh, indent=2, ensure_ascii=False)
+
+
+def write_txt(lines: list, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# 5. Orchestrierung
+# ---------------------------------------------------------------------------
+
+def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None,
+                     rd: Optional[str] = None, rp: Optional[str] = None,
+                     target: Optional[str] = None, rx: Optional[float] = None,
+                     rx_pct_of_max: Optional[float] = None, isodose: str = DEFAULT_ISODOSE,
+                     grid_mm: float = 0.25, dose_interp: str = "linear",
+                     volume_model: str = "slab", piv_scope: str = "component",
+                     output: str = "output", label: str = "_IDX", write_rs: bool = True,
+                     include_target: bool = False, simplify_mm: float = 0.1,
+                     transfer_syntax: str = "explicit", max_name_len: int = 64,
+                     append_csv: Optional[str] = None, eclipse_compat: Optional[str] = None,
+                     iso_contours: str = "mask", quiet: bool = False) -> dict:
+    """
+    Kompletter Lauf: Discovery -> Berechnung -> RS-Export -> Report/JSON/TXT/CSV.
+
+    ``eclipse_compat`` ("high" | "default") setzt alle Parameter auf die Eclipse-
+    Konventionen: Feingitter exakt auf dem CT-Pixelraster (High = 1 Pixel auf den
+    Pixelzentren, Default = 2 Pixel mit Halbpixel-Versatz), Volumenmodell
+    ``eclipse``, PIV global, lineare Interpolation, Isodosen-Konturen als
+    Feld-Isolinien (Vertices auf den Gitterlinien) ohne Vereinfachung.
+    """
+    def say(msg=""):
+        if not quiet:
+            print(msg)
+
+    files = discover_dose_case(case_dir, rs, rd, rp)
+    case_id = files["case_id"]
+    say(f"\nDosisindex-Berechnung fuer Case '{case_id}'")
+    say(f"  RS: {files['rs'].name}\n  RD: {files['rd'].name}\n  RP: {files['rp'].name if files['rp'] else '-'}")
+
+    rs_ds = ana.load_rtstruct(str(files["rs"]))
+    dose = dm.dose_grid_from_dataset(dm.load_rtdose(str(files["rd"])), str(files["rd"]))
+    rp_ds = dm.load_rtplan(str(files["rp"])) if files["rp"] else None
+    warns = list(dose.warnings)                      # echte Warnungen (! WARNUNG !)
+    warns += dm.validate_dose_against_rtstruct(dose, rs_ds, rp_ds)
+    notes = []                                       # informative Hinweise
+    say(f"  Dosisgitter: {dose.shape[2]} x {dose.shape[1]} x {dose.shape[0]} Voxel @ "
+        f"{dose.spacing[2]:.2f}/{dose.spacing[1]:.2f}/{dose.spacing[0]:.2f} mm, "
+        f"Dmax {dose.dmax:.2f} Gy, FoR OK")
+
+    rp_refs = dm.prescription_references(rp_ds) if rp_ds is not None else []
+    targets, t_notes = select_targets(rs_ds, target, rp_refs)
+    notes += t_notes
+    rx_gy, rx_source, rx_detail = resolve_prescription(
+        rx, rx_pct_of_max, rp_refs, dose, [n for _, n in targets])
+    level_specs, l_notes = parse_isodose_levels(isodose, rx_gy)
+    notes += l_notes
+    say(f"  Ziel(e): {', '.join(repr(n) for _, n in targets)}")
+    say(f"  Rx: {rx_gy:.2f} Gy ({rx_source}: {rx_detail})")
+
+    # CT-Schichtindex (fuer RS-Export, z-Beschraenkung und Eclipse-Raster)
+    ct_index = None
+    if files["ct_dir"] is not None:
+        from . import rtstruct_writer as rw
+        ct_index = rw.build_ct_slice_index(str(files["ct_dir"]))
+        warns += rw.validate_index_against_rs(ct_index, rs_ds)
+    elif write_rs:
+        notes.append("Kein CT-Ordner gefunden; RS-Export uebersprungen (nur Indizes).")
+        write_rs = False
+    restrict_z = ct_index["z_values"] if ct_index is not None else None
+
+    align = None
+    if eclipse_compat:
+        if eclipse_compat not in ("high", "default"):
+            raise ValueError("--eclipse-compat muss 'high' oder 'default' sein.")
+        if ct_index is None:
+            raise ValueError("--eclipse-compat braucht den CT-Ordner (CT-Pixelraster).")
+        psp = ct_index["pixel_spacing"]
+        if abs(psp[0] - psp[1]) > 1e-6:
+            raise ValueError("--eclipse-compat: CT-Pixel sind nicht quadratisch.")
+        px = float(psp[0])
+        x0, y0 = ct_index["ipp_xy"]
+        if eclipse_compat == "high":
+            grid_mm, align = px, (x0, y0)
+        else:
+            grid_mm, align = 2.0 * px, (x0 + px / 2.0, y0 + px / 2.0)
+        volume_model, piv_scope, dose_interp = "eclipse", "global", "linear"
+        iso_contours, simplify_mm = "field", 0.0
+        notes.append(
+            f"Eclipse-kompatibel ({eclipse_compat}): Raster {grid_mm:.5f} mm auf dem CT-Pixelgitter "
+            f"(Ursprung x={align[0]:.4f}, y={align[1]:.4f}), Volumenmodell eclipse, PIV global, "
+            "Interpolation linear, Isodosen als Feld-Isolinien ohne Vereinfachung."
+        )
+    extra = {"eclipse_compat": eclipse_compat, "iso_contours": iso_contours,
+             "simplify_mm": float(simplify_mm)}
+
+    art = compute_dose_indices(rs_ds, dose, targets, rx_gy, rx_source, level_specs,
+                               grid_mm=grid_mm, dose_interp=dose_interp,
+                               volume_model=volume_model, piv_scope=piv_scope,
+                               restrict_z_to=restrict_z, align=align, extra_settings=extra)
+    say(f"  Feingitter: {art.grid.shape[2]} x {art.grid.shape[1]} x {art.grid.shape[0]} Voxel "
+        f"({art.grid.n_voxels / 1e6:.2f} M) @ {grid_mm:g} mm, z {art.grid.dz:.2f} mm")
+
+    out_dir = Path(output) / f"{case_id}{label}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {"rs_path": None, "json_path": str(out_dir / f"{case_id}_indices.json"),
+               "txt_path": str(out_dir / "indices.txt"), "csv_path": str(out_dir / "indices.csv"),
+               "append_csv_path": str(append_csv) if append_csv else None}
+
+    # RS-Export (Fehler duerfen die Indizes nicht verwerfen)
+    if write_rs:
+        from . import rtstruct_writer as rw
+        rs_out = out_dir / f"RS_{case_id}{label}.dcm"
+        try:
+            desc = rw.summary_description(art)
+            specs = rw.build_roi_specs(art, include_target=include_target,
+                                       max_name_len=max_name_len, simplify_mm=simplify_mm,
+                                       iso_contours=iso_contours)
+            rw.write_isodose_rtstruct(rs_ds, ct_index, specs, rs_out, label=label,
+                                      description=desc, transfer_syntax=transfer_syntax,
+                                      max_name_len=max_name_len)
+            problems = rw.verify_rtstruct(rs_out, ct_index)
+            if problems:
+                warns.append("RS-Pruefung meldet Probleme: " + "; ".join(problems))
+                say("  RS-Pruefung: PROBLEME (siehe Warnungen)")
+            else:
+                say(f"  RS-Pruefung: OK ({rs_out.name}, {len(specs)} ROIs)")
+            outputs["rs_path"] = str(rs_out)
+        except Exception as e:  # noqa: BLE001 - Export darf den Lauf nicht abbrechen
+            warns.append(f"RS-Export fehlgeschlagen ({type(e).__name__}: {e}).")
+            say(f"  ! WARNUNG ! RS-Export fehlgeschlagen: {e}")
+
+    art.warnings = warns + art.warnings
+    meta = {
+        "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+        "case_id": case_id,
+        "rs_path": str(files["rs"]), "rd_path": str(files["rd"]),
+        "rp_path": str(files["rp"]) if files["rp"] else None,
+        "rs_label": str(rs_ds.get("StructureSetLabel", "")),
+        "rs_sop_uid": str(rs_ds.get("SOPInstanceUID", "")),
+        "rs_n_rois": len(rs_ds.get("StructureSetROISequence", [])),
+        "rx_detail": rx_detail,
+        "rtplan": ({"label": str(rp_ds.get("RTPlanLabel", "")),
+                    "sop_instance_uid": str(rp_ds.get("SOPInstanceUID", "")),
+                    "fractions": dm.fractions_planned(rp_ds),
+                    "dose_references": rp_refs} if rp_ds is not None else None),
+        "notes": notes,
+    }
+    report = build_report(art, meta, outputs)
+    art.results = report
+    lines = format_report(report)
+    say("")
+    for ln in lines:
+        say(ln)
+    write_json(report, outputs["json_path"])
+    write_txt(lines, outputs["txt_path"])
+    rows = csv_rows(report)
+    write_csv(rows, outputs["csv_path"], append=False)
+    if append_csv:
+        write_csv(rows, Path(append_csv), append=True)
+    say("\nFertig.")
+    return report
+
+
+def list_rois(case_dir: Optional[str], rs: Optional[str], rd: Optional[str],
+              rp: Optional[str]) -> int:
+    """``--list``: ROI-Tabelle und Verschreibungen, dann Ende."""
+    files = discover_dose_case(case_dir, rs, rd, rp)
+    rs_ds = ana.load_rtstruct(str(files["rs"]))
+    print(f"\nROIs in {files['rs'].name}:")
+    print(f"  {'Nr':>4}  {'Name':<32}{'Typ':<12}{'Kategorie':<14}{'Konturen':>9}{'Vol cm3':>10}")
+    for num, name, rt, cat in sorted(_roi_table(rs_ds), key=lambda r: r[0]):
+        cs = dm.closed_planar_contours(rs_ds, num)
+        vol = ana.compute_volume(cs) if cs else 0.0
+        print(f"  {num:>4}  {name[:31]:<32}{rt[:11]:<12}{cat:<14}{len(cs):>9}{vol:>10.3f}")
+    if files["rp"]:
+        rp_ds = dm.load_rtplan(str(files["rp"]))
+        print(f"\nVerschreibungen in {files['rp'].name} (Label '{rp_ds.get('RTPlanLabel', '')}', "
+              f"{dm.fractions_planned(rp_ds)} Fraktion(en)):")
+        for r in dm.prescription_references(rp_ds):
+            print(f"  #{r['number']} {r['description']!r} {r['structure_type']}/{r['reference_type']}: "
+                  f"{r['target_prescription_dose_gy']} Gy")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Self-Test (analytisches Phantom, keine Dateien)
+# ---------------------------------------------------------------------------
+
+def _lens_area(a: float, b: float, d: float) -> float:
+    """Schnittflaeche zweier Kreise (Radien a, b, Mittelpunktsabstand d)."""
+    if a <= 0 or b <= 0 or d >= a + b:
+        return 0.0
+    if d <= abs(a - b):
+        return math.pi * min(a, b) ** 2
+    t1 = a * a * math.acos((d * d + a * a - b * b) / (2 * d * a))
+    t2 = b * b * math.acos((d * d + b * b - a * a) / (2 * d * b))
+    t3 = 0.5 * math.sqrt((-d + a + b) * (d + a - b) * (d - a + b) * (d + a + b))
+    return t1 + t2 - t3
+
+
+class _Phantom:
+    """
+    Kugel-Ziel (Radius R bei 0) + glattes radiales Dosisfeld um CD mit
+    geschlossener Form fuer alle Erwartungswerte:
+      D(r) = Dmax / (1 + (r / r0)^p)   (Hill-Profil, C-unendlich),
+      r(L) = r0 * (Dmax / L - 1)^(1/p);  r(Rx) = R100 = 10.5 mm, GI ~ 2.4.
+    Ein Profil mit Knick am Rx-Level (z.B. quadratisch/exponentiell) wuerde
+    die lineare Interpolation systematisch verzerren und den Sampler-Test
+    unbrauchbar machen.
+    """
+    R = 10.0            # Zielradius
+    DMAX, RX = 25.0, 20.0
+    R100, P = 10.5, 6.0
+    R0 = 10.5 / (25.0 / 20.0 - 1.0) ** (1.0 / 6.0)
+    CD = np.array([2.0, 0.0, 0.0])   # Dosiszentrum (Ziel bei 0)
+    DZ = 1.0
+
+    def __init__(self):
+        self.contour_z = np.arange(-9.5, 9.5 + 1e-9, self.DZ)
+
+    def contours(self, center=(0.0, 0.0, 0.0), n: int = 360) -> list:
+        cx, cy, cz = center
+        return [ana._synthetic_circle(cz + z, math.sqrt(self.R ** 2 - z * z), cx, cy, n)
+                for z in self.contour_z]
+
+    def dose_at(self, pts: np.ndarray, center=None) -> np.ndarray:
+        c = self.CD if center is None else np.asarray(center, float)
+        r = np.linalg.norm(np.asarray(pts, float) - c, axis=1)
+        return self.DMAX / (1.0 + (r / self.R0) ** self.P)
+
+    def level_radius(self, level: float) -> float:
+        if level >= self.DMAX:
+            return 0.0
+        return self.R0 * (self.DMAX / level - 1.0) ** (1.0 / self.P)
+
+    def native_grid(self, extent: float = 32.0, res_xy: float = 0.5) -> dm.DoseGrid:
+        zs = np.arange(-extent + 0.5, extent, self.DZ)
+        xs = np.arange(-extent + res_xy / 2, extent, res_xy)
+        Z, Y, X = np.meshgrid(zs, xs, xs, indexing="ij")
+        pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+        arr = self.dose_at(pts).reshape(Z.shape).astype(np.float32)
+        A = np.zeros((4, 4))
+        A[3, 3] = 1.0
+        A[2, 0] = self.DZ          # k -> z
+        A[1, 1] = res_xy           # j -> y
+        A[0, 2] = res_xy           # i -> x
+        A[:3, 3] = [xs[0], xs[0], zs[0]]
+        return dm.DoseGrid(array=arr, affine=A, spacing=(self.DZ, res_xy, res_xy),
+                           origin=A[:3, 3].copy(), units="GY", dose_type="PHYSICAL",
+                           summation_type="PLAN", dmax=float(arr.max()),
+                           frame_of_reference_uid="1.2.3", sop_instance_uid="1.2.3.4")
+
+    # --- Erwartungswerte als Scheibenstapel (exakt fuer das Slab-Modell) ---
+    def _disc_radius(self, z: float) -> float:
+        return math.sqrt(max(self.R ** 2 - z * z, 0.0))
+
+    def _weights(self, model: str) -> np.ndarray:
+        w = np.ones(len(self.contour_z))
+        if model == "eclipse":
+            w[0] = w[-1] = 0.5
+        return w
+
+    def expected(self, model: str = "slab", n_polygon: int = 360) -> dict:
+        # Polygonflaeche eines regelmaessigen n-Ecks = pi r^2 * (n/(2 pi)) sin(2 pi / n)
+        poly_f = n_polygon / (2 * math.pi) * math.sin(2 * math.pi / n_polygon)
+        w = self._weights(model)
+        d = float(np.linalg.norm(self.CD))
+
+        def tv():
+            return sum(wk * math.pi * self._disc_radius(z) ** 2 * poly_f
+                       for wk, z in zip(w, self.contour_z)) * self.DZ / 1000.0
+
+        def piv(level):
+            rl = self.level_radius(level)
+            zs = np.arange(-31.5, 32.0, self.DZ)
+            return sum(math.pi * max(rl * rl - z * z, 0.0) for z in zs) * self.DZ / 1000.0
+
+        def inter(level):
+            rl = self.level_radius(level)
+            tot = 0.0
+            for wk, z in zip(w, self.contour_z):
+                a = self._disc_radius(z) * math.sqrt(poly_f)
+                b = math.sqrt(max(rl * rl - z * z, 0.0))
+                tot += wk * _lens_area(a, b, d)
+            return tot * self.DZ / 1000.0
+
+        TV, PIV, I = tv(), piv(self.RX), inter(self.RX)
+        PIV50 = piv(0.5 * self.RX)
+
+        def d_at(frac):   # Dosis, die frac des Volumens erhaelt (bisection auf inter(L)/TV)
+            lo, hi = 0.01, self.DMAX
+            for _ in range(80):
+                mid = 0.5 * (lo + hi)
+                if inter(mid) / TV >= frac:
+                    lo = mid
+                else:
+                    hi = mid
+            return 0.5 * (lo + hi)
+
+        levels = np.linspace(0.0, self.DMAX, 801)
+        vcum = np.array([inter(L) if L > 0 else TV for L in levels])
+        dmean = float(np.trapz(vcum, levels) / TV)
+        d2, d50, d98, d95 = d_at(0.02), d_at(0.50), d_at(0.98), d_at(0.95)
+        return {
+            "tv": TV, "piv": PIV, "tv_piv": I, "piv50": PIV50,
+            "ci_paddick": I * I / (TV * PIV), "coverage": I / TV, "selectivity": I / PIV,
+            "ci_rtog": PIV / TV, "dice": 2 * I / (TV + PIV), "gi": PIV50 / PIV,
+            "gm_cm": gradient_measure_cm(PIV50, PIV),
+            "d2": d2, "d50": d50, "d98": d98, "d95": d95, "dmean": dmean,
+            "hi": (d2 - d98) / d50,
+            "v100_pct": 100.0 * I / TV, "v95_pct": 100.0 * inter(0.95 * self.RX) / TV,
+        }
+
+
+def _synthetic_rtdose_dataset(dose: dm.DoseGrid, absolute_gfov: bool = False) -> pydicom.Dataset:
+    """Minimaler In-Memory-RTDOSE (uint32) aus einem DoseGrid (fuer den Loader-Test)."""
+    from pydicom.dataset import Dataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian
+
+    scaling = float(dose.dmax) / 4.0e9
+    px = np.round(dose.array.astype(np.float64) / scaling).astype(np.uint32)
+    ds = Dataset()
+    ds.file_meta = FileMetaDataset()
+    ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds.is_little_endian, ds.is_implicit_VR = True, False
+    ds.Modality = "RTDOSE"
+    ds.SOPInstanceUID = "1.2.3.4"
+    ds.FrameOfReferenceUID = "1.2.3"
+    ds.DoseUnits, ds.DoseType, ds.DoseSummationType = "GY", "PHYSICAL", "PLAN"
+    ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+    ds.ImagePositionPatient = [float(v) for v in dose.origin]
+    ds.PixelSpacing = [float(dose.spacing[1]), float(dose.spacing[2])]
+    nk = dose.shape[0]
+    offs = np.arange(nk) * dose.spacing[0]
+    ds.GridFrameOffsetVector = [float(v) for v in (offs + dose.origin[2] if absolute_gfov else offs)]
+    ds.NumberOfFrames = nk
+    ds.Rows, ds.Columns = dose.shape[1], dose.shape[2]
+    ds.SamplesPerPixel, ds.PhotometricInterpretation = 1, "MONOCHROME2"
+    ds.BitsAllocated, ds.BitsStored, ds.HighBit, ds.PixelRepresentation = 32, 32, 31, 0
+    ds.DoseGridScaling = scaling
+    ds.PixelData = px.tobytes()
+    return ds
+
+
+def _run_self_test() -> int:
+    """Analytischer Phantomtest; 0 = alle PASS, 1 = mindestens ein FAIL."""
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(bool(ok))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
+
+    def rel(a, b):
+        return abs(a - b) / max(abs(b), 1e-12)
+
+    print("\nDosisindex Self-Test (analytisches Kugelphantom)")
+    print("-" * 70)
+    ph = _Phantom()
+    native = ph.native_grid()
+
+    # 1) Loader mit synthetischem RTDOSE (relativer + absoluter GFOV)
+    for absolute in (False, True):
+        ds = _synthetic_rtdose_dataset(native, absolute_gfov=absolute)
+        g = dm.dose_grid_from_dataset(ds)
+        ok = (np.allclose(g.affine, native.affine, atol=1e-6) and rel(g.dmax, native.dmax) < 1e-6
+              and g.gfov_mode == ("absolute" if absolute else "relative")
+              and np.allclose(g.patient_to_index([[0.25, 0.25, 0.5]]),
+                              native.patient_to_index([[0.25, 0.25, 0.5]])))
+        check(f"Loader: synthetische RTDOSE, GFOV {'absolut' if absolute else 'relativ'}", ok,
+              f"dmax={g.dmax:.4f}, mode={g.gfov_mode}")
+
+    # 2) Sampler-Exaktheit auf linearem Feld (Achsen-Transposition wuerde auffallen)
+    lin = dm.DoseGrid(array=native.array.copy(), affine=native.affine.copy(),
+                      spacing=native.spacing, origin=native.origin.copy(), units="GY",
+                      dose_type="PHYSICAL", summation_type="PLAN", dmax=0.0,
+                      frame_of_reference_uid="1", sop_instance_uid="1")
+    nk, nj, ni = lin.shape
+    K, J, I = np.meshgrid(np.arange(nk), np.arange(nj), np.arange(ni), indexing="ij")
+    P = lin.index_to_patient(np.column_stack([K.ravel(), J.ravel(), I.ravel()]))
+    field_fn = lambda p: 10.0 + 0.5 * p[:, 0] + 0.25 * p[:, 1] - 0.1 * p[:, 2]
+    lin.array = field_fn(P).reshape(lin.shape).astype(np.float32)
+    grid_l = dm.build_fine_grid(lin, [-8, -8, -8], [8, 8, 8], 0.25)
+    for name, order in (("linear", 1), ("kubisch", 3)):
+        df = dm.sample_dose_on_grid(lin, grid_l, order)
+        exp = np.stack([field_fn(grid_l.plane_points(k)).reshape(len(grid_l.gy), len(grid_l.gx))
+                        for k in range(len(grid_l.gz))])
+        err = float(np.nanmax(np.abs(df - exp)))
+        check(f"Sampler {name}: lineares Feld exakt reproduziert", err < 2e-3, f"max|err|={err:.2e} Gy")
+    outside = dm.sample_dose_at_points(lin, np.array([[100.0, 0.0, 0.0]]))
+    check("Sampler: Punkt ausserhalb -> NaN", bool(np.isnan(outside[0])))
+
+    # 3) Kern-Mathematik mit analytischem Feld auf dem Feingitter
+    levels, _ = parse_isodose_levels("100,50", ph.RX)
+    contours = ph.contours()
+    cz = ph.contour_z
+    for res, tol_v, tol_ci, tol_gi, tol_hi, tol_d in ((0.25, 0.005, 0.005, 0.01, 0.01, 0.1),
+                                                    (1.0, 0.02, 0.02, 0.03, 0.03, 0.3)):
+        lo, hi = dm.contours_bbox([contours])
+        lb = dm.native_level_bbox(native, 0.5 * ph.RX)
+        grid = dm.build_fine_grid(native, np.minimum(lo, lb[0]), np.maximum(hi, lb[1]), res, contour_z=cz)
+        analytic = np.stack([ph.dose_at(grid.plane_points(k)).reshape(len(grid.gy), len(grid.gx))
+                             for k in range(len(grid.gz))]).astype(np.float32)
+        for model in ("slab", "eclipse"):
+            exp = ph.expected(model)
+            art = evaluate_on_grid(grid, analytic, native, None,
+                                   [{"name": "Kugel", "roi_number": 1, "contours": contours}],
+                                   ph.RX, "cli", levels, model, "global")
+            r = art.targets["Kugel"].result
+            c, ix, dv = r["components"], r["indices"], r["dvh_stats"]
+            ok_v = (rel(c["tv_cm3"], exp["tv"]) < tol_v and rel(c["piv_cm3"], exp["piv"]) < tol_v
+                    and rel(c["tv_piv_cm3"], exp["tv_piv"]) < tol_v and rel(c["piv50_cm3"], exp["piv50"]) < tol_v)
+            check(f"Phantom {res} mm/{model}: Volumina TV/PIV/TV&PIV/PIV50 innerhalb {tol_v*100:g} %", ok_v,
+                  f"TV {c['tv_cm3']:.4f}/{exp['tv']:.4f}, PIV {c['piv_cm3']:.4f}/{exp['piv']:.4f}, "
+                  f"I {c['tv_piv_cm3']:.4f}/{exp['tv_piv']:.4f}, PIV50 {c['piv50_cm3']:.3f}/{exp['piv50']:.3f}")
+            ok_i = (abs(ix["ci_paddick"] - exp["ci_paddick"]) < tol_ci and abs(ix["coverage"] - exp["coverage"]) < tol_ci
+                    and abs(ix["dice"] - exp["dice"]) < tol_ci and rel(ix["gi"], exp["gi"]) < tol_gi
+                    and abs(ix["gm_cm"] - exp["gm_cm"]) < 0.01 and abs(ix["hi_icru83"] - exp["hi"]) < tol_hi)
+            check(f"Phantom {res} mm/{model}: CI/Coverage/Dice/GI/GM/HI", ok_i,
+                  f"CI {ix['ci_paddick']:.4f}/{exp['ci_paddick']:.4f}, GI {ix['gi']:.3f}/{exp['gi']:.3f}, "
+                  f"GM {ix['gm_cm']:.3f}/{exp['gm_cm']:.3f}, HI {ix['hi_icru83']:.4f}/{exp['hi']:.4f}")
+            ok_d = (abs(dv["d2_gy"] - exp["d2"]) < tol_d and abs(dv["d50_gy"] - exp["d50"]) < tol_d
+                    and abs(dv["d98_gy"] - exp["d98"]) < tol_d and abs(dv["d95_gy"] - exp["d95"]) < tol_d
+                    and abs(dv["dmean_gy"] - exp["dmean"]) < tol_d)
+            check(f"Phantom {res} mm/{model}: D2/D50/D95/D98/Dmean innerhalb {tol_d:g} Gy", ok_d,
+                  f"D2 {dv['d2_gy']:.2f}/{exp['d2']:.2f}, D50 {dv['d50_gy']:.2f}/{exp['d50']:.2f}, "
+                  f"D98 {dv['d98_gy']:.2f}/{exp['d98']:.2f}, Dmean {dv['dmean_gy']:.2f}/{exp['dmean']:.2f}")
+            if res == 0.25 and model == "slab":
+                art_ref = art
+        # 4) volle Pipeline (Sampling vom nativen 0.5/1.0-mm-Gitter), nur slab, 0.25 mm
+        if res == 0.25:
+            exp = ph.expected("slab")
+            art_s = compute_dose_indices.__wrapped__(grid, native, contours, levels) \
+                if hasattr(compute_dose_indices, "__wrapped__") else None
+            df = dm.sample_dose_on_grid(native, grid, 1)
+            art_s = evaluate_on_grid(grid, df, native, None,
+                                     [{"name": "Kugel", "roi_number": 1, "contours": contours}],
+                                     ph.RX, "cli", levels, "slab", "global")
+            r = art_s.targets["Kugel"].result
+            c, ix = r["components"], r["indices"]
+            check("Pipeline 0.25 mm (Sampling linear vom nativen Gitter): Volumina innerhalb 1.5 %, CI +-0.015",
+                  rel(c["tv_cm3"], exp["tv"]) < 0.015 and rel(c["piv_cm3"], exp["piv"]) < 0.015
+                  and abs(ix["ci_paddick"] - exp["ci_paddick"]) < 0.015 and rel(ix["gi"], exp["gi"]) < 0.03,
+                  f"PIV {c['piv_cm3']:.4f}/{exp['piv']:.4f}, CI {ix['ci_paddick']:.4f}/{exp['ci_paddick']:.4f}")
+
+    # 5) Volumenmodelle: TV_slab - TV_eclipse = 0.5*(A_erste + A_letzte)*dz
+    e_s, e_e = ph.expected("slab"), ph.expected("eclipse")
+    r = art_ref.targets["Kugel"].result
+    diff = r["volume_models"]["slab"]["tv_cm3"] - r["volume_models"]["eclipse"]["tv_cm3"]
+    check("Volumenmodell: TV_slab - TV_eclipse = halbe Endschichten (2 %)", rel(diff, e_s["tv"] - e_e["tv"]) < 0.02,
+          f"{diff:.5f} vs {e_s['tv'] - e_e['tv']:.5f} cm3")
+    pv_s = dm.planimetric_volume_cm3(contours, "slab")
+    pv_e = dm.planimetric_volume_cm3(contours, "eclipse")
+    check("Planimetrie slab/eclipse = Erwartung (1e-6)", rel(pv_s, e_s["tv"]) < 1e-6 and rel(pv_e, e_e["tv"]) < 1e-6,
+          f"{pv_s:.5f}/{e_s['tv']:.5f}, {pv_e:.5f}/{e_e['tv']:.5f}")
+
+    # 6) Ring-Ziel (Loch): XOR-Raster = Planimetrie, n_holes = 20
+    ring = [c for z in cz for c in (ana._synthetic_circle(z, 8.0), ana._synthetic_circle(z, 4.0))]
+    grid_r = dm.build_fine_grid(native, [-10, -10, -10], [10, 10, 10], 0.25, contour_z=cz)
+    smr = dm.rasterize_structure(ring, grid_r, "slab", "Ring", 2)
+    check("Ring-Ziel: Rastervolumen = Even-Odd-Planimetrie (0.5 %), 20 Loecher",
+          rel(smr.volume_cm3(grid_r), dm.planimetric_volume_cm3(ring)) < 0.005 and smr.n_holes == 20,
+          f"{smr.volume_cm3(grid_r):.4f} vs {dm.planimetric_volume_cm3(ring):.4f}, holes={smr.n_holes}")
+
+    # 7) Komponenten-Scope: zweiter Hotspot bei (32,0,0) mit eigenem Ziel bei (30,0,0)
+    #    (groesseres natives Gitter, damit beide Isodosen vollstaendig enthalten sind)
+    wide = ph.native_grid(extent=48.0, res_xy=1.0)
+    nk2, nj2, ni2 = wide.shape
+    K, J, I = np.meshgrid(np.arange(nk2), np.arange(nj2), np.arange(ni2), indexing="ij")
+    P = wide.index_to_patient(np.column_stack([K.ravel(), J.ravel(), I.ravel()]))
+    two = np.maximum(wide.array, ph.dose_at(P, center=[32.0, 0.0, 0.0]).reshape(wide.shape).astype(np.float32))
+    dose2 = dm.DoseGrid(array=two, affine=wide.affine.copy(), spacing=wide.spacing,
+                        origin=wide.origin.copy(), units="GY", dose_type="PHYSICAL",
+                        summation_type="PLAN", dmax=float(two.max()), frame_of_reference_uid="1",
+                        sop_instance_uid="2")
+    c1, c2 = ph.contours(), ph.contours(center=(30.0, 0.0, 0.0))
+    lo, hi = dm.contours_bbox([c1, c2])
+    lb = dm.native_level_bbox(dose2, 0.5 * ph.RX)
+    grid2 = dm.build_fine_grid(dose2, np.minimum(lo, lb[0]), np.maximum(hi, lb[1]), 0.5, contour_z=cz)
+    df2 = dm.sample_dose_on_grid(dose2, grid2, 1)
+    specs2 = [{"name": "A", "roi_number": 1, "contours": c1}, {"name": "B", "roi_number": 2, "contours": c2}]
+    art_g = evaluate_on_grid(grid2, df2, dose2, None, specs2, ph.RX, "cli", levels, "slab", "global")
+    art_c = evaluate_on_grid(grid2, df2, dose2, None, specs2, ph.RX, "cli", levels, "slab", "component")
+    piv_g = art_g.targets["A"].result["components"]["piv_cm3"]
+    piv_c = art_c.targets["A"].result["components"]["piv_cm3"]
+    exp = ph.expected("slab")
+    check("Komponenten-Scope: global PIV = 2 Hotspots, component PIV = 1 Hotspot",
+          rel(piv_g, 2 * exp["piv"]) < 0.03 and rel(piv_c, exp["piv"]) < 0.03
+          and art_c.levels["100"].n_components == 2 and art_g.global_result is not None,
+          f"global {piv_g:.3f}, component {piv_c:.3f}, Erwartung {exp['piv']:.3f}, "
+          f"CI_A component {art_c.targets['A'].result['indices']['ci_paddick']:.3f}")
+
+    # 8) Roundtrip Maske -> Konturen -> Maske
+    d_iso = dm.contours_roundtrip_dice(art_ref.levels["100"].mask, art_ref.grid)
+    d_tv = dm.contours_roundtrip_dice(art_ref.targets["Kugel"].structure.mask, art_ref.grid)
+    check("Roundtrip mask_to_contours -> rasterize: Dice > 0.99 (Isodose) / > 0.995 (Ziel)",
+          d_iso > 0.99 and d_tv > 0.995, f"Dice iso={d_iso:.4f}, Ziel={d_tv:.4f}")
+
+    n_fail = results.count(False)
+    print("-" * 70)
+    print(f"Gesamt: {'PASS' if n_fail == 0 else 'FAIL'}  "
+          f"({len(results) - n_fail}/{len(results)} Pruefungen bestanden)")
+    return 0 if n_fail == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# 7. CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m dicom_file_modifier.dose_indices",
+        description="Dosisindizes (Paddick-CI, GI, HI ICRU83, ...) aus RTSTRUCT + RTDOSE (+ RTPLAN) "
+                    "und separate RTSTRUCT mit Isodosen- und Schnittkonturen.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Beispiele:
+  %(prog)s data/<case-id>
+  %(prog)s data/<case-id> --target PTV_1 --grid 0.5 --volume-model eclipse
+  %(prog)s --rs RS.dcm --rd RD.dcm --rx 20 --isodose 100,80,50,12Gy
+  %(prog)s data/<case-id> --list
+  %(prog)s --self-test
+""",
+    )
+    p.add_argument("case_dir", nargs="?", default=None,
+                   help="Case-Ordner mit RS*.dcm, RD*.dcm, optional RP*.dcm und CT/ (fuer den RS-Export)")
+    p.add_argument("--rs", dest="rs", default=None, help="RTSTRUCT-Datei (Override)")
+    p.add_argument("--rd", dest="rd", default=None, help="RTDOSE-Datei (Override)")
+    p.add_argument("--rp", dest="rp", default=None, help="RTPLAN-Datei (Override, fuer die Verschreibung)")
+    p.add_argument("--list", action="store_true", help="ROI-Tabelle und Verschreibungen anzeigen, dann Ende")
+    p.add_argument("--target", default=None,
+                   help="Zielvolumen NAME[,NAME...] (exakt oder eindeutiger Teilstring); Default: PTV automatisch")
+    p.add_argument("--rx", type=float, default=None, help="Verschreibungsdosis in Gy (Default: RTPLAN)")
+    p.add_argument("--rx-pct-of-max", type=float, default=None,
+                   help="Verschreibung als Prozent der Maximaldosis (SRS-Konvention), z.B. 80")
+    p.add_argument("--isodose", default=DEFAULT_ISODOSE,
+                   help=f"Isodosen-Level in %% von Rx oder absolut mit Gy (z.B. 100,80,50,12Gy); Default {DEFAULT_ISODOSE}")
+    p.add_argument("--grid", type=float, default=0.25, choices=GRID_CHOICES,
+                   help="In-Plane-Aufloesung des Feingitters in mm (z bleibt auf den Dosisebenen); Default 0.25")
+    p.add_argument("--dose-interp", choices=("linear", "cubic"), default="linear",
+                   help="Dosis-Interpolation: linear (Default) oder cubic (B-Spline)")
+    p.add_argument("--volume-model", choices=("slab", "eclipse"), default="slab",
+                   help="slab = jede Konturschicht volle Dicke (Default); eclipse = Endschichten halb")
+    p.add_argument("--piv-scope", choices=("global", "component"), default="component",
+                   help="PIV global oder nur die Isodosen-Komponente(n), die das Ziel ueberlappen (Default)")
+    p.add_argument("--output", "-o", default="output", help="Basis-Ausgabeordner (Default: output)")
+    p.add_argument("--label", default="_IDX", help="Suffix fuer Ausgabeordner/RS-Datei/StructureSetLabel (Default _IDX)")
+    p.add_argument("--no-rs", action="store_true", help="Keine Isodosen-RTSTRUCT schreiben")
+    p.add_argument("--include-target", action="store_true", help="Zielkopie(n) mit in die Isodosen-RTSTRUCT schreiben")
+    p.add_argument("--simplify-mm", type=float, default=0.1,
+                   help="Douglas-Peucker-Toleranz der Isodosen-Konturen in mm (< Raster/2; Default 0.1)")
+    p.add_argument("--transfer-syntax", choices=("explicit", "implicit"), default="explicit",
+                   help="Transfer-Syntax der RS-Datei (Default explicit VR little endian)")
+    p.add_argument("--max-name-len", type=int, default=64, help="Maximale ROI-Namenslaenge (Default 64)")
+    p.add_argument("--iso-contours", choices=("mask", "field"), default="mask",
+                   help="Isodosen-Konturen aus der Maske (Kantenmitten, Default) oder als Feld-Isolinie "
+                        "(Vertices auf den Gitterlinien wie in Eclipse)")
+    p.add_argument("--eclipse-compat", choices=("high", "default"), default=None,
+                   help="Alles auf Eclipse-Konventionen setzen: Feingitter auf dem CT-Pixelraster "
+                        "(high = 1 Pixel auf den Pixelzentren, default = 2 Pixel mit Halbpixel-Versatz), "
+                        "Volumenmodell eclipse, PIV global, linear, Feld-Isolinien ohne Vereinfachung")
+    p.add_argument("--append-csv", default=None, help="Ergebniszeilen zusaetzlich an diese Sammel-CSV anhaengen")
+    p.add_argument("--no-viz", action="store_true", help="(reserviert) Visualisierung ueberspringen")
+    p.add_argument("--self-test", action="store_true", help="Analytischer Phantomtest; Exit 0 = pass")
+    return p
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        if args.self_test:
+            return _run_self_test()
+        if args.list:
+            return list_rois(args.case_dir, args.rs, args.rd, args.rp)
+        if args.case_dir is None and (args.rs is None or args.rd is None):
+            print("Fehler: Case-Ordner oder --rs und --rd angeben (siehe --help).", file=sys.stderr)
+            return 2
+        if args.no_viz:
+            print("  Hinweis: --no-viz ist reserviert (Visualisierung folgt als eigenes Arbeitspaket).")
+        run_dose_indices(
+            args.case_dir, rs=args.rs, rd=args.rd, rp=args.rp, target=args.target, rx=args.rx,
+            rx_pct_of_max=args.rx_pct_of_max, isodose=args.isodose, grid_mm=args.grid,
+            dose_interp=args.dose_interp, volume_model=args.volume_model, piv_scope=args.piv_scope,
+            output=args.output, label=args.label, write_rs=not args.no_rs,
+            include_target=args.include_target, simplify_mm=args.simplify_mm,
+            transfer_syntax=args.transfer_syntax, max_name_len=args.max_name_len,
+            append_csv=args.append_csv, eclipse_compat=args.eclipse_compat,
+            iso_contours=args.iso_contours,
+        )
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        print(f"\nFehler: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
