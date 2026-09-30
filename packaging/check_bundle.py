@@ -2,6 +2,7 @@
 Pruefung des onedir-Bundles (Standard ``dist/DICOM-RT-Toolkit``); Exit 0 = ok.
 
   - Groesse unter MAX_MB, keine DICOM-Dateien im Bundle, App-Icon in beiden EXEs
+  - LICENSE.txt und THIRD-PARTY-NOTICES.txt (Qt/PySide6 unter LGPL, GEOS) neben den EXEs
   - dfm.exe: Versionen (alle Bibliotheken gefunden), alle Self-Tests,
     Demo-Fall, Dosisindizes mit Validierungsansicht (plotly, matplotlib),
     Transformation mit Vorher/Nachher-Ansichten
@@ -86,6 +87,12 @@ def main(argv=None) -> int:
     bad = dicom_files(bundle)
     if bad:
         errors.append("DICOM-Dateien im Bundle: " + ", ".join(str(p.relative_to(bundle)) for p in bad[:10]))
+    for name, needles in (("LICENSE.txt", ("MIT License",)),
+                          ("THIRD-PARTY-NOTICES.txt", ("Qt 6", "PySide6", "GEOS", "GNU LESSER GENERAL PUBLIC LICENSE"))):
+        path = bundle / name
+        text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        if not text or any(n not in text for n in needles):
+            errors.append(f"{name} fehlt oder ist unvollstaendig")
 
     tmp = Path(tempfile.mkdtemp(prefix="dfm_b_"))
     try:

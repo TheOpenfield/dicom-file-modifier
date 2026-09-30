@@ -33,7 +33,8 @@ ABOUT_HTML = (
     "validiert oder zertifiziert; nicht zum Erstellen, Ändern oder Prüfen von Daten für die "
     "Behandlung von Patientinnen und Patienten verwenden. Alle Ergebnisse vor jeder klinischen "
     "Verwendung unabhängig durch qualifizierte Medizinphysik prüfen. Nutzung auf eigene Gefahr."
-    "<br><br>Lizenz: MIT")
+    "<br><br>Lizenz: MIT. Enthält Qt 6 und PySide6 (LGPL v3), GEOS (LGPL v2.1) und weitere "
+    "Open-Source-Komponenten; Hinweise und Lizenztexte in THIRD-PARTY-NOTICES.txt im Programmordner.")
 
 
 @dataclass

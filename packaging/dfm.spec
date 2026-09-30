@@ -7,7 +7,10 @@
 #   .venv/Scripts/python packaging/check_bundle.py
 # (ein einfaches "uv sync" entfernt Extra und Gruppe wieder)
 # Kein onefile (entpackt bei jedem Start nach %TEMP%), kein UPX (Virenscanner).
+# Neben den EXEs liegen LICENSE.txt und THIRD-PARTY-NOTICES.txt (third_party_notices.py).
 
+import shutil
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules, copy_metadata
@@ -52,3 +55,12 @@ gui_exe = EXE(PYZ(gui.pure), gui.scripts, [], exclude_binaries=True, name="DICOM
               console=False, upx=False, icon=ICON)
 COLLECT(gui_exe, gui.binaries, gui.datas, cli_exe, cli.binaries, cli.datas,
         name="DICOM-RT-Toolkit", upx=False)
+
+# Eigene Lizenz und Lizenzhinweise Dritter neben die EXEs (check_bundle.py prueft beide)
+sys.path.insert(0, str(ROOT / "packaging"))
+from third_party_notices import bundled_names, write_notices
+from dicom_file_modifier import __version__
+
+BUNDLE = Path(DISTPATH) / "DICOM-RT-Toolkit"
+shutil.copyfile(ROOT / "LICENSE", BUNDLE / "LICENSE.txt")
+write_notices(bundled_names(cli, gui), BUNDLE / "THIRD-PARTY-NOTICES.txt", __version__)
