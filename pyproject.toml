@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dicom-file-modifier"
-version = "0.1.0"
+version = "1.2.0"
 description = "Research toolkit for DICOM RT: RTSTRUCT analysis, rigid CT + RTSTRUCT transforms and dose indices (CI, GI, HI). Not a medical device."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -41,7 +41,6 @@ dicom-rt-toolkit = "dicom_file_modifier.gui.app:main"
 [project.optional-dependencies]
 gui = [
     "PySide6-Essentials>=6.10,<6.11",
-    "pyqtgraph>=0.13.7",
 ]
 
 [project.urls]

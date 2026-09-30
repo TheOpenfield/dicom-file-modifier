@@ -22,6 +22,7 @@ def test_version_is_the_same_everywhere(capsys):
     assert cli.main(["--version", "--json"]) == 0
     info = json.loads(capsys.readouterr().out)
     assert info["dfm"] == dicom_file_modifier.__version__
+    assert info["tools"] == {"dose_indices": dicom_file_modifier.__version__}     # eine Nummer fuer alles
     assert set(info["packages"]) == set(cli.PACKAGES) and all(info["packages"].values())
 
 

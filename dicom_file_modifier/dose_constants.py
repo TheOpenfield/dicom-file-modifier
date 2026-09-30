@@ -3,11 +3,13 @@ dose_constants.py - Gemeinsame Konstanten der Dosisindex-Module.
 
 Eigenes Modul, damit ``rtstruct_writer`` und ``dose_viz`` die Konstanten ohne
 Import von ``dose_indices`` nutzen koennen (sonst entstuende ein Import-Zyklus).
-Das Modul importiert nichts.
+Das Modul importiert nur die Paketversion.
 """
 
+from . import __version__
+
 TOOL_NAME = "dose_indices"
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = __version__          # eine Nummer fuer Paket, Werkzeuge und Bundle
 
 # Farbvorschlaege (RGB) fuer Isodosen-ROIs nach Prozent-Level
 LEVEL_COLORS = {
