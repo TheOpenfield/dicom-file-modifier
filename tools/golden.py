@@ -8,13 +8,16 @@ vergleicht zwei Laeufe exakt oder mit Migrationstoleranzen.
 
   python tools/golden.py make-inputs [--work DIR]
   python tools/golden.py run --label G0 [--work DIR] [--only MUSTER] [--real CASE ...]
-  python tools/golden.py compare G0 G3 [--work DIR] [--mode exact|migration] [--expected]
+  python tools/golden.py compare G0 G3 [--work DIR] [--mode exact|migration] [--expected] [--stats]
 
 Arbeitsordner (Default ``%USERPROFILE%\\dfm-golden``) liegt bewusst ausserhalb
 des Repos: ``inputs/`` (synthetische Demo-Faelle + Manifest), ``runs/<label>/``
 (Schnappschuesse, stdout/stderr, Pixel-Arrays).  Echte Faelle (``--real``)
 werden nur lokal ausgefuehrt; ihr Ordnername wird in Schnappschuessen und
 Berichten durch ``REAL<n>`` ersetzt, Textdiffs zeigen dort keinen Inhalt.
+Je CLI-Aufruf werden Laufzeit und (unter Windows) Peak-Speicher mitgeschrieben;
+``compare --stats`` haengt Driftstatistik, Laufzeit/Speicher und
+stderr-Warnungen an den Bericht an.
 
 Laeuft auf Python >= 3.8 (auch in der alten Umgebung, siehe Plan P0.2).
 Konsolenausgabe ist ASCII.
@@ -90,8 +93,7 @@ SCENARIOS = [
     _sc("mod_viz", "modifier", ["{ct}", "--tx", "5", "--rz", "10", "--output", "{out}"], case="std"),
     _sc("mod_flat", "modifier", ["{case}", "--tx", "3", "--no-viz", "--output", "{out}"], case="flat",
         tags=["known_bug"]),
-    _sc("mod_rle", "modifier", ["{ct}", "--tx", "3", "--no-viz", "--output", "{out}"], case="rle",
-        tags=["known_bug"]),
+    _sc("mod_rle", "modifier", ["{ct}", "--tx", "3", "--no-viz", "--output", "{out}"], case="rle"),
     # case_modifier
     _sc("cm_list_markers", "case_modifier", ["{case}", "--list-markers"], case="std"),
     _sc("cm_dry", "case_modifier", ["{case}"] + T6 + ["--center", "marker:HS1", "--dry-run", "--output", "{out}"],
@@ -109,7 +111,7 @@ SCENARIOS = [
     _sc("cm_flat", "case_modifier", ["{case}", "--tx", "3", "--center", "volume", "--no-viz",
                                      "--output", "{out}"], case="flat"),
     _sc("cm_rle", "case_modifier", ["{case}", "--tx", "3", "--center", "volume", "--no-viz",
-                                    "--output", "{out}"], case="rle", tags=["known_bug"]),
+                                    "--output", "{out}"], case="rle"),
     # dose_indices
     _sc("dose_default", "dose_indices", ["{case}", "--output", "{out}"], case="std"),
     _sc("dose_list", "dose_indices", ["{case}", "--list"], case="std"),
@@ -292,7 +294,9 @@ def _png_dims(p: Path):
 
 
 def _dicom_value(elem, norm: Normalizer):
-    vr = str(elem.VR)
+    # pydicom 2.4 legt aufgeloeste mehrdeutige VRs als Enum ab; str() ergibt dort
+    # unter Python < 3.11 'VR.US' statt 'US'
+    vr = str(getattr(elem.VR, "value", elem.VR))
     val = elem.value
     if val is None or val == "":
         return None
@@ -308,27 +312,55 @@ def _dicom_value(elem, norm: Normalizer):
         seq = val if (isinstance(val, (list, tuple)) or type(val).__name__ == "MultiValue") else [val]
         out = [str(getattr(v, "original_string", None) or v).strip() for v in seq]
         return out if len(out) != 1 else out[0]
-    if vr in ("FL", "FD", "SL", "SS", "UL", "US", "SV", "UV"):
-        seq = val if (isinstance(val, (list, tuple)) or type(val).__name__ == "MultiValue") else [val]
+    seq = val if (isinstance(val, (list, tuple)) or type(val).__name__ == "MultiValue") else [val]
+    # Mehrdeutiger VR ("US or SS"): pydicom 3 loest ihn beim Lesen auf, pydicom 2 nicht
+    ambiguous_int = " or " in vr and all(isinstance(v, int) and not isinstance(v, bool) for v in seq)
+    if vr in ("FL", "FD", "SL", "SS", "UL", "US", "SV", "UV") or ambiguous_int:
         out = [float(v) if vr in ("FL", "FD") else int(v) for v in seq]
         return out if len(out) != 1 else out[0]
     if vr == "AT":
-        seq = val if (isinstance(val, (list, tuple)) or type(val).__name__ == "MultiValue") else [val]
-        out = [str(v) for v in seq]
+        out = [_tag_key(str(v)) for v in seq]
         return out if len(out) != 1 else out[0]
     if isinstance(val, (list, tuple)) or type(val).__name__ == "MultiValue":
         return [norm.text(str(v)) for v in val]
     return norm.text(str(val))
 
 
+# Abgeleitete Laenge: haengt von den UID-Laengen ab, und pydicom 3 erzeugt
+# zufaellige UIDs mit 62-64 statt immer 64 Zeichen.  Die Elemente selbst
+# werden einzeln verglichen.
+_META_IGNORE = ("FileMetaInformationGroupLength",)
+
+
+_TAG_KEY_RE = re.compile(r"^\(([0-9A-Fa-f]{4}),\s*([0-9A-Fa-f]{4})\)$")
+
+
+def _tag_key(key: str) -> str:
+    """Tag ohne Keyword einheitlich '(gggg,eeee)' (pydicom 2: '(0009, 0010)', 3: '(0009,0010)')."""
+    m = _TAG_KEY_RE.match(key)
+    return f"({m.group(1).lower()},{m.group(2).lower()})" if m else key
+
+
+def _canon_tag_keys(obj):
+    """Tag-Schluessel und AT-Werte alter Schnappschuesse einheitlich schreiben."""
+    if isinstance(obj, dict):
+        return {_tag_key(k): _canon_tag_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_canon_tag_keys(v) for v in obj]
+    return _tag_key(obj) if isinstance(obj, str) else obj
+
+
 def _dicom_elements(ds, norm: Normalizer) -> dict:
     out = {}
     for elem in ds:
-        key = elem.keyword or str(elem.tag)
+        key = elem.keyword or _tag_key(str(elem.tag))
         if key == "PixelData":
             continue
         if key == "ImplementationVersionName":
             out[key] = "<IVN>"
+            continue
+        if key in _META_IGNORE:
+            out[key] = "<GL>"
             continue
         if str(elem.VR) == "SQ":
             out[key] = [_dicom_elements(item, norm) for item in elem.value]
@@ -459,6 +491,165 @@ def _expand(arg: str, ctx: dict) -> str:
     return out
 
 
+class _JobMeter:
+    """
+    Peak-Speicher eines Kindprozesses samt Enkeln ueber ein Windows-Job-Objekt.
+    Noetig, weil ``python.exe`` einer venv nur ein Launcher ist, der den
+    Interpreter als eigenen Prozess startet.  Das Kind startet angehalten
+    (CREATE_SUSPENDED), wird dem Job zugeordnet und erst dann fortgesetzt, damit
+    kein Enkel am Job vorbei entsteht.  Gemessen werden der Peak Working Set
+    (physischer Speicher; ein Thread oeffnet dazu jeden Prozess des Jobs,
+    solange er laeuft) und der Peak-Commit.  Der Commit enthaelt die Puffer,
+    die OpenBLAS beim Import je Thread zusagt: je rund 30 MB pro logischem Kern
+    fuer numpy und fuer scipy (eigene Kopie), bei 24 Kernen gut 1,5 GB schon
+    bei kleinen Laeufen; mit OPENBLAS_NUM_THREADS=1 nur rund 40 MB.
+    Ausserhalb von Windows oder bei einem Fehler bleibt die Messung leer; der
+    Lauf selbst ist davon nie betroffen.
+    """
+
+    CREATE_SUSPENDED = 0x00000004
+    KILL_ON_JOB_CLOSE = 0x00002000
+    BASIC_PROCESS_ID_LIST = 3
+    EXTENDED_LIMIT_INFORMATION = 9
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def __init__(self):
+        self.job = None
+        self._handles: Dict[int, int] = {}
+        self._thread = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Basic(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class _Extended(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", _Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                            ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            for fn in (k32.SetInformationJobObject, k32.QueryInformationJobObject):
+                fn.restype = wintypes.BOOL
+            k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                    wintypes.DWORD]
+            k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                      wintypes.DWORD, ctypes.c_void_p]
+            class _PidList(ctypes.Structure):
+                _fields_ = [("NumberOfAssignedProcesses", wintypes.DWORD),
+                            ("NumberOfProcessIdsInList", wintypes.DWORD), ("ProcessIdList", ctypes.c_size_t * 64)]
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            k32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            ntdll = ctypes.WinDLL("ntdll")
+            ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+            ntdll.NtResumeProcess.restype = ctypes.c_long
+            self._ct, self._k32, self._ntdll = ctypes, k32, ntdll
+            self._Extended, self._PidList, self._Counters = _Extended, _PidList, _Counters
+            job = k32.CreateJobObjectW(None, None)
+            if job:
+                info = _Extended()
+                info.BasicLimitInformation.LimitFlags = self.KILL_ON_JOB_CLOSE   # Baum stirbt mit dem Harness
+                k32.SetInformationJobObject(job, self.EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+                                            ctypes.sizeof(info))
+                self.job = job
+        except Exception:  # noqa: BLE001 - Messung ist optional
+            self.job = None
+
+    def popen(self, args: list, **kw):
+        if not self.job:
+            return subprocess.Popen(args, **kw)
+        proc = subprocess.Popen(args, creationflags=self.CREATE_SUSPENDED, **kw)
+        handle = int(proc._handle)
+        try:
+            assigned = bool(self._k32.AssignProcessToJobObject(self.job, handle))
+        except Exception:  # noqa: BLE001
+            assigned = False
+        if self._ntdll.NtResumeProcess(handle) != 0:
+            # sollte nie passieren; ohne Messung neu starten
+            proc.kill()
+            proc.communicate()
+            self.close()
+            return subprocess.Popen(args, **kw)
+        if not assigned:
+            self.close()
+            return proc
+        import threading
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+        return proc
+
+    def _watch(self) -> None:
+        """Jeden Prozess des Jobs oeffnen, solange er laeuft (Handle haelt die Zaehler)."""
+        ct, k32 = self._ct, self._k32
+        lst = self._PidList()
+        while True:
+            if k32.QueryInformationJobObject(self.job, self.BASIC_PROCESS_ID_LIST, ct.byref(lst),
+                                             ct.sizeof(lst), None):
+                for pid in lst.ProcessIdList[:lst.NumberOfProcessIdsInList]:
+                    if pid not in self._handles:
+                        h = k32.OpenProcess(self.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                        if h:
+                            self._handles[pid] = h
+            if self._stop.wait(0.01):
+                return
+
+    def peak_mb(self) -> tuple:
+        """(Peak Working Set, Peak-Commit) des groessten Prozesses im Baum, in MB."""
+        if not self.job:
+            return None, None
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            self._thread = None
+        ws = None
+        for h in self._handles.values():
+            c = self._Counters()
+            c.cb = self._ct.sizeof(c)
+            if self._k32.K32GetProcessMemoryInfo(h, self._ct.byref(c), c.cb):
+                ws = max(ws or 0.0, c.PeakWorkingSetSize / 2 ** 20)
+        info = self._Extended()
+        ok = self._k32.QueryInformationJobObject(self.job, self.EXTENDED_LIMIT_INFORMATION,
+                                                 self._ct.byref(info), self._ct.sizeof(info), None)
+        commit = info.PeakProcessMemoryUsed / 2 ** 20 if ok else None
+        return (None if ws is None else round(ws, 1)), (None if commit is None else round(commit, 1))
+
+    def close(self) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            self._thread = None
+        for h in self._handles.values():
+            self._k32.CloseHandle(h)
+        self._handles.clear()
+        if self.job:
+            self._k32.CloseHandle(self.job)
+            self.job = None
+
+
 def _run_one(sc: dict, sdir: Path, ctx_paths: dict, replacements: list, save_arrays: bool) -> dict:
     import numpy as np
 
@@ -476,19 +667,27 @@ def _run_one(sc: dict, sdir: Path, ctx_paths: dict, replacements: list, save_arr
         argv = [_expand(a, ctx) for a in argv_t]
         head = ([sys.executable, str(Path(__file__).resolve().with_name(sc["script"]))] if sc.get("script")
                 else [sys.executable, "-m", "dicom_file_modifier." + sc["module"]])
+        meter = _JobMeter()
         t0 = time.perf_counter()
         try:
-            p = subprocess.run(head + argv,
-                               cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, timeout=sc["timeout"])
-            code, so, se = p.returncode, p.stdout, p.stderr
-        except subprocess.TimeoutExpired as e:
-            code, so, se = "timeout", e.stdout or b"", e.stderr or b""
-        dt = time.perf_counter() - t0
+            proc = meter.popen(head + argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                so, se = proc.communicate(timeout=sc["timeout"])
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                so, se = proc.communicate()
+                code = "timeout"
+            dt = time.perf_counter() - t0
+            peak = meter.peak_mb()
+        finally:
+            meter.close()
         (sdir / f"stdout_{i}.txt").write_bytes(so)
         (sdir / f"stderr_{i}.txt").write_bytes(se)
         step_results.append({
             "argv": [norm.text(a) for a in argv], "exit_code": code, "duration_s": round(dt, 2),
+            "peak_ws_mb": peak[0], "peak_commit_mb": peak[1],
             "stdout": norm.text(so.decode("utf-8", "replace")).splitlines(),
             "stderr_tail": norm.text(se.decode("utf-8", "replace")).splitlines()[-25:],
         })
@@ -555,10 +754,12 @@ def cmd_run(args) -> int:
         t0 = time.perf_counter()
         snap = _run_one(sc, run_dir / sc["name"], ctx, repl, save_arrays=not args.no_arrays)
         codes = [s["exit_code"] for s in snap["steps"]]
-        meta["scenarios"][sc["name"]] = {"exit_codes": codes, "duration_s": round(time.perf_counter() - t0, 1),
-                                         "tags": sc["tags"]}
+        dur, peak_ws, peak_commit = _step_usage(snap)
+        meta["scenarios"][sc["name"]] = {"exit_codes": codes, "tags": sc["tags"], "duration_s": round(dur, 1),
+                                         "peak_ws_mb": peak_ws, "peak_commit_mb": peak_commit}
         print(f"  {sc['name']:24s} exit {','.join(str(c) for c in codes):8s} "
-              f"{time.perf_counter() - t0:6.1f} s  {len(snap['files']):4d} Dateien")
+              f"{time.perf_counter() - t0:6.1f} s  {len(snap['files']):4d} Dateien"
+              + (f"  {peak_ws:7.0f} MB" if peak_ws is not None else ""))
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"Lauf {args.label}: {len(jobs)} Szenarien in {time.perf_counter() - t_all:.0f} s -> {run_dir}")
     return 0
@@ -581,6 +782,7 @@ def _git_head() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _NUM_RE = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
+_INT_RE = re.compile(r"^\s*[-+]?\d+\s*$")
 
 
 def _decimals(s: str) -> int:
@@ -604,14 +806,26 @@ class Rules:
         mig = data.get("migration", {})
         self.float_rules = mig.get("float_rules", [])
         self.pixel_rules = mig.get("pixel_rules", [])
+        self.contour = {k: v for k, v in mig.get("contour", {}).items() if not k.startswith("_")}
         self.expected = {k: v for k, v in data.get("expected_changes", {}).items() if not k.startswith("_")}
+        # --stats: jede numerische Abweichung (auch innerhalb der Toleranz) als
+        # (file, path, a, b, regel, toleranz, ok)
+        self.recorder: Optional[list] = None
 
     def tol_ok(self, a: float, b: float, file: str, path: str, a_str: str = "", b_str: str = "") -> bool:
         if a == b:
             return True
+        ok, label, tol = self._judge(a, b, file, path, a_str, b_str)
+        if self.recorder is not None:
+            self.recorder.append((file, path, float(a), float(b), label, tol, ok))
+        return ok
+
+    def _judge(self, a: float, b: float, file: str, path: str, a_str: str, b_str: str) -> tuple:
+        """(ok, Regel, Toleranz) fuer zwei verschiedene Zahlen."""
         if self.mode == "exact":
-            return False
+            return False, "exact", 0.0
         key = path.rsplit(".", 1)[-1] if path else ""
+        label = "Default (letzte Stelle)"
         for r in self.float_rules:
             if "file" in r and not fnmatch.fnmatch(file, r["file"]):
                 continue
@@ -620,14 +834,18 @@ class Rules:
             if "path" in r and not fnmatch.fnmatch(path, r["path"]):
                 continue
             if r.get("last_digit"):
+                label = _rule_label(r)
                 break
             tol = max(float(r.get("abs", 0.0)), float(r.get("rel", 0.0)) * max(abs(a), abs(b)))
-            return abs(a - b) <= tol * (1 + 1e-9)
-        # Default: 1 Einheit der letzten gedruckten Stelle
+            return abs(a - b) <= tol * (1 + 1e-9), _rule_label(r), tol
+        # Default: 1 Einheit der letzten gedruckten Stelle; Ganzzahlen (IS,
+        # Zaehlwerte in Text/CSV) exakt
         sa = a_str or repr(float(a))
         sb = b_str or repr(float(b))
-        dec = max(_decimals(sa), _decimals(sb))
-        return abs(a - b) <= 10.0 ** (-dec) * (1 + 1e-9)
+        if _INT_RE.match(sa) and _INT_RE.match(sb):
+            return False, "Ganzzahl (exakt)", 0.0
+        tol = 10.0 ** (-max(_decimals(sa), _decimals(sb)))
+        return abs(a - b) <= tol * (1 + 1e-9), label, tol
 
     def pixel_rule(self, scenario: str) -> dict:
         for r in self.pixel_rules:
@@ -636,8 +854,15 @@ class Rules:
         return {"max_abs": 0, "max_frac": 0.0}
 
 
+def _rule_label(r: dict) -> str:
+    sel = " ".join(f"{k}={r[k]}" for k in ("file", "key", "path") if k in r)
+    if r.get("last_digit"):
+        return sel + " (letzte Stelle)"
+    return sel + " (" + ", ".join(f"{k} {float(r[k]):g}" for k in ("abs", "rel") if k in r) + ")"
+
+
 class Diff:
-    def __init__(self, redact: bool):
+    def __init__(self, redact: bool, count: bool = False):
         self.redact = redact
         self.fails: List[str] = []
         self.warns: List[str] = []
@@ -646,6 +871,10 @@ class Diff:
         self.pix_diff = 0
         self.pix_max = 0
         self.pix_files = 0
+        # --stats: numerische Werte in Dateien (auch gleiche) und alle Abweichungen
+        self.count = count
+        self.n_num = 0
+        self.drift: List[tuple] = []
 
     def fail(self, msg: str):
         self.fails.append(msg)
@@ -654,9 +883,69 @@ class Diff:
         self.warns.append(msg)
 
 
+def _contour_len_differs(a: dict, b: dict) -> bool:
+    ca, cb = a.get("ContourData"), b.get("ContourData")
+    return isinstance(ca, list) and isinstance(cb, list) and len(ca) != len(cb)
+
+
+def _cmp_ring(a: dict, b: dict, rules: Rules, file: str, path: str, diff: Diff) -> None:
+    """
+    Migrationsmodus: ein Konturring mit anderer Punktzahl (z.B. andere
+    Vereinfachung durch eine neue GEOS-Version) wird geometrisch verglichen.
+    Gleiche Ebene; Hausdorff <= simplify_mm + extra_mm; ist ein Ring keine
+    Vertex-Teilmenge des anderen, zusaetzlich XOR-Flaeche <= xor_frac.
+    """
+    p = f"{path}.ContourData" if path else "ContourData"
+    sa, sb = a["ContourData"], b["ContourData"]
+    va, vb = [_num(v) for v in sa], [_num(v) for v in sb]
+    if None in va or None in vb or len(va) % 3 or len(vb) % 3 or len(va) < 9 or len(vb) < 9:
+        diff.fail(f"{file}: {p} Laenge {len(sa)} vs {len(sb)}")
+        return
+    for item, vals, lab in ((a, va, "A"), (b, vb, "B")):
+        ncp = _num(item.get("NumberOfContourPoints"))
+        if ncp is not None and int(ncp) != len(vals) // 3:
+            diff.fail(f"{file}: {path}.NumberOfContourPoints passt nicht zu ContourData ({lab})")
+    za, zb = {round(v, 4) for v in va[2::3]}, {round(v, 4) for v in vb[2::3]}
+    if za != zb or len(za) != 1:
+        diff.fail(f"{file}: {p} {len(va) // 3} vs {len(vb) // 3} Punkte, Ebene verschieden oder nicht planar")
+        return
+    from shapely.geometry import LinearRing, Polygon
+
+    xy_a = [(va[i], va[i + 1]) for i in range(0, len(va), 3)]
+    xy_b = [(vb[i], vb[i + 1]) for i in range(0, len(vb), 3)]
+    cr = rules.contour
+    tol = float(cr.get("simplify_mm", 0.1)) + float(cr.get("extra_mm", 0.01))
+    hd = LinearRing(xy_a).hausdorff_distance(LinearRing(xy_b))
+    ok = hd <= tol * (1 + 1e-9)
+    # Vertex-Teilmenge textuell (gleiche DS-Strings = gleicher Punkt)
+    ta = {(sa[i], sa[i + 1]) for i in range(0, len(sa), 3)}
+    tb = {(sb[i], sb[i + 1]) for i in range(0, len(sb), 3)}
+    subset = tb <= ta or ta <= tb
+    note = ""
+    if not subset:
+        pa, pb = Polygon(xy_a).buffer(0), Polygon(xy_b).buffer(0)
+        frac = pa.symmetric_difference(pb).area / max(pa.area, 1e-12)
+        xmax = float(cr.get("xor_frac", 0.002))
+        ok = ok and frac <= xmax
+        note = f", XOR {frac:.2e} der Flaeche (erlaubt {xmax:g})"
+    kind = "Vertex-Teilmenge" if subset else "Punkte verschoben"
+    if rules.recorder is not None:
+        rules.recorder.append((file, p, 0.0, hd, f"ContourData mit anderer Punktzahl ({kind}): Hausdorff mm",
+                               tol, ok))
+    if not ok:
+        diff.fail(f"{file}: {p} {len(va) // 3} vs {len(vb) // 3} Punkte ({kind}): Hausdorff {hd:.4f} mm "
+                  f"(erlaubt {tol:g}){note}")
+
+
 def _cmp_value(a, b, rules: Rules, file: str, path: str, diff: Diff):
     if isinstance(a, dict) and isinstance(b, dict):
+        skip = ()
+        if rules.mode == "migration" and _contour_len_differs(a, b):
+            _cmp_ring(a, b, rules, file, path, diff)
+            skip = ("ContourData", "NumberOfContourPoints")
         for k in sorted(set(a) | set(b)):
+            if k in skip:
+                continue
             p = f"{path}.{k}" if path else k
             if k not in a or k not in b:
                 diff.fail(f"{file}: {p} nur in {'B' if k not in a else 'A'}")
@@ -675,15 +964,20 @@ def _cmp_value(a, b, rules: Rules, file: str, path: str, diff: Diff):
             diff.fail(f"{file}: {path} {_show(a, diff)} vs {_show(b, diff)}")
         return
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        diff.n_num += 1
         if not rules.tol_ok(float(a), float(b), file, _strip_idx(path)):
             diff.fail(f"{file}: {path} {a!r} vs {b!r} (d={float(b) - float(a):+.3g})")
         return
     if isinstance(a, str) and isinstance(b, str):
         if a == b:
+            if diff.count and _num(a) is not None:
+                diff.n_num += 1
             return
         na, nb = _num(a), _num(b)
-        if na is not None and nb is not None and rules.tol_ok(na, nb, file, _strip_idx(path), a, b):
-            return
+        if na is not None and nb is not None:
+            diff.n_num += 1
+            if rules.tol_ok(na, nb, file, _strip_idx(path), a, b):
+                return
         diff.fail(f"{file}: {path} {_show(a, diff)} vs {_show(b, diff)}")
         return
     if a != b:
@@ -772,8 +1066,17 @@ def _judge_pixels(name: str, rules: Rules, diff: Diff):
         diff.warn(msg + " -> innerhalb Toleranz")
 
 
-def _compare_snap(a: dict, b: dict, rules: Rules, arrays: tuple) -> Diff:
-    diff = Diff(redact="real" in a.get("tags", []))
+def _compare_snap(a: dict, b: dict, rules: Rules, arrays: tuple, stats: bool = False) -> Diff:
+    diff = Diff(redact="real" in a.get("tags", []), count=stats)
+    rules.recorder = diff.drift if stats else None
+    try:
+        _compare_snap_into(a, b, rules, arrays, diff)
+    finally:
+        rules.recorder = None
+    return diff
+
+
+def _compare_snap_into(a: dict, b: dict, rules: Rules, arrays: tuple, diff: Diff) -> None:
     name = a["scenario"]
     if len(a["steps"]) != len(b["steps"]):
         diff.fail(f"Schritte {len(a['steps'])} vs {len(b['steps'])}")
@@ -807,8 +1110,10 @@ def _compare_snap(a: dict, b: dict, rules: Rules, arrays: tuple) -> Diff:
         elif kind == "text":
             _cmp_lines(x["lines"], y["lines"], rules, f, diff, numeric_warn=False)
         elif kind == "dicom":
-            _cmp_value(x["file_meta"], y["file_meta"], rules, f, "meta", diff)
-            _cmp_value(x["dataset"], y["dataset"], rules, f, "", diff)
+            meta_a = {k: v for k, v in x["file_meta"].items() if k not in _META_IGNORE}
+            meta_b = {k: v for k, v in y["file_meta"].items() if k not in _META_IGNORE}
+            _cmp_value(meta_a, meta_b, rules, f, "meta", diff)
+            _cmp_value(_canon_tag_keys(x["dataset"]), _canon_tag_keys(y["dataset"]), rules, f, "", diff)
             _cmp_pixels(x, y, name, f, rules, arrays, diff)
         elif kind == "html":
             if x.get("external_src") or y.get("external_src"):
@@ -820,7 +1125,6 @@ def _compare_snap(a: dict, b: dict, rules: Rules, arrays: tuple) -> Diff:
             if x != y:
                 diff.fail(f"{f}: {kind} weicht ab")
     _judge_pixels(name, rules, diff)
-    return diff
 
 
 def _load_arrays(p: Path):
@@ -828,6 +1132,139 @@ def _load_arrays(p: Path):
         return None
     import numpy as np
     return np.load(str(p))
+
+
+# Python-Warnungszeile "pfad/datei.py:123: DeprecationWarning: text"
+_WARN_RE = re.compile(r"^(?P<src>\S.*?\.py):\d+: (?P<cat>[A-Za-z]*(?:Warning|Error)): (?P<msg>.*)$")
+
+
+def _stderr_warnings(snap: dict, redact: bool) -> set:
+    """Warnungen aus den stderr-Enden; bei echten Faellen ohne Meldungstext."""
+    out = set()
+    for st in snap.get("steps", []):
+        for line in st.get("stderr_tail", []):
+            m = _WARN_RE.match(line.strip())
+            if m:
+                src = re.sub(r"^.*?/site-packages/", "", m.group("src")).replace("<REPO>/", "")
+                src = src.replace("numpy/core/", "numpy/_core/")   # numpy 2 hat core -> _core umbenannt
+                out.add(f"{src}: {m.group('cat')}" + ("" if redact else ": " + m.group("msg")[:110]))
+    return out
+
+
+def _step_usage(snap: dict) -> tuple:
+    """(Sekunden der CLI-Aufrufe, Peak Working Set MB, Peak-Commit MB) ueber alle Schritte."""
+    steps = snap.get("steps", [])
+    ws = [s["peak_ws_mb"] for s in steps if s.get("peak_ws_mb") is not None]
+    cm = [s["peak_commit_mb"] for s in steps if s.get("peak_commit_mb") is not None]
+    return (sum(float(s.get("duration_s") or 0.0) for s in steps),
+            max(ws) if ws else None, max(cm) if cm else None)
+
+
+def _fmt(x: float) -> str:
+    return "-" if math.isinf(x) else ("0" if x == 0 else f"{x:.3g}")
+
+
+def _md(s: str) -> str:
+    return _ascii(s).replace("|", "\\|")
+
+
+def _mb(x) -> str:
+    return "-" if x is None else f"{x:.0f}"
+
+
+def _stats_report(results: list) -> tuple:
+    """
+    Drift-Statistik aus [(szenario, Diff, warnungen_a, warnungen_b, nutzung_a,
+    nutzung_b)] -> (Markdown-Zeilen, Konsolenzeilen).
+    """
+    agg: Dict[tuple, dict] = {}
+    per_scen = []
+    for name, d, *_ in results:
+        n_file = n_stdout = 0
+        worst = 0.0
+        for file, path, a, b, label, tol, ok in d.drift:
+            src = "stdout" if file.startswith("stdout[") else "Datei"
+            g = agg.setdefault((src, label), {"n": 0, "over": 0, "abs": 0.0, "rel": -1.0, "ratio": -1.0,
+                                              "at": "", "keys": {}, "scen": set()})
+            dabs = abs(b - a)
+            ratio = dabs / tol if tol > 0 else math.inf
+            g["n"] += 1
+            g["over"] += 0 if ok else 1
+            g["abs"] = max(g["abs"], dabs)
+            if min(abs(a), abs(b)) > 0:        # relativ zu 0 ist nichtssagend
+                g["rel"] = max(g["rel"], dabs / max(abs(a), abs(b)))
+            g["scen"].add(name)
+            if ratio > g["ratio"]:
+                g["ratio"], g["at"] = ratio, name
+            if not d.redact and path:
+                k = path.rsplit(".", 1)[-1]
+                g["keys"][k] = g["keys"].get(k, 0) + 1
+            if src == "stdout":
+                n_stdout += 1
+            else:
+                n_file += 1
+            worst = max(worst, ratio)
+        if d.drift or d.pix_files:
+            per_scen.append((name, d, n_file, n_stdout, worst))
+
+    md = ["## Drift-Statistik", "",
+          "Alle numerischen Abweichungen A -> B, auch innerhalb der Toleranz. Quote = |d| / Toleranz "
+          "(<= 1 besteht). Schluessel nur aus synthetischen Szenarien.", "",
+          "| Quelle | Regel | Werte | ueber Tol. | Szenarien | max abs(d) | max rel(d) | max Quote | bei "
+          "| haeufigste Schluessel |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---|---|"]
+    con = ["Drift-Statistik (Quelle, Regel, Werte, max |d|, max Quote):"]
+    for (src, label), g in sorted(agg.items(), key=lambda kv: (kv[0][0], -kv[1]["ratio"], kv[0][1])):
+        keys = ", ".join(f"{k} ({c})" for k, c in sorted(g["keys"].items(), key=lambda kc: -kc[1])[:4])
+        rel = _fmt(g["rel"]) if g["rel"] >= 0 else "-"
+        md.append(f"| {src} | {_md(label)} | {g['n']} | {g['over']} | {len(g['scen'])} | {_fmt(g['abs'])} "
+                  f"| {rel} | {_fmt(g['ratio'])} | {g['at']} | {_md(keys)} |")
+        con.append(f"  {src:6s} {_ascii(label)[:52]:52s} {g['n']:8d}  {_fmt(g['abs']):>9s}  {_fmt(g['ratio']):>7s}")
+    if not agg:
+        md.append("| - | keine numerischen Abweichungen | 0 | 0 | 0 | - | - | - | - | - |")
+        con.append("  keine numerischen Abweichungen")
+
+    md += ["", "### Je Szenario mit Abweichungen", "",
+           "| Szenario | Zahlen in Dateien | davon geaendert | stdout-Zahlen geaendert | max Quote "
+           "| CT-Dateien mit Pixeldiff | Pixel geaendert | Anteil | max abs(d) Pixel |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for name, d, n_file, n_stdout, worst in per_scen:
+        frac = d.pix_diff / d.pix_total if d.pix_total else 0.0
+        md.append(f"| {name} | {d.n_num} | {n_file} | {n_stdout} | {_fmt(worst) if d.drift else '0'} "
+                  f"| {d.pix_files} | {d.pix_diff} | {_fmt(frac)} | {d.pix_max} |")
+
+    md += ["", "### Laufzeit und Peak-Speicher der CLI-Aufrufe (Szenarien ab 5 s oder 500 MB Working Set)", "",
+           "WS = Peak Working Set, Commit = Peak-Commit, jeweils des groessten Prozesses im Prozessbaum.", "",
+           "| Szenario | A s | B s | B/A | A WS MB | B WS MB | A Commit MB | B Commit MB |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    t_a = t_b = 0.0
+    for name, _, _, _, ua, ub in results:
+        t_a += ua[0]
+        t_b += ub[0]
+        if max(ua[0], ub[0]) >= 5 or max(ua[1] or 0, ub[1] or 0) >= 500:
+            t_ratio = f"{ub[0] / ua[0]:.2f}" if ua[0] else "-"
+            md.append(f"| {name} | {ua[0]:.1f} | {ub[0]:.1f} | {t_ratio} | {_mb(ua[1])} | {_mb(ub[1])} "
+                      f"| {_mb(ua[2])} | {_mb(ub[2])} |")
+    md.append(f"| Summe ({len(results)} Szenarien) | {t_a:.0f} | {t_b:.0f} | "
+              f"{(t_b / t_a if t_a else 0):.2f} | | | | |")
+    con.append(f"  Laufzeit der CLI-Aufrufe: A {t_a:.0f} s, B {t_b:.0f} s")
+
+    only_a: Dict[str, int] = {}
+    only_b: Dict[str, int] = {}
+    both: Dict[str, int] = {}
+    for _, _, wa, wb, _, _ in results:
+        for w in wa | wb:
+            tgt = both if (w in wa and w in wb) else (only_a if w in wa else only_b)
+            tgt[w] = tgt.get(w, 0) + 1
+    md += ["", "### Warnungen auf stderr (Anzahl Szenarien)", ""]
+    if not (only_a or only_b or both):
+        md.append("keine")
+    for title, dct in (("nur in B", only_b), ("nur in A", only_a), ("in beiden", both)):
+        for w, c in sorted(dct.items(), key=lambda wc: (-wc[1], wc[0])):
+            md.append(f"- {title}: {c}x `{_ascii(w)}`")
+            if title != "in beiden":
+                con.append(f"  stderr {title}: {c}x {_ascii(w)[:100]}")
+    return md, con
 
 
 def cmd_compare(args) -> int:
@@ -851,6 +1288,7 @@ def cmd_compare(args) -> int:
             lines.append(f"- {k}: {va.get(k)} -> {vb.get(k)}")
     lines.append("")
     n_fail = n_warn = n_exp = 0
+    stats_results = []
     for n in names:
         pa, pb = ra / n / "snapshot.json", rb / n / "snapshot.json"
         if not pa.is_file() or not pb.is_file():
@@ -859,14 +1297,18 @@ def cmd_compare(args) -> int:
             a = json.loads(pa.read_text(encoding="utf-8"))
             b = json.loads(pb.read_text(encoding="utf-8"))
             arrays = (_load_arrays(ra / n / "arrays.npz"), _load_arrays(rb / n / "arrays.npz"))
-            d = _compare_snap(a, b, rules, arrays)
+            d = _compare_snap(a, b, rules, arrays, stats=args.stats)
+            if args.stats:
+                stats_results.append((n, d, _stderr_warnings(a, d.redact), _stderr_warnings(b, d.redact),
+                                      _step_usage(a), _step_usage(b)))
             status = "FAIL" if d.fails else ("WARN" if d.warns else "PASS")
             detail = d.fails[:args.max_details] + [f"(Warnung) {w}" for w in d.warns[:args.max_details]]
             if len(d.fails) > args.max_details:
                 detail.append(f"... {len(d.fails) - args.max_details} weitere Abweichungen")
-            if status == "FAIL" and args.expected and n in rules.expected:
+            reason = next((msg for pat, msg in rules.expected.items() if fnmatch.fnmatch(n, pat)), None)
+            if status == "FAIL" and args.expected and reason:
                 status = "EXPECTED"
-                detail.insert(0, f"erwartete Aenderung: {rules.expected[n]}")
+                detail.insert(0, f"erwartete Aenderung: {reason}")
         n_fail += status == "FAIL"
         n_warn += status == "WARN"
         n_exp += status == "EXPECTED"
@@ -877,6 +1319,10 @@ def cmd_compare(args) -> int:
     summary = f"{len(names)} Szenarien: {len(names) - n_fail - n_warn - n_exp} PASS, {n_warn} WARN, " \
               f"{n_exp} EXPECTED, {n_fail} FAIL"
     lines.insert(1, summary)
+    if args.stats:
+        md, con = _stats_report(stats_results)
+        lines += md
+        print("\n".join(con))
     report = Path(args.report) if args.report else work / "reports" / f"{args.run_a}_vs_{args.run_b}_{args.mode}.md"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -910,6 +1356,9 @@ def main(argv=None) -> int:
     cp.add_argument("--only", help="Komma-getrennte Namensmuster (fnmatch)")
     cp.add_argument("--report", help="Pfad des Markdown-Berichts")
     cp.add_argument("--max-details", type=int, default=12)
+    cp.add_argument("--stats", action="store_true",
+                    help="Drift-Statistik anhaengen: alle numerischen Abweichungen (auch innerhalb der "
+                         "Toleranz), Pixel je Szenario, stderr-Warnungen")
     args = p.parse_args(argv)
     if args.cmd == "make-inputs":
         return cmd_make_inputs(args)
