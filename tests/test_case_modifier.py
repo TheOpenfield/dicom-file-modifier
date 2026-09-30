@@ -121,6 +121,57 @@ def test_rs_reference_to_unknown_ct_fails_before_writing(demo, tmp_path):
     assert not (tmp_path / "out").exists()
 
 
+# -- Bildverweise der Konturen ------------------------------------------------
+
+def _plan(demo, tz=0.0, rx=0.0, method="resample"):
+    pre = cm.preflight_case(str(demo.root), quiet=True)
+    return pre, cm.plan_transform(pre, 3.0, -2.0, tz, rx, 0.0, 5.0, out_dir=".", method=method, quiet=True)
+
+
+def _off_plane(plan):
+    return next((i for i in plan.issues if i.code == "CASE.CONTOURS_OFF_PLANE"), None)
+
+
+def test_resample_points_each_contour_to_the_slice_at_its_new_z(demo):
+    pre, plan = _plan(demo, tz=2.0)                              # 2 Schichten nach superior
+    z_old = {str(h.SOPInstanceUID): float(h.ImagePositionPatient[2]) for h in pre.ct_headers}
+    z_of_new = {new: z_old[old] for old, new in plan.sop_map.items()}   # das Raster bleibt
+    lo, hi = min(z_old.values()), max(z_old.values())
+    pairs = []
+    for rc in plan.new_rs.ROIContourSequence:
+        for c in rc.get("ContourSequence", []):
+            if "ContourImageSequence" in c and str(c.ContourGeometricType) != "POINT":
+                z = float(np.mean(np.asarray(c.ContourData, dtype=float).reshape(-1, 3)[:, 2]))
+                if lo <= z <= hi:
+                    pairs.append((z, z_of_new[str(c.ContourImageSequence[0].ReferencedSOPInstanceUID)]))
+    assert len(pairs) > 100 and all(abs(z - zr) < 1e-6 for z, zr in pairs)
+    assert _off_plane(plan) is None
+
+
+@pytest.mark.parametrize("tz, rx, tilted", [(0.5, 0.0, False), (0.0, 2.0, True)])
+def test_resample_warns_when_contours_leave_the_slice_planes(demo, tz, rx, tilted):
+    _, plan = _plan(demo, tz=tz, rx=rx)
+    issue = _off_plane(plan)
+    assert issue is not None and issue.level == "warning"
+    assert ("gekippt" in issue.message_de) == tilted
+    assert ("metadata" in issue.hint_de) == tilted and ("Vielfaches" in issue.hint_de) != tilted
+
+
+def test_metadata_keeps_the_slice_of_each_contour(demo):
+    pre, plan = _plan(demo, tz=0.5, rx=2.0, method="metadata")  # die Schichten wandern mit
+    assert _off_plane(plan) is None
+    n = 0
+    for rc_old, rc_new in zip(pre.rs_ds.ROIContourSequence, plan.new_rs.ROIContourSequence,
+                              strict=False):                    # neu: zusaetzlich der Drehpunkt
+        for c_old, c_new in zip(rc_old.get("ContourSequence", []), rc_new.get("ContourSequence", []),
+                                strict=True):
+            if "ContourImageSequence" in c_old:
+                n += 1
+                assert str(c_new.ContourImageSequence[0].ReferencedSOPInstanceUID) == \
+                    plan.sop_map[str(c_old.ContourImageSequence[0].ReferencedSOPInstanceUID)]
+    assert n > 100
+
+
 # -- Ausfuehren ---------------------------------------------------------------
 
 def test_metadata_run_writes_series_number_offset_in_one_pass(demo, tmp_path):

@@ -66,6 +66,7 @@ from .dicom_utils import (_label_with_suffix, _truncate, find_point_markers,
 from .issues import Issue, UserInputError
 
 VERIFY_THRESHOLD_MM = 1e-3      # --verify: max. Centroid-Abweichung fuer PASS
+PLANE_TOL_MM = 0.01             # resample: Kontur liegt in einer CT-Schichtebene
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +553,57 @@ def transform_rtstruct(
     return new_ds
 
 
+def align_contour_images(orig_ds: pydicom.Dataset, new_ds: pydicom.Dataset, ct_headers: list,
+                         sop_map: dict, tol: float = PLANE_TOL_MM) -> dict:
+    """
+    Nur ``resample``: das CT-Raster bleibt, die Konturen wandern.  Jede Kontur
+    verweist danach (erster Eintrag der ``ContourImageSequence``) auf die
+    Schicht an ihrer neuen Lage, die naechste Schichtebene entlang der
+    Schichtnormalen, statt auf die Schicht mit dem alten Index.
+
+    Zaehlt die Konturen (ohne POINT), die vorher in einer Schichtebene lagen
+    und jetzt nicht mehr: gekippt (Rotation um X/Y) oder zwischen zwei
+    Schichten (z-Verschiebung kein Vielfaches des Schichtabstands).  Konturen
+    jenseits der ersten oder letzten Schicht zaehlen nicht; die meldet das
+    Clipping.
+    """
+    iop = np.asarray(ct_headers[0].ImageOrientationPatient, dtype=np.float64)
+    normal = np.cross(iop[:3], iop[3:])
+    normal /= np.linalg.norm(normal)
+    planes = np.array([float(normal @ np.asarray(h.ImagePositionPatient, dtype=np.float64))
+                       for h in ct_headers])
+    sops = [str(h.SOPInstanceUID) for h in ct_headers]
+
+    def nearest(pos: np.ndarray) -> tuple:
+        k = int(np.argmin(np.abs(planes - pos.mean())))
+        return k, float(np.max(np.abs(pos - planes[k])))
+
+    stats = {"n_contours": 0, "n_off_plane": 0, "n_tilted": 0, "max_offset_mm": 0.0}
+    # das neue RS hat am Ende zusaetzlich den Drehpunkt (ohne Vorgaenger)
+    for rc_old, rc_new in zip(orig_ds.get("ROIContourSequence", []), new_ds.get("ROIContourSequence", []),
+                              strict=False):
+        for c_old, c_new in zip(rc_old.get("ContourSequence", []), rc_new.get("ContourSequence", []),
+                                strict=True):
+            if "ContourData" not in c_new:
+                continue
+            pos = np.asarray(c_new.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
+            k, offset = nearest(pos)
+            refs = c_new.get("ContourImageSequence")
+            if refs:
+                refs[0].ReferencedSOPInstanceUID = sop_map[sops[k]]
+            if str(c_new.get("ContourGeometricType", "")).upper() == "POINT":
+                continue
+            stats["n_contours"] += 1
+            before = np.asarray(c_old.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
+            inside = planes.min() - tol <= pos.mean() <= planes.max() + tol
+            if offset <= tol or not inside or nearest(before)[1] > tol:
+                continue
+            stats["n_off_plane"] += 1
+            stats["n_tilted"] += int(float(pos.max() - pos.min()) > tol)
+            stats["max_offset_mm"] = max(stats["max_offset_mm"], offset)
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # Marker / Rotationszentrum (Stage 3)
 # ---------------------------------------------------------------------------
@@ -864,9 +916,27 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
         new_for_uid=new_for_uid, drehpunkt_position=drehpunkt_pos, label_suffix=label,
         description=description, series_number_offset=series_number_offset,
     )
+    # resample: das Raster bleibt, also zeigen die Bildverweise auf die Schicht an der neuen Lage
+    align = align_contour_images(pre.rs_ds, new_rs, pre.ct_headers, sop_map) if method == "resample" else None
     clipping = check_contour_clipping(new_rs, pre.geom, method)
 
     issues = []
+    if align and align["n_off_plane"]:
+        n_off, n_all, n_tilt = align["n_off_plane"], align["n_contours"], align["n_tilted"]
+        hints = ["Ein TPS kann solche Konturen beim Import verwerfen oder auf die naechste Schicht legen."]
+        if n_tilt:
+            hints.append("Rotationen um die Links-Rechts- und die anterior-posteriore Achse bildet nur "
+                         "die Methode 'metadata' exakt ab (schraege Schichten).")
+        if n_off > n_tilt:
+            hints.append(f"Verschiebung Z als Vielfaches des Schichtabstands ({pre.geom['dz']:g} mm) waehlen.")
+        issues.append(Issue(
+            "warning", "CASE.CONTOURS_OFF_PLANE",
+            f"{n_off} von {n_all} Konturen liegen nach der Bewegung nicht mehr in einer CT-Schichtebene"
+            + (f" ({n_tilt} gekippt)." if n_tilt else "."),
+            hint_de=" ".join(hints), field="method" if n_tilt else "tz"))
+        say(f"  ! Konturen  : {n_off} von {n_all} nicht mehr in einer CT-Schichtebene"
+            + (f" ({n_tilt} gekippt)" if n_tilt else "")
+            + f", bis {align['max_offset_mm']:.2f} mm daneben; ein TPS kann sie verwerfen.")
     if for_strategy == "keep":
         issues.append(Issue(
             "warning", "CASE.FOR_KEPT",

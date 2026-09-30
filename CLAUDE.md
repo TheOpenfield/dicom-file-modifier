@@ -396,9 +396,12 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
   - `validate_label` rejects `--label` values that Windows forbids in the output dir name or `RS<label>.dcm`: characters `<>:"/\|?*`, reserved names, a trailing dot or space.
 - **`resolve_center`** takes `volume`, `marker:NAME` or `x,y,z`. The prompt appears only if interactive and stdin is a TTY; stdin may be `None` under pythonw/GUI.
 - **`plan_transform` → `TransformPlan`** builds `T` and the paths, and pre-assigns all UIDs: CT series, `sop_map` old→new, optional FoR. It already runs `transform_rtstruct` and `check_contour_clipping`, so a bad RS reference (`KeyError`) fails before anything is written. The dry run stops here and loads no pixels.
+  - For `resample` the grid stays fixed, so `align_contour_images` then re-points each contour's `ContourImageSequence` to the output slice at its new position (the nearest plane along the slice normal); `metadata` keeps the index mapping, because its slices move with the contours.
+  - It counts the non-POINT contours that were in a slice plane before and are not afterwards (tolerance `PLANE_TOL_MM`). These are contours tilted by an X/Y rotation, or between two slices after a z-shift that is not a multiple of the slice spacing; contours beyond the first or last slice count as clipping instead.
+  - Any such contour produces the warning `CASE.CONTOURS_OFF_PLANE` and one console line.
 - **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
 - The result dict adds these keys:
-  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`;
+  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`;
   - `clipping`, `method` and `for_strategy`;
   - `viz`: the `{'written', 'skipped'}` report of the before/after plots.
 - For the API (P0.8b):
