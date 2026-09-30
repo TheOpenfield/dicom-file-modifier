@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         from .dose_page import DosePage
         from .structures_page import StructuresPage
+        from .transform_page import TransformPage
 
         self.config = config
         self.case = None
@@ -86,7 +87,8 @@ class MainWindow(QMainWindow):
 
         self.structures = StructuresPage(self)
         self.dose = DosePage(self)
-        self.pages = [self.structures, self.dose]
+        self.transform = TransformPage(self)
+        self.pages = [self.structures, self.dose, self.transform]
         self.nav = QListWidget()
         self.nav.setFixedWidth(170)
         self.nav.setFrameShape(QFrame.Shape.NoFrame)

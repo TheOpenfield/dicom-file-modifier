@@ -103,7 +103,7 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - the inputs stay unchanged.
     - `tests/test_worker.py` (P0.8c): JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
     - `tests/test_gui.py` (offscreen, skipped without PySide6):
-      - the structure page and the dose page (locked fields, error marks, metric table with Eclipse columns) end to end through the real worker;
+      - the structure page, the dose page (locked fields, error marks, metric table with Eclipse columns) and the transform page (centre choice, run, CT only) end to end through the real worker;
       - `DecimalSpinBox` and the CLI-option-to-field-name mapping;
       - `JobRunner` cancel;
       - the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
@@ -245,6 +245,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
 | `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
+| `transform_page.py` | RS combo or "Nur das CT transformieren" (`selection.from_ct_dir`); motion grid on patient axes (X + links, Y + posterior, Z + superior; mm/° suffixes) built from `external` form fields; centre combo (Volumenmitte, markers, Koordinate) that writes the `center` spec; check with `describe_motion`, centre, the new `Drehpunkt` marker, planned files and memory; result: `transform_overview.png`, `displacement.png`, button for the 3D HTML |
 | `dose_page.py` | inputs by label (StructureSetLabel, summation type and Dmax, RTPlanLabel; file names in the tooltip), form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), "Kennzahlen" tab from the result JSON (rows = metrics; per target value, Eclipse, deviation; a separate `… global` row where the comparison used the whole isodose), report, `dose_overview.png`, button for `validation.html` |
 
 `JobRunner` details:

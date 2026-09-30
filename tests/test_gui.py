@@ -133,6 +133,45 @@ def test_dose_page_end_to_end(app, demo, tmp_path):
     win.close()
 
 
+def test_transform_page_end_to_end(app, demo, tmp_path):
+    win = MainWindow(AppConfig(results_root=tmp_path / "results", jobs_dir=tmp_path / "jobs"))
+    win.show()
+    win.open_case(demo.root)
+    page = win.transform
+    win.nav.setCurrentRow(win.pages.index(page))
+    wait_until(app, page.start_button.isEnabled)
+    assert "Volumenmitte" in page.case_label.text() and "keine Bewegung" in page.preview_label.text()
+
+    # Drehpunkt: Marker aus dem RTSTRUCT; "Koordinate" zeigt das Eingabefeld mit der Volumenmitte
+    combo, marker = page.center_combo, page.center_combo.findData("marker:HS1")
+    assert marker > 0 and not page.center_edit.isVisible()
+    combo.setCurrentIndex(combo.count() - 1)
+    assert page.center_edit.isVisible() and page.form.settings().center.count(",") == 2
+    combo.setCurrentIndex(marker)
+    page.form.widget("tx").setValue(2.0)
+    page.form.widget("rz").setValue(5.0)
+    text = page.preview_label.text()
+    assert "2 mm nach links · +5° um die Kopf-Fuss-Achse" in text and "Drehpunkt: Marker 'HS1'" in text
+
+    page.start_button.click()
+    wait_until(app, lambda: page.last_result is not None)
+    res = page.last_result
+    assert res["status"] in ("ok", "ok_warnings"), res["issues"]
+    out = Path(res["output_dir"])
+    assert out.name == f"{demo.root.name}_RB" and (out / "CT").is_dir() and (out / "RS_RB.dcm").is_file()
+    assert page.gallery.count() == 2 and page.view3d_button.isEnabled()
+    assert "2 mm nach links" in page.summary_label.text()
+    page.command_button.click()
+    assert QApplication.clipboard().text().startswith("dfm case-transform")
+
+    # nur CT: Drehpunkt fest auf der Volumenmitte, Kennung und FoR gesperrt
+    page.ct_only.setChecked(True)
+    wait_until(app, page.start_button.isEnabled)
+    assert page.form.settings().center == "volume" and not page.center_combo.isEnabled()
+    assert not page.form.widget("label").isEnabled() and "nur das CT" in page.preview_label.text()
+    win.close()
+
+
 def test_decimal_spinbox_accepts_a_comma_and_shows_a_point(app):
     w = DecimalSpinBox()
     w.setDecimals(2)

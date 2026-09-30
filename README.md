@@ -111,7 +111,10 @@ To run an analysis:
 3. Check the pre-start review.
 4. Start the analysis.
 
-The results appear as a gallery with the statistics. The first page is the structure analysis; the dose-index and transform pages follow.
+The app has three pages:
+- **Structure analysis**: the plots as a gallery, plus the statistics.
+- **Dose indices**: a metric table per target, compared with Eclipse where reference values exist, plus the report, the dose overview and the validation view.
+- **Transformation**: shift and rotation on labelled patient axes, a rotation centre (volume centre, marker or coordinate), and CT only or CT together with the RTSTRUCT. The result shows before/after plots, the displacement per ROI and the 3D view.
 
 Every run happens in a separate worker process (`dfm worker`). It writes to a staging folder that becomes the result folder only when the run succeeds. A cancelled run leaves nothing behind. The results go under `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`; the toolbar changes this folder.
 
