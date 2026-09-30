@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +32,8 @@ from pydicom.uid import (PYDICOM_IMPLEMENTATION_UID, ExplicitVRLittleEndian,
 
 from . import dose as dm
 from . import analyzer as ana
-from .case_modifier import _label_with_suffix, _truncate
-from .modifier import set_sop_instance_uid
+from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references, set_sop_instance_uid
+from .dose_constants import HELPER_COLORS, TOOL_NAME, TOOL_VERSION
 
 RTSTRUCT_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.481.3"
 CT_IMAGE_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.2"
@@ -67,18 +68,24 @@ class RoiSpec:
 # 1. CT-Schichtindex
 # ---------------------------------------------------------------------------
 
-def build_ct_slice_index(ct_dir: str) -> dict:
+def build_ct_slice_index(ct_dir) -> dict:
     """
     Liest die CT-Header (ohne Pixel) und liefert
     ``{'series_uid', 'study_uid', 'for_uid', 'sop_class_uid', 'z_values',
     'z_to_sop', 'sops', 'pixel_spacing', 'ipp_xy', 'n_slices', 'z_to_path',
     'paths'}`` (``z_to_path``/``paths``: Dateipfade je Schicht, damit
     ``dose_viz`` nur die Schichten im Bereich des Feingitters mit Pixeln laedt).
+    ``ct_dir`` ist ein Ordner (``*.dcm``) oder eine Liste von Dateien.
     """
     import glob
     import os
 
-    files = sorted(glob.glob(os.path.join(str(ct_dir), "*.dcm")))
+    if isinstance(ct_dir, (str, os.PathLike)):
+        files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
+        where = repr(ct_dir)
+    else:
+        files = [str(f) for f in ct_dir]
+        where = f"den {len(files)} CT-Dateien"
     slices = []
     for f in files:
         try:
@@ -88,7 +95,7 @@ def build_ct_slice_index(ct_dir: str) -> dict:
         if str(ds.get("Modality", "")).upper() == "CT" and "ImagePositionPatient" in ds:
             slices.append(ds)
     if not slices:
-        raise ValueError(f"Keine CT-Schichten in {ct_dir!r} gefunden.")
+        raise ValueError(f"Keine CT-Schichten in {where} gefunden.")
     slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
     series = {str(s.SeriesInstanceUID) for s in slices}
     fors = {str(s.get("FrameOfReferenceUID", "")) for s in slices}
@@ -122,8 +129,6 @@ def validate_index_against_rs(ct_index: dict, orig_rs: pydicom.Dataset) -> list:
     FoR- oder Serien-Mismatch zwischen CT-Ordner und Original-RS -> ``ValueError``;
     fehlende referenzierte Schichten -> Warnungstexte.
     """
-    from .case_modifier import get_rs_frame_of_references
-
     warnings = []
     rs_fors = get_rs_frame_of_references(orig_rs)
     if rs_fors and ct_index["for_uid"] not in rs_fors:
@@ -245,7 +250,6 @@ def build_roi_specs(art, include_target: bool = False, max_name_len: int = 64,
         descs = {"inter": "Schnitt Ziel & Rx-Isodose (TV&PIV)",
                  "under": "Ziel ausserhalb der Rx-Isodose (unterdosiert)",
                  "spill": "Rx-Isodose ausserhalb des Ziels (Spill)"}
-        from .dose_indices import HELPER_COLORS
         for kind in ("inter", "under", "spill"):
             specs.append(RoiSpec(
                 name=names[kind], color=HELPER_COLORS[kind],
@@ -271,6 +275,32 @@ def build_roi_specs(art, include_target: bool = False, max_name_len: int = 64,
     return specs
 
 
+def planned_roi_names(level_specs: list, target_names: list, include_target: bool = False,
+                      max_name_len: int = 64) -> list:
+    """
+    ROI-Namen, die ``build_roi_specs`` schreiben wuerde, ohne Rechnung (Vorschau):
+    ``[(kind, name, bezug), ...]`` in derselben Reihenfolge und mit derselben
+    Eindeutigkeits-Passe; ``bezug`` ist der Level-``label`` bzw. der Zielname.
+    """
+    stubs, refs = [], []
+    if include_target:
+        for t in target_names:
+            stubs.append(RoiSpec(name=t[:max_name_len], color=(0, 0, 0), kind="target"))
+            refs.append(t)
+    for lv in level_specs:
+        stubs.append(RoiSpec(name=iso_name(lv["pct"], lv["gy"])[:max_name_len], color=(0, 0, 0),
+                             kind="isodose"))
+        refs.append(lv["label"])
+    for t in target_names:
+        for kind, prefix, suffix in (("inter", "", "_x_ISO100"), ("under", "", "_minus_ISO100"),
+                                     ("spill", "ISO100_minus_", "")):
+            stubs.append(RoiSpec(name=_fit_name(prefix, t, suffix, max_name_len), color=(0, 0, 0),
+                                 kind=kind))
+            refs.append(t)
+    _unique_names(stubs)
+    return [(sp.kind, sp.name, ref) for sp, ref in zip(stubs, refs)]
+
+
 def summary_description(art, max_len: int = 200) -> str:
     """Kurzfassung der Indizes fuer ``StructureSetDescription`` (ST)."""
     parts = []
@@ -285,14 +315,23 @@ def summary_description(art, max_len: int = 200) -> str:
 # 3. RTSTRUCT schreiben
 # ---------------------------------------------------------------------------
 
+_WRITING_VALIDATION_LOCK = threading.RLock()
+
+
 @contextmanager
 def _writing_validation(mode):
-    old = pdconfig.settings.writing_validation_mode
-    pdconfig.settings.writing_validation_mode = mode
-    try:
-        yield
-    finally:
-        pdconfig.settings.writing_validation_mode = old
+    """
+    Setzt ``writing_validation_mode`` fuer die Dauer des Blocks.  Der Schalter
+    gilt prozessweit; das Lock verhindert, dass zwei Threads ihn gleichzeitig
+    umstellen und sich den alten Wert gegenseitig ueberschreiben.
+    """
+    with _WRITING_VALIDATION_LOCK:
+        old = pdconfig.settings.writing_validation_mode
+        pdconfig.settings.writing_validation_mode = mode
+        try:
+            yield
+        finally:
+            pdconfig.settings.writing_validation_mode = old
 
 
 def _now_strings() -> tuple:
@@ -301,8 +340,8 @@ def _now_strings() -> tuple:
 
 
 def _tool_version() -> str:
-    from .dose_indices import TOOL_VERSION
-    return f"dose_indices {TOOL_VERSION}"[:16]
+    # SoftwareVersions hat VR LO (64 Zeichen); bis P0.4 auf 16 gekuerzt
+    return f"{TOOL_NAME} {TOOL_VERSION}"[:64]
 
 
 def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,
@@ -438,13 +477,11 @@ def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,
     fm.ImplementationVersionName = f"PYDICOM {pydicom.__version__}"[:16]
     validate_file_meta(fm, enforce_standard=True)
     ds.file_meta = fm
-    ds.is_little_endian = True
-    ds.is_implicit_VR = (ts == ImplicitVRLittleEndian)
     set_sop_instance_uid(ds, str(fm.MediaStorageSOPInstanceUID))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with _writing_validation(pdconfig.RAISE):
-        pydicom.dcmwrite(str(out_path), ds, write_like_original=False)
+        pydicom.dcmwrite(str(out_path), ds, enforce_file_format=True)   # Kodierung aus der Transfer Syntax
     return ds
 
 

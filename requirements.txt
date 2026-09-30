@@ -1,7 +1,0 @@
-pydicom
-numpy
-scipy
-shapely
-matplotlib
-scikit-image
-plotly

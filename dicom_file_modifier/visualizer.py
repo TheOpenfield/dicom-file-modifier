@@ -29,16 +29,18 @@ Beispiele:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")          # kein interaktives Fenster notwenig
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+# Objektorientierte Matplotlib-API statt pyplot: kein globaler Figurenzustand,
+# kein Backend-Wechsel beim Import (Plan P0.7).  Figuren rendern ueber Agg.
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import numpy as np
 
 from dicom_file_modifier.analyzer import (
-    run_analysis, get_structure_names,
+    run_analysis, get_structure_names, parse_name_list,
     CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL, CAT_HELPER,
     CATEGORY_ORDER,
 )
@@ -71,6 +73,19 @@ CATEGORY_LABELS = {
     CAT_HELPER:       "Hilfs-/Planungsstruktur",
 }
 
+
+
+def _figure(figsize=None) -> Figure:
+    """Neue Figur mit eigener Agg-Canvas (ersetzt ``pyplot.figure``)."""
+    fig = Figure(figsize=figsize)
+    FigureCanvasAgg(fig)
+    return fig
+
+
+def _subplots(*args, figsize=None, **kwargs):
+    """Wie ``pyplot.subplots``, aber ohne pyplot: ``(fig, axes)``."""
+    fig = _figure(figsize)
+    return fig, fig.subplots(*args, **kwargs)
 
 def _iter_structures(results: dict):
     """Alle ausgewerteten Strukturen (Targets, OARs, Helpers) als (name, s)."""
@@ -116,7 +131,7 @@ def plot_volumes(results: dict, output_dir: Path) -> None:
     hatches = ["///" if c == CAT_HELPER else "" for c in cats]
 
     y = np.arange(len(names))
-    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.34 + 1.5)))
+    fig, ax = _subplots(figsize=(10, max(4, len(names) * 0.34 + 1.5)))
     vmin = max(0.01, min(volumes) * 0.5)
     # Balken vom Log-Achsenboden (vmin) bis zum echten Volumen. NICHT left=vmin
     # + width=volume verwenden: dort wäre die rechte Kante vmin+volume und würde
@@ -152,11 +167,11 @@ def plot_volumes(results: dict, output_dir: Path) -> None:
                                      label=f"(External ausgeblendet: {', '.join(ext)})"))
     ax.legend(handles=legend, loc="lower right", fontsize=8)
 
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "volumes.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +206,7 @@ def plot_shape_metrics(results: dict, output_dir: Path) -> None:
     elo = np.array([r[1]["shape"]["elongation"]  for r in rows])
     n = len(names)
 
-    fig, axes = plt.subplots(
+    fig, axes = _subplots(
         1, 4, figsize=(11, max(4, n * 0.32 + 1.5)),
         gridspec_kw={"width_ratios": [0.12, 1, 1, 1], "wspace": 0.08})
     y = np.arange(n)
@@ -235,11 +250,11 @@ def plot_shape_metrics(results: dict, output_dir: Path) -> None:
                fontsize=8, frameon=True, bbox_to_anchor=(0.5, -0.02))
     fig.suptitle("Formmetriken (anatomische Strukturen; Hilfsstrukturen ausgelassen)",
                  fontsize=12, fontweight="bold", y=1.0)
-    plt.tight_layout(rect=(0, 0.03, 1, 0.98))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.98))
     path = output_dir / "shape_metrics.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +289,7 @@ def plot_distances(results: dict, output_dir: Path, max_pairs: int = 25) -> None
     dh95   = [d.get("hd95_mm", d["hausdorff_distance_mm"]) for d in serial]
 
     y = np.arange(len(serial))[::-1]   # kleinster Abstand oben
-    fig, ax = plt.subplots(figsize=(10, max(4, len(serial) * 0.34 + 1.5)))
+    fig, ax = _subplots(figsize=(10, max(4, len(serial) * 0.34 + 1.5)))
 
     for yi, mn, h95 in zip(y, dmin, dh95):
         ax.plot([mn, h95], [yi, yi], color="#BDC3C7", linewidth=1.5, zorder=1)
@@ -303,11 +318,11 @@ def plot_distances(results: dict, output_dir: Path, max_pairs: int = 25) -> None
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(axis="x", alpha=0.3, linestyle="--")
 
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "distances.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +337,7 @@ def plot_centroids_3d(results: dict, output_dir: Path) -> None:
     die Targets durchnummeriert (Zuordnung Nummer→Läsion in der Seitenlegende).
     Marker und External sind ausgeschlossen.
     """
-    fig = plt.figure(figsize=(11, 8))
+    fig = _figure(figsize=(11, 8))
     ax  = fig.add_subplot(111, projection="3d")
     coords = []
 
@@ -379,11 +394,11 @@ def plot_centroids_3d(results: dict, output_dir: Path) -> None:
                  fontsize=7, va="center", ha="left",
                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
 
-    plt.tight_layout(rect=(0.16, 0, 1, 1))
+    fig.tight_layout(rect=(0.16, 0, 1, 1))
     path = output_dir / "centroids_3d.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +505,7 @@ def write_statistics(results: dict, output_dir: Path) -> None:
                         f"{d['hd95_mm']:>7.2f}{d['assd_mm']:>7.2f}\n")
 
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +567,7 @@ def plot_proximity_matrix(results: dict, output_dir: Path) -> None:
     cmap = ListedColormap(["#C0392B", "#E67E22", "#F1C40F", "#A9DFBF", "#27AE60"])
     norm = BoundaryNorm(bounds, cmap.N)
 
-    fig, ax = plt.subplots(figsize=(max(6, len(cols) * 0.95 + 2),
+    fig, ax = _subplots(figsize=(max(6, len(cols) * 0.95 + 2),
                                     max(4, len(ptvs) * 0.5 + 2)))
     ax.imshow(np.ma.masked_invalid(M), aspect="auto", cmap=cmap, norm=norm)
     ax.set_xticks(range(len(cols)))
@@ -566,11 +582,11 @@ def plot_proximity_matrix(results: dict, output_dir: Path) -> None:
     ax.set_title("Nähe-Matrix: PTV × kritische OARs  –  Min-Abstand (mm)\n"
                  "rot ≤2  orange ≤5  gelb ≤10  hellgrün ≤20  grün >20",
                  fontsize=11, fontweight="bold")
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "proximity_matrix.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +620,7 @@ def plot_nearest_critical_oar(results: dict, output_dir: Path) -> None:
     vals = [r[2] for r in rows]
     colors = ["#C0392B" if v < 3 else ("#E67E22" if v < 5 else COLOR_MIN) for v in vals]
 
-    fig, ax = plt.subplots(figsize=(9, max(3.5, len(rows) * 0.4 + 1.5)))
+    fig, ax = _subplots(figsize=(9, max(3.5, len(rows) * 0.4 + 1.5)))
     y = np.arange(len(rows))
     ax.barh(y, vals, color=colors, edgecolor="white", linewidth=0.5)
     for yi, (_, oar, mn) in zip(y, rows):
@@ -618,11 +634,11 @@ def plot_nearest_critical_oar(results: dict, output_dir: Path) -> None:
     ax.set_xlim(0, max(vals) * 1.35 + 2)
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(axis="x", alpha=0.3, linestyle="--")
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "nearest_critical_oar.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +657,7 @@ def plot_sphericity_vs_elongation(results: dict, output_dir: Path) -> None:
             and s["shape"].get("shape_valid", False)]
     if not rows:
         return
-    fig, ax = plt.subplots(figsize=(9, 7))
+    fig, ax = _subplots(figsize=(9, 7))
     for cat in (CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL):
         grp = [s for _, s in rows if s.get("category") == cat]
         if not grp:
@@ -664,11 +680,11 @@ def plot_sphericity_vs_elongation(results: dict, output_dir: Path) -> None:
     ax.set_ylim(0, 1.05)
     ax.grid(alpha=0.3, linestyle="--")
     ax.legend(fontsize=9)
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "sphericity_vs_elongation.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +717,7 @@ def plot_gtv_ptv_margin(results: dict, output_dir: Path) -> None:
 
     y = np.arange(len(keys))
     h = 0.38
-    fig, ax = plt.subplots(figsize=(9, max(3.5, len(keys) * 0.5 + 1.5)))
+    fig, ax = _subplots(figsize=(9, max(3.5, len(keys) * 0.5 + 1.5)))
     vmin = max(0.001, min(gtv_v) * 0.5)   # stets < jedes Volumen -> Breite > 0
     # Breite = Volumen - vmin, damit die Balkenspitze auf der Log-Skala exakt
     # auf dem echten Volumen liegt (left=vmin + width=volume würde überzeichnen).
@@ -723,11 +739,11 @@ def plot_gtv_ptv_margin(results: dict, output_dir: Path) -> None:
                  fontsize=12, fontweight="bold")
     ax.legend(fontsize=9, loc="lower right")
     ax.grid(axis="x", alpha=0.3, linestyle="--", which="both")
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "gtv_ptv_margin.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ===========================================================================
@@ -825,7 +841,7 @@ def plot_transform_overview(
         (1, 2, "Sagittal (Y-Z)", "Y [mm] (Posterior)", "Z [mm] (Superior)",  False),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig, axes = _subplots(1, 3, figsize=(18, 6))
     for ax, (a, b, title, xl, yl, inv_y) in zip(axes, planes):
         if orig.size:
             ax.scatter(orig[:, a], orig[:, b], s=2, c=COLOR_ORIG,
@@ -867,11 +883,11 @@ def plot_transform_overview(
                fontsize=9, frameon=True)
     fig.suptitle("Rigide Transformation -- Vorher (grau) / Nachher (rot)",
                  fontsize=13, fontweight="bold")
-    plt.tight_layout(rect=(0, 0.05, 1, 0.97))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
     path = output_dir / "transform_overview.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +928,7 @@ def plot_displacement_summary(
 
     t_norm = float(np.linalg.norm(np.asarray(translation, dtype=np.float64)))
 
-    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.32 + 1)))
+    fig, ax = _subplots(figsize=(10, max(4, len(names) * 0.32 + 1)))
     bars = ax.barh(names, disp, color=COLOR_TRANS, edgecolor="white", linewidth=0.5)
     for bar, d in zip(bars, disp):
         ax.text(bar.get_width() + 0.01 * max(disp + [1]),
@@ -933,11 +949,11 @@ def plot_displacement_summary(
     ax.invert_yaxis()
     ax.grid(axis="x", alpha=0.3, linestyle="--")
 
-    plt.tight_layout()
+    fig.tight_layout()
     path = output_dir / "displacement.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Gespeichert: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1120,7 @@ def plot_transform_3d(
     path = output_dir / "transform_3d.html"
     fig.write_html(str(path))
     print(f"  Gespeichert: {path}")
+    return path
 
 
 def run_case_visualization(
@@ -1117,73 +1134,84 @@ def run_case_visualization(
     geom: "dict | None" = None,
     volume_hu: "np.ndarray | None" = None,
     ct_surface: bool = False,
-) -> None:
+) -> dict:
     """
     Erzeugt alle Case-Transform-Plots in ``output_dir``.
 
     ``orig_ds`` / ``new_ds`` sind das RTSTRUCT vor bzw. nach der Transformation,
     ``markers`` ist die ``[(name, position_lps), ...]``-Liste der POINT-Marker
     aus dem Original-RS (transformierte Positionen werden via ``T`` berechnet).
+    Rueckgabe wie ``run_visualization``: ``{'written': {...}, 'skipped': {...}}``.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nErstelle Case-Transform-Visualisierungen in {output_dir} …")
     # Pro-Plot-Isolation: ein fehlschlagender Plot darf die anderen nicht kippen.
     plots = (
-        lambda: plot_transform_overview(orig_ds, new_ds, center, drehpunkt_pos,
-                                        markers, output_dir),
-        lambda: plot_displacement_summary(orig_ds, T, translation, output_dir),
-        lambda: plot_transform_3d(orig_ds, new_ds, center, drehpunkt_pos, markers,
-                                  output_dir, T=T, geom=geom, volume_hu=volume_hu,
-                                  ct_surface=ct_surface),
+        ("plot_transform_overview",
+         lambda: plot_transform_overview(orig_ds, new_ds, center, drehpunkt_pos, markers, output_dir)),
+        ("plot_displacement_summary",
+         lambda: plot_displacement_summary(orig_ds, T, translation, output_dir)),
+        ("plot_transform_3d",
+         lambda: plot_transform_3d(orig_ds, new_ds, center, drehpunkt_pos, markers,
+                                   output_dir, T=T, geom=geom, volume_hu=volume_hu,
+                                   ct_surface=ct_surface)),
     )
-    for fn in plots:
+    report: dict = {"written": {}, "skipped": {}}
+    for name, fn in plots:
         try:
-            fn()
+            path = fn()
+            if path is None:
+                report["skipped"][name] = "keine passenden Daten"
+            else:
+                report["written"][name] = str(path)
         except Exception as e:
             print(f"  (!) Case-Plot uebersprungen: {e}")
+            report["skipped"][name] = f"{type(e).__name__}: {e}"
     print("Case-Visualisierung abgeschlossen.")
+    return report
 
 
 # ---------------------------------------------------------------------------
 # Haupt-Workflow
 # ---------------------------------------------------------------------------
 
-def run_visualization(results: dict, output_dir: Path) -> None:
-    """Erstellt alle Plots fuer ein bereits analysiertes results-Dict."""
+def run_visualization(results: dict, output_dir: Path) -> dict:
+    """
+    Erstellt alle Plots fuer ein bereits analysiertes results-Dict.  Ein
+    fehlender Plot (keine passenden Daten oder Fehler) stoppt die anderen nicht.
+    Rueckgabe ``{'written': {name: pfad}, 'skipped': {name: grund}}``, inkl.
+    ``statistics`` (statistics.txt).
+    """
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nErstelle Visualisierungen in {output_dir} ...")
-    expected = {
-        "plot_volumes": "volumes.png",
-        "plot_shape_metrics": "shape_metrics.png",
-        "plot_distances": "distances.png",
-        "plot_centroids_3d": "centroids_3d.png",
-        "plot_proximity_matrix": "proximity_matrix.png",
-        "plot_nearest_critical_oar": "nearest_critical_oar.png",
-        "plot_sphericity_vs_elongation": "sphericity_vs_elongation.png",
-        "plot_gtv_ptv_margin": "gtv_ptv_margin.png",
-    }
+    report: dict = {"written": {}, "skipped": {}}
     for fn in (plot_volumes, plot_shape_metrics, plot_distances,
                plot_centroids_3d, plot_proximity_matrix,
                plot_nearest_critical_oar, plot_sphericity_vs_elongation,
                plot_gtv_ptv_margin):
         try:
-            fn(results, output_dir)
-            png = expected.get(fn.__name__)
-            if png and not (output_dir / png).exists():
+            path = fn(results, output_dir)
+            if path is None:
                 # Plot hat sich wegen fehlender Daten still beendet -> sichtbar machen
                 print(f"  (-) {fn.__name__} uebersprungen (keine passenden Daten)")
+                report["skipped"][fn.__name__] = "keine passenden Daten"
+            else:
+                report["written"][fn.__name__] = str(path)
         except Exception as e:   # ein fehlgeschlagener Plot darf den Rest nicht stoppen
             print(f"  (!) {fn.__name__} uebersprungen: {e}")
-    write_statistics(results, output_dir)
+            report["skipped"][fn.__name__] = f"{type(e).__name__}: {e}"
+    report["written"]["statistics"] = str(write_statistics(results, output_dir))
     print("Visualisierung abgeschlossen.")
+    return report
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description="RTSTRUCT Visualizer – Plots aus DICOM RT Structure Sets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1201,10 +1229,10 @@ def main() -> None:
                         help="Komma-getrennte Zielgebiet-Namen (z.B. PTV,CTV)")
     parser.add_argument("--oars", type=str, default=None,
                         help="Komma-getrennte Risikoorgan-Namen")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    target_list = args.targets.split(",") if args.targets else None
-    oar_list    = args.oars.split(",")    if args.oars    else None
+    target_list = parse_name_list(args.targets)
+    oar_list    = parse_name_list(args.oars)
 
     results = run_analysis(
         filepath=args.file,
@@ -1213,7 +1241,8 @@ def main() -> None:
     )
 
     run_visualization(results, Path(args.output))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

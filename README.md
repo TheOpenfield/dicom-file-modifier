@@ -1,4 +1,4 @@
-# DICOM File Modifier
+# <img src="dicom_file_modifier/gui/assets/app.png" width="40" align="absmiddle" alt=""> DICOM File Modifier
 
 A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set files used in radiotherapy planning. This project provides tools to process target volumes (PTV, CTV, GTV) and organs at risk (OAR) from DICOM files, compute geometric metrics, and generate visualizations.
 
@@ -34,6 +34,9 @@ dicom-file-modifier/
 ├── output/                  # Analysis results and modified files (not synced)
 ├── dicom_file_modifier/     # Python package
 │   ├── __init__.py
+│   ├── __main__.py, cli.py  # `dfm` entry point (python -m dicom_file_modifier)
+│   ├── api/                 # Interface for scripts, the worker and the desktop app (settings, inspect, preview, run)
+│   ├── gui/                 # Desktop app (PySide6; extra [gui])
 │   ├── analyzer.py          # RTSTRUCT analysis module
 │   ├── modifier.py          # CT rigid body transformer
 │   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
@@ -41,8 +44,27 @@ dicom-file-modifier/
 │   ├── dose.py              # Dose-grid numerics library (RTDOSE, fine grid, sampling, DVH statistics)
 │   ├── dose_indices.py      # Dose index computation (CI/GI/HI), Eclipse comparison + reports
 │   ├── dose_viz.py          # Dose-index validation view (validation.html, dose_overview.png)
-│   └── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
-├── requirements.txt         # Python dependencies
+│   ├── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
+│   ├── demo.py              # Synthetic demo/test case (CT + RS + RP + RD, no patient data)
+│   ├── phantom.py           # Analytic geometry/dose models and closed-form expectations for demo.py
+│   ├── dicom_utils.py       # Small DICOM helpers shared by several modules (FoR lookup, SOP UID, label length)
+│   ├── dose_constants.py    # Constants shared by the dose-index modules (tool version, ROI colours)
+│   ├── issues.py            # Structured findings (code, German message, hint) for CLI and GUI
+│   └── _runtime.py          # Progress/cancel context for long computations
+├── tests/                   # pytest suite (uv run pytest)
+├── tools/
+│   ├── golden.py            # Golden-output harness (CLI parity before/after refactors and upgrades)
+│   ├── golden_rules.json    # Comparison tolerances for the migration mode
+│   └── cli_surface.py       # argparse snapshot of every CLI (flags, defaults, choices, types)
+├── packaging/
+│   ├── dfm.spec             # PyInstaller build of the Windows app (two EXEs in one folder)
+│   ├── check_bundle.py      # Bundle check; --zip writes the portable ZIP
+│   ├── third_party_notices.py  # THIRD-PARTY-NOTICES.txt of the bundle (licences of the bundled components)
+│   └── licenses/            # LGPL 3, GPL 3, LGPL 2.1 and Apache 2.0 texts for the notices
+├── pyproject.toml           # Package metadata and dependencies (hatchling)
+├── uv.lock                  # Locked dependency versions (uv)
+├── .python-version          # Python version for uv (3.14)
+├── LICENSE                  # MIT
 └── README.md                # This file
 ```
 
@@ -50,13 +72,89 @@ dicom-file-modifier/
 
 ## Installation
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Requires Python ≥ 3.12. `uv.lock` pins the tested versions (Python 3.14).
+
+With [uv](https://docs.astral.sh/uv/) (recommended; installs exactly the locked versions):
+```bash
+uv sync                                                   # creates .venv (Python 3.14 + locked dependencies)
+uv run python -m dicom_file_modifier.analyzer --self-test
+uv run pytest                                             # test suite in tests/
+```
+
+With pip (minimum versions from `pyproject.toml`, not pinned):
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows; Linux/macOS: source .venv/bin/activate
+pip install -e .
+```
 
 ## Usage
+
+### One command for all tools
+
+After installation, the `dfm` command, or `python -m dicom_file_modifier`, runs every tool. The arguments are passed on unchanged, so all options below work the same way:
+
+```bash
+dfm analyze data/<case-id>/RS.dcm --output output/         # = python -m dicom_file_modifier.analyzer ...
+dfm visualize | ct-transform | case-transform | dose-indices | demo ...
+dfm selftest              # installation check: all self-tests (case modifier on a freshly generated demo case)
+dfm --version --json      # versions of the package, the tools and the libraries
+```
+
+### Desktop app
+
+**Download and first start** (Windows 10/11, 64-bit; no Python and no admin rights needed):
+1. Download `DICOM-RT-Toolkit-<version>-win64.zip` from the [Releases](https://github.com/TheOpenfield/dicom-file-modifier/releases) page.
+2. Right-click the ZIP → Properties → tick *Unblock*, then extract it to a short path such as `C:\Tools\` (Windows path limit of 260 characters).
+3. Start `DICOM-RT-Toolkit.exe` from the extracted folder. The EXEs are not code-signed yet, so SmartScreen may show "Windows protected your PC": choose *More info* → *Run anyway*. On managed PCs an application-control policy (AppLocker) can block EXEs in user folders; ask IT to allow the folder.
+4. `dfm.exe` in the same folder is the command line: `dfm.exe selftest` checks the installation, `dfm.exe --help` lists the commands.
+
+The folder also holds `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` with the licences of the bundled components (Qt 6/PySide6 under the LGPL v3, GEOS under the LGPL v2.1).
+
+From source, the app needs the `gui` extra (`uv sync --extra gui` or `pip install -e .[gui]`). Start it with `dfm gui [CASE]` or `dicom-rt-toolkit`.
+
+To run an analysis:
+1. Open a case folder, or drag it onto the window.
+2. Pick the settings.
+3. Check the pre-start review.
+4. Start the analysis.
+
+The app has three pages:
+- **Structure analysis**: the plots as a gallery, plus the statistics.
+- **Dose indices**: a metric table per target, compared with Eclipse where reference values exist, plus the report, the dose overview and the validation view.
+- **Transformation**: shift and rotation on labelled patient axes, a rotation centre (volume centre, marker or coordinate), and CT only or CT together with the RTSTRUCT. The result shows before/after plots, the displacement per ROI and the 3D view.
+
+Every run happens in a separate worker process (`dfm worker`). It writes to a staging folder that becomes the result folder only when the run succeeds. A cancelled run leaves nothing behind. The results go under `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`; the toolbar changes this folder.
+
+Build the Windows app as a folder (PyInstaller onedir, no installer yet). `dist\DICOM-RT-Toolkit\` then holds `DICOM-RT-Toolkit.exe` (the app), `dfm.exe` (CLI and worker), `LICENSE.txt` and the generated `THIRD-PARTY-NOTICES.txt`. The check tests the bundle: licence files, self-tests, demo case, dose indices and an app smoke test through the frozen worker.
+```bash
+uv sync --extra gui --group build
+.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm
+.venv\Scripts\python packaging/check_bundle.py --zip   # check; if it passes, write dist\DICOM-RT-Toolkit-<version>-win64.zip
+```
+
+### Python API
+
+`dicom_file_modifier.api` offers the three workflows as functions: structure analysis, dose indices and transformation. The desktop app is built on this layer, and scripts can use it as well. Each workflow module has the same steps:
+
+| Step | What it does |
+|---|---|
+| `inspect(selection)` | reads the inputs, prints nothing |
+| `preview(info, settings)` | checks everything before the start and writes nothing |
+| `run(settings, selection, out_dir)` | writes the results and returns a `JobResult` with status, issues, outputs and the equivalent `dfm` command |
+
+```python
+from dicom_file_modifier.api import dose, selection
+
+sel = selection.for_dose("data/<case-id>")        # same files the CLI would pick
+settings = dose.Settings(eclipse_compat="high")   # defaults = CLI defaults
+pv = dose.preview(dose.inspect(sel), settings)    # targets, Rx, ROI names, fine grid + memory estimate
+if pv.ok:
+    res = dose.run(settings, sel, "C:/Results/<case-id>_IDX")
+    print(res.status, res.outputs, res.command)
+```
+
+The results are identical to the CLI's; `tests/test_api.py` checks this on the demo case.
 
 ### Analyzer
 
@@ -105,6 +203,13 @@ python -m dicom_file_modifier.modifier data/<case-id>/CT \
 This produces:
 - `CT_0000.dcm … CT_NNNN.dcm`: Transformed CT series on the original axial grid (with `--method metadata` the pixels are unchanged and the slices become oblique instead)
 - `visualization_3d.html`: Interactive 3D comparison (original vs. transformed)
+
+**Input and checks:**
+- The input folder may also be a flat export: only files with `Modality` CT are read, and RTSTRUCT, RTPLAN and RTDOSE next to them are skipped.
+- The folder must hold exactly one CT series, and every slice exactly once.
+- The CT geometry is checked like in the case modifier (see *Pre-Flight Validation*). Feet-first and tilted series are rejected.
+- Input errors end with exit code 2 and a message.
+- For a supine patient, `--rx` is pitch, `--ry` yaw and `--rz` roll.
 
 **All CLI options:**
 
@@ -232,10 +337,41 @@ This produces `output/<case-id>_IDX/`:
 | `--eclipse-tol-pct` | `5` | Relative tolerance of the comparison in %; larger deviations are marked `!` and listed as warnings |
 | `--no-eclipse-dvh` | off | Ignore the Eclipse DVHs stored in the RTDOSE |
 | `--no-viz` / `--no-viz-ct` | off | Skip the validation view (`validation.html`, `dose_overview.png`) / draw it without the CT background |
-| `--list` / `--self-test` | off | ROI table + prescriptions; analytic phantom self-test |
+| `--list` / `--self-test` | off | ROI table + prescriptions (needs no RTDOSE); analytic phantom self-test |
 | `--output` | `output` | Base output directory |
 
 See [Dose Index Documentation](#dose-index-documentation) for the definitions, the grid conventions and the Eclipse comparison.
+
+### Synthetic Demo Case and Golden Tests
+
+`demo.py` writes a fully synthetic head-phantom case that every tool accepts, so the tools can be tried, tested and demonstrated without patient data:
+
+```bash
+# Standard case: CT/ subfolder, RS/RP/RD at the case root (Eclipse-style file names)
+python -m dicom_file_modifier.demo output/demo
+# Variants: flat export folder, extra beam doses or two plan doses, no DVH, RLE-compressed CT,
+# eclipse_ref.json with one or two targets
+python -m dicom_file_modifier.demo output/demo_flat --layout flat
+python -m dicom_file_modifier.demo output/demo_rle --rle --rd-set plan+2beams --eclipse-ref ptv1
+```
+
+The case is head-first supine: a water cylinder with a bone shell (CT 128 × 128 px at 2 mm, 80 slices at 1 mm). It contains the following:
+- two spherical PTVs with separated isodoses (PTV_1 R = 10 mm, 20 Gy; PTV_2 R = 6 mm, 18 Gy) and a GTV
+- serial and parallel OARs at known distances, an OAR with an XOR hole and a two-component OAR
+- a helper union, a CONTROL ring, two POINT markers and an empty ROI
+- an RTPLAN with both prescriptions
+- an RTDOSE with an analytic dose (one smooth Hill profile per target) and an Eclipse-style cumulative DVHSequence (targets, body, one OAR)
+
+UIDs are deterministic. `demo_expected.json` holds the closed-form reference values: TV, PIV (component and global), CI, GI, HI and D98/D50/D2 for the slab and Eclipse volume models, plus the planimetric structure volumes.
+
+`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. In migration mode, contour rings whose point count changed are compared geometrically (same plane, Hausdorff distance, XOR area). It is the safety net for refactoring the CLI modules and for environment upgrades. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local. No snapshots are committed: the synthetic ones alone are about 50 MB, and exact parity is only reliable on the same machine.
+
+```bash
+python tools/golden.py make-inputs                 # generate the synthetic inputs once (+ SHA-256 manifest)
+python tools/golden.py run --label G0              # run all scenarios, write normalized snapshots
+python tools/golden.py run --label G0 --only "real*" --real data/<case-id>   # add local real cases
+python tools/golden.py compare G0 G1 --mode exact  # or --mode migration
+```
 
 ## Dependencies
 
@@ -730,7 +866,7 @@ A DICOM RTSTRUCT stores ROI contours as flat lists of (x, y, z) coordinates in t
 Because $\mathbf{T}$ is a rigid transformation, $\lVert\mathbf{R}\mathbf{p}_1 - \mathbf{R}\mathbf{p}_2\rVert = \lVert\mathbf{p}_1 - \mathbf{p}_2\rVert$ for all pairs of points, and consequently:
 
 - Contour shapes are not distorted (no shearing, no anisotropic scaling).
-- The **true 3D volume** is preserved exactly, since a rigid transform has $|\det \mathbf{R}| = 1$. Note, however, that the volume *re-measured* afterwards by the planimetric Shoelace + mean-slice-spacing formula is invariant only for translations and pure Z-rotations. For X/Y rotations that tilt the contour planes by an angle $\theta$, it shrinks by roughly $\cos^2\theta$ (−0.8 % at 5°, −3 % at 10°, −7 % at 15°). The Shoelace formula measures the area projected onto the axial plane ($A\cos\theta$), and the z-spacing of the tilted contours shrinks by the same factor. This is an artefact of the per-axial-slice convention (see [The `resample` vs `metadata` Trade-Off](#the-resample-vs-metadata-trade-off)), not a change of the true volume.
+- The **true 3D volume** is preserved exactly, since a rigid transform has $|\det \mathbf{R}| = 1$. Note, however, that the volume *re-measured* afterwards by the planimetric Shoelace + mean-slice-spacing formula is invariant only for translations and pure Z-rotations. For X/Y rotations that tilt the contour planes by an angle $\theta$, it shrinks by roughly $\cos^2\theta$ (−0.8 % at 5°, −3 % at 10°, −7 % at 15°) for a structure with one contour per slice. The Shoelace formula measures the area projected onto the axial plane ($A\cos\theta$), and the z-spacing of the tilted contours shrinks by the same factor. With several contours per slice (holes, islands) the error is far larger; see the trade-off section. This is an artefact of the per-axial-slice convention (see [The `resample` vs `metadata` Trade-Off](#the-resample-vs-metadata-trade-off)), not a change of the true volume.
 - Centroids transform linearly: $\mathbf{T}(\overline{\mathbf{p}}) = \overline{\mathbf{T}(\mathbf{p}_i)}$, which is exploited by `--verify` as a per-ROI sanity check.
 
 The implementation reads `ContourData`, reshapes the flat list into an $N \times 3$ matrix, applies $\mathbf{T}$ to every row in homogeneous coordinates, formats the result back into the flat string list with six-decimal precision, and writes it back. `NumberOfContourPoints` is unchanged.
@@ -803,8 +939,10 @@ The label suffix is configurable via `--label`. The transform description always
 Before any data is written, the case modifier validates the input:
 
 1. **Folder layout.** The case directory must exist and contain a `CT/` subfolder. Exactly one `RS*.dcm` file must be present at the case root (or `--rs PATH` must be given). Sibling `RP*.dcm`/`RD*.dcm` files trigger a hint warning.
-2. **CT geometry.** All slices must share the same `ImageOrientationPatient` (within 1e-3) and `PixelSpacing` (within 1e-4 mm). Slice spacing must be uniform within 1 % relative deviation. At least 2 slices are required. The orientation is only checked for consistency across slices, not for being axial (see *Limitations and Out-of-Scope*).
+2. **CT geometry.** Only the CT headers are read at this point, not the pixels. All slices must share the same `ImageOrientationPatient` (within 1e-3) and `PixelSpacing` (within 1e-4 mm). Slice spacing must be uniform within 1 % relative deviation, and at least 2 slices are required. The slice step must run along the slice normal $\mathbf{n}$: $\hat{\mathbf{s}} \cdot \mathbf{n} \geq 0.999$ for the unit step $\hat{\mathbf{s}}$ between the first two slices. Head-first series (HFS, HFP) pass; feet-first series and gantry tilts above about 2.6° are rejected. Otherwise the orientation is not required to be axial (see *Limitations and Out-of-Scope*). Duplicate `SOPInstanceUID`s in the CT folder are rejected.
 3. **FoR consistency.** The CT slices must all carry the same `FrameOfReferenceUID`, and the RTSTRUCT must reference this FoR through its `ReferencedFrameOfReferenceSequence`. A mismatch raises a clear error — almost always indicating that the user picked an RS file that does not belong to this CT.
+4. **Label.** `--label` becomes part of a folder and a file name. Characters that Windows forbids (`<>:"/\|?*`), reserved names (`CON`, `NUL`, `COM1`, …) and a trailing dot or space are rejected.
+5. **Planning.** The transformed RTSTRUCT is built and checked for clipping before anything is written. An RTSTRUCT that references CT slices missing from the folder therefore fails here, not after the CT has been written.
 
 Any failure terminates the run with exit code 2 before any output is written.
 
@@ -819,11 +957,12 @@ Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication t
 
 **`--method resample` (default):** the CT's voxel grid stays axial, and pixels are inverse-mapped from the source. The contour points are still rotated by $\mathbf{T}$ in 3D, which means **after a non-axial rotation, the contours are tilted polygons that no longer lie on the axial slice planes** of the new CT. DICOM RTSTRUCT is conventionally per-axial-slice, so this is technically off-spec. Two consequences:
 - *Clipping at the grid boundaries.* The output grid is fixed, so anatomy moved beyond it is lost. Grid regions whose source lies outside the original scan are filled with −1000 HU. A contour point that stays inside the grid always has the correct anatomy beneath it, because it samples exactly its original source position. A contour point moved *outside* the grid has no image data at all. The case modifier detects such points automatically and prints a per-ROI warning at the end of the run.
-- *Volume measurements via the per-axial-slice formula (XOR area × nominal slice spacing) are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure a volume reduced by roughly $\cos^2\theta$ (−3 % at 10°, −7 % at 15°). This is a measurement artefact of the formula, not a transformation error.
+- *Volume measurements via the per-axial-slice formula (XOR area × nominal slice spacing) are no longer invariant.* The transformation itself preserves volume in 3D, but a tool that interprets the output RS as per-axial-slice contours (including this repo's `analyzer.py`) will measure a volume reduced by roughly $\cos^2\theta$ (−3 % at 10°, −7 % at 15°) for a structure with one contour per slice. When a slice holds several contours (holes, islands), its tilted contours no longer share one z value. The per-slice grouping then splits them, and the measured volume can collapse even at small angles. This is a measurement artefact of the formula, not a transformation error.
+- *Slice references and slice planes.* The grid stays fixed, so after the motion each contour's `ContourImageSequence` points to the output slice at its new position, the nearest slice plane along the slice normal, and not to the slice with its old index. With `metadata` the slices move with the contours and keep their index. Some contours no longer lie in a slice plane: they are tilted by an X/Y rotation, or they lie between two slices because the z-shift is not a multiple of the slice spacing. For these the run warns with `CASE.CONTOURS_OFF_PLANE` before anything is written, and the warning also appears in the app's pre-check. A TPS may discard such contours on import or move them to the nearest slice. Contours moved beyond the first or last slice are reported by the clipping warning instead.
 - *Z-only rotations are immune* to the tilt and volume effects, because $r_z$ leaves contour Z values unchanged and each contour stays in its original axial slice. They can still move anatomy out of the in-plane grid when the rotation centre is far from the image centre or a translation is added.
 
 **Practical guidance:**
-- Pure translations: contours and anatomy stay exactly aligned with both methods. Resample keeps standard axial output, but on its fixed grid it discards whatever is shifted out and fills the vacated margin with air (for a z-shift, one end of the scan range).
+- Pure translations: contours and anatomy stay exactly aligned with both methods. Resample keeps standard axial output, but on its fixed grid it discards whatever is shifted out and fills the vacated margin with air (for a z-shift, one end of the scan range). Choose a z-shift that is a multiple of the slice spacing, so that the contours stay on the slice planes.
 - Z-rotation only: both methods are exactly equivalent in geometric fidelity; resample is preferable for TPS compatibility.
 - X/Y rotation: prefer **metadata** for analytic correctness if your TPS accepts oblique CT/RS; otherwise accept the resample artefacts and verify on critical structures.
 
@@ -831,8 +970,8 @@ Rigid-body rotation of a CT + RTSTRUCT pair has a subtle geometric implication t
 
 Three orthogonal modes are provided to verify correctness:
 
-- **`--dry-run`** — runs all input validation, computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. No files are written.
-- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI vertex centroids (the mean of all contour points), and compares them with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Vertex centroids transform linearly under rigid (indeed any affine) motion, so a deviation well above the ~1e-6 mm rounding floor (e.g. > 1e-4 mm) indicates a bug in the transform pipeline. The maximum norm and the worst ROI are reported; the check is informational and does not change the exit code.
+- **`--dry-run`** — runs all input validation and the planning step (including the RTSTRUCT transform), computes the transform matrix, resolves the rotation centre, and prints a plan including the resolved centre, the 4×4 matrix $\mathbf{T}$, and the planned output paths. It reads no CT pixels and writes no files.
+- **`--verify`** — after writing the transformed RS, re-reads it from disk, computes per-ROI vertex centroids (the mean of all contour points), and compares them with $\mathbf{T} \cdot \overline{\mathbf{p}}_{\text{orig}}$. Vertex centroids transform linearly under rigid (indeed any affine) motion, so a deviation well above the ~1e-6 mm rounding floor (e.g. > 1e-4 mm) indicates a bug in the transform pipeline. The maximum norm and the worst ROI are reported. Above 1e-3 mm the check fails and prints a warning; the exit code stays unchanged.
 - **`--self-test`** — runs three independent checks, each writing to a temporary directory with `--method metadata` (so the CT resampling path is not exercised), and reports PASS/FAIL each:
   1. *Identity round-trip*: zero translation, zero rotation; every contour point matches the original within 1e-4 mm. Catches accidental side effects in the pipeline.
   2. *Z-rotation pairwise distance drift* (15°): point-to-point distances within each ROI (up to 200 randomly sampled points per ROI) are preserved within 1e-3 mm. Validates the trivially-volume-preserving direction.
@@ -970,7 +1109,7 @@ The heatmap and lollipop layouts are chosen to stay readable at ~40 structures a
 
 ### Matplotlib Backend
 
-`matplotlib.use("Agg")` is set at module level so the visualizer can run on headless servers (e.g., CI pipelines, remote compute nodes) without an X display. All output is written to files; no interactive window is opened.
+The plots use matplotlib's object-oriented API: every figure is a `matplotlib.figure.Figure` with its own Agg canvas, and pyplot is never imported. Importing the visualizer therefore does not switch the global matplotlib backend, and there is no global figure state. The plots run on headless machines (CI, remote nodes, a background worker) and in several threads. All output is written to files; no window is opened. `run_visualization` returns which plots were written and which were skipped, and why.
 
 ---
 
@@ -1074,7 +1213,7 @@ On a clinical SRS case this mode reproduced Eclipse's DVH statistics of the targ
 The report compares every component the indices are built from against the values of the TPS, from two sources:
 
 - **Eclipse DVHs in the RTDOSE.** Eclipse exports the cumulative DVHs of the structures it evaluated into the RTDOSE `DVHSequence` (`DVHType` `CUMULATIVE`, `DoseUnits` `GY`, `DVHVolumeUnits` `CM3`; `DVHData` is a flat list of bin-width / cumulative-volume pairs and `DVHDoseScaling` scales the widths). The tool reads them automatically (`--no-eclipse-dvh` disables it). For every evaluated target with a DVH this yields the TPS target volume, the target volume inside the prescription isodose ($V_{D_{\mathrm{Rx}}}$ of the target, i.e. $\mathrm{TV}_{\mathrm{PIV}}$), $D_{98}$ / $D_{50}$ / $D_2$ and $D_{\min}$ / $D_{\max}$ / $D_{\mathrm{mean}}$; a DVH of the body (`EXTERNAL`) yields the TPS prescription isodose volume ($V_{D_{\mathrm{Rx}}}$ of the body $= \mathrm{PIV}$) and $V_{D_{\mathrm{Rx}}/2} = \mathrm{PIV}_{50}$. The bin volumes are read at the **left bin edge**: bin 0 at 0 Gy carries the total volume and the last non-empty bin then sits exactly at `DVHMaximumDose`; with the usual 0.01 Gy bins the other convention would shift $V_{D_{\mathrm{Rx}}}$ by 0.0003 cm³. Items that are differential, relative, combined over several ROIs or marked `EXCLUDED` are skipped with a note, and the DVHs are only used when the RTDOSE references the evaluated RTSTRUCT.
-- **TPS values supplied by the user.** A file `eclipse_ref.json` in the case folder (or `--eclipse-ref PATH`) and/or `--eclipse-values KEY=VALUE,…` on the command line. Keys are case-insensitive aliases of the canonical names (`TV`/`tv_cm3`, `VRX`/`tv_piv_cm3`, `PIV`/`piv_cm3`, `V50`/`piv50_cm3`, `CI`, `GI`, `HI`, `D98`, `D50`, `D2`, `Dmean`, `Dmin`, `Dmax`); `V20Gy` / `V10Gy` are resolved through the prescription (a dose equal to $D_{\mathrm{Rx}}$ means $\mathrm{TV}_{\mathrm{PIV}}$, half of it $\mathrm{PIV}_{50}$, anything else is an error). Targets are addressed by exact name, case-insensitive name or unique prefix; `"*"` (JSON) or a bare `KEY=VALUE` (CLI) is accepted only when a single target is evaluated, otherwise use `NAME:KEY=VALUE`.
+- **TPS values supplied by the user.** A file `eclipse_ref.json` in the case folder (or `--eclipse-ref PATH`) and/or `--eclipse-values KEY=VALUE,…` on the command line. Keys are case-insensitive aliases of the canonical names (`TV`/`tv_cm3`, `VRX`/`tv_piv_cm3`, `PIV`/`piv_cm3`, `V50`/`piv50_cm3`, `CI`, `GI`, `HI`, `D98`, `D50`, `D2`, `Dmean`, `Dmin`, `Dmax`); `V20Gy` / `V10Gy` are resolved through the prescription (a dose equal to $D_{\mathrm{Rx}}$ means $\mathrm{TV}_{\mathrm{PIV}}$, half of it $\mathrm{PIV}_{50}$, anything else is an error). Targets are addressed by exact name, case-insensitive name or unique prefix; `"*"` (JSON) or a bare `KEY=VALUE` (CLI) is accepted only when a single target is evaluated, otherwise use `NAME:KEY=VALUE`. `eclipse_ref.json` may hold more targets than the run evaluates: a target that matches none of them only adds a note, while an ambiguous name, or an unknown target in `--eclipse-values`, remains an error.
 
 ```json
 {"_meta": {"source": "TPS plan evaluation, values copied by hand", "date": "YYYY-MM-DD"},
@@ -1084,7 +1223,7 @@ The report compares every component the indices are built from against the value
 
 Precedence is `--eclipse-values` > JSON > DVH. Missing values are then derived from the given ones and tagged `derived`: the TPS prescription isodose volume from a TPS Paddick index ($\mathrm{PIV} = \mathrm{TV}_{\mathrm{PIV}}^{\,2} / (\mathrm{TV} \cdot \mathrm{CI})$), the Paddick index from the components, $\mathrm{GI} = \mathrm{PIV}_{50} / \mathrm{PIV}$ and the ICRU 83 index from $D_2$, $D_{98}$ and $D_{50}$; when both a CI and a PIV are given and disagree by more than 1 % a note is printed.
 
-The block `Abgleich Eclipse` of each target then lists, for the 13 quantities, the tool value, the TPS value, the absolute and the relative difference and the source (`dvh`, `json`, `cli`, `derived`). The tool's PIV and PIV₅₀ in this table are always the **global** isodose volumes, because the TPS reports the whole isodose; with `--piv-scope component` the table says so. Rows whose relative difference exceeds `--eclipse-tol-pct` (default 5 %) are marked with `!` and repeated under the target's warnings; the exit code is not affected. The same rows appear in the JSON (`targets[<name>].eclipse`, with `meta.eclipse_reference` naming the sources) and as `ecl_*` / `d_*_pct` columns at the end of the CSV. Because the CSV header grew, appending to a collection CSV written by an older version stops with a clear error before anything is computed; rename the old file or give a new `--append-csv` path.
+The block `Abgleich Eclipse` of each target then lists, for the 13 quantities, the tool value, the TPS value, the absolute and the relative difference and the source (`dvh`, `json`, `cli`, `derived`). The tool's PIV and PIV₅₀ in this table are always the **global** isodose volumes, because the TPS reports the whole isodose. With `--piv-scope component` the CI and GI rows are computed from these global volumes too (TV∩PIV is the same in both scopes), so the comparison stays like for like; those rows carry the note `mit globalem PIV`, and the table says so. Rows whose relative difference exceeds `--eclipse-tol-pct` (default 5 %) are marked with `!` and repeated under the target's warnings; the exit code is not affected. The same rows appear in the JSON (`targets[<name>].eclipse`, with `meta.eclipse_reference` naming the sources) and as `ecl_*` / `d_*_pct` columns at the end of the CSV. Because the CSV header grew, appending to a collection CSV written by an older version stops with a clear error before anything is computed; rename the old file or give a new `--append-csv` path.
 
 When the RTDOSE holds only the target's DVH (Eclipse exports the DVHs of the structures that were evaluated in the plan), TV, $\mathrm{TV}_{\mathrm{PIV}}$ and the D-values are compared automatically while PIV and PIV₅₀ wait for the TPS values (`n/a (kein Body-DVH; manuell angeben)`). Entering the CI the TPS reports (`--eclipse-values CI=0.79`) makes the tool derive the PIV the TPS must have used and compare it with its own, which localises a CI gap either in the isodose volume or in the target statistics.
 

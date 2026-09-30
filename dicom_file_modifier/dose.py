@@ -28,8 +28,11 @@ from typing import Optional
 import numpy as np
 import pydicom
 from scipy import ndimage
+from scipy.integrate import trapezoid
 
+from . import _runtime
 from . import analyzer as ana
+from .dicom_utils import get_rs_frame_of_references
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +209,6 @@ def validate_dose_against_rtstruct(dose: DoseGrid, rs_ds: pydicom.Dataset,
     FoR-Mismatch RD<->RS -> ``ValueError``; abweichende Referenz-UIDs
     (RD->RS, RD->RP, RP->RS) -> Warnungstexte.
     """
-    from .case_modifier import get_rs_frame_of_references
-
     warnings = []
     rs_fors = get_rs_frame_of_references(rs_ds)
     if dose.frame_of_reference_uid and rs_fors and dose.frame_of_reference_uid not in rs_fors:
@@ -393,7 +394,7 @@ def dvh_statistics(dvh: EclipseDVH, rx_gy: float) -> dict:
     tot = dvh.total_volume_cm3
     dmean = dvh.dmean_gy
     if dmean is None and tot > 0 and len(dvh.dose_gy) > 1:
-        dmean = float(np.trapz(dvh.volume_cm3, dvh.dose_gy) / tot)
+        dmean = float(trapezoid(dvh.volume_cm3, dvh.dose_gy) / tot)
     return {
         "total_cm3": tot,
         "v_rx_cm3": dvh.v_at(rx_gy),
@@ -489,10 +490,13 @@ def native_level_bbox(dose: DoseGrid, level_gy: float, margin_voxels: int = 2) -
     return pts.min(axis=0), pts.max(axis=0)
 
 
+MAX_FINE_VOXELS = 40_000_000       # Obergrenze des Feingitters (Speicher)
+
+
 def build_fine_grid(dose: DoseGrid, bbox_lo, bbox_hi, res_xy: float,
                     contour_z: Optional[np.ndarray] = None,
                     restrict_z_to: Optional[np.ndarray] = None,
-                    margin_mm: float = 1.0, max_voxels: int = 40_000_000,
+                    margin_mm: float = 1.0, max_voxels: float = MAX_FINE_VOXELS,
                     align: Optional[tuple] = None) -> FineGrid:
     """
     Feingitter ueber die BBox: In-Plane-Achsen an 1-mm-Vielfache gesnappt
@@ -762,8 +766,12 @@ def sample_dose_on_grid(dose: DoseGrid, grid: FineGrid, order: int = 1) -> np.nd
     vol, offset = _crop_for_sampling(dose, corners, order)
     out = np.empty(grid.shape, dtype=np.float32)
     ny, nx = len(grid.gy), len(grid.gx)
-    for k in range(len(grid.gz)):
+    ctx = _runtime.current()
+    nz = len(grid.gz)
+    for k in range(nz):
+        ctx.check_cancel()
         out[k] = _sample(vol, offset, dose, grid.plane_points(k), order).reshape(ny, nx)
+        ctx.progress(k + 1, nz, "Dosis auf dem Feingitter abtasten")
     return out
 
 
@@ -946,6 +954,9 @@ def _trace_rings(values: np.ndarray, level: float, grid: FineGrid, k: int,
             continue
         if simplify_mm > 0:
             try:
+                # GEOS >= 3.13 entfernt dabei auch den Ring-Startpunkt, wenn er innerhalb
+                # der Toleranz liegt (aeltere Versionen behielten ihn immer); der Startpunkt
+                # hat keine geometrische Bedeutung, die Abweichung bleibt < simplify_mm
                 simp = LinearRing(xy).simplify(simplify_mm, preserve_topology=True)
                 coords = np.asarray(simp.coords)[:-1]
                 if len(coords) >= 3:

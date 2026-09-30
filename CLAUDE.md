@@ -4,13 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Python toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set (RTSTRUCT) files and CT DICOM series used in radiotherapy planning. The package is `dicom_file_modifier/` and ships four runnable modules.
+Python toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set (RTSTRUCT) files and CT DICOM series used in radiotherapy planning. The package is `dicom_file_modifier/` and ships five runnable modules.
 
 ## Common Commands
 
-Install dependencies:
+Install dependencies (Python ≥ 3.12; `uv.lock` pins the tested versions on Python 3.14):
 ```bash
-pip install -r requirements.txt
+uv sync                  # .venv with Python 3.14 and the locked dependencies
+pip install -e .         # alternative: minimum versions from pyproject.toml
+uv run pytest            # test suite in tests/
+```
+
+One entry point `dfm` (installed by `uv sync` / `pip install -e .`, also `python -m dicom_file_modifier`):
+```bash
+dfm analyze|visualize|ct-transform|case-transform|dose-indices|demo ...   # = python -m dicom_file_modifier.<module> ..., argv unchanged
+dfm selftest              # installation check: all self-tests, case_modifier on a freshly generated demo case
+dfm --version [--json]    # package, tool and library versions
+dfm gui [CASE]            # desktop app (needs `uv sync --extra gui`); also `dicom-rt-toolkit`
 ```
 
 Each module is invoked as `python -m dicom_file_modifier.<module>`:
@@ -53,6 +63,14 @@ python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high 
 python -m dicom_file_modifier.dose_indices data/<case-id> --list
 python -m dicom_file_modifier.dose_indices --self-test
 python -m dicom_file_modifier.rtstruct_writer --self-test
+
+# Synthetic demo case (CT + RS + RP + RD, no patient data; deterministic UIDs, demo_expected.json)
+python -m dicom_file_modifier.demo output/demo [--layout flat] [--rd-set plan+2beams|2plans] \
+    [--no-dvh] [--explicit-vr] [--rle] [--eclipse-ref ptv1|both] [--size medium]
+# Golden-output harness (CLI parity); work dir %USERPROFILE%\dfm-golden (outside the repo)
+python tools/golden.py make-inputs
+python tools/golden.py run --label G0 [--only PATTERN] [--real data/<case-id> ...]
+python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected]
 ```
 
 `dose_indices` flags: `--target NAME[,NAME]` (default: PTVs classified as targets; a RTPLAN `DoseReferenceDescription` prefix narrows to one), `--rx GY` / `--rx-pct-of-max PCT` (default: RTPLAN `TargetPrescriptionDose`), `--isodose 100,50[,80,12Gy]`, `--grid {1.0,0.5,0.25,0.1}` (in-plane mm, default 0.25; z stays on the dose planes), `--dose-interp {linear,cubic}`, `--volume-model {slab,eclipse}` (eclipse = end slabs count half), `--piv-scope {global,component}` (default component: only the Rx-isodose component(s) overlapping the target), `--iso-contours {mask,field}`, `--eclipse-compat {high,default}` (sets grid = 1 or 2 CT pixels aligned to the CT pixel raster, eclipse volume model, global PIV, linear, field isolines, no simplification), `--label` (default `_IDX`), `--no-rs`, `--include-target`, `--simplify-mm`, `--transfer-syntax`, `--max-name-len`, `--append-csv PATH` (cross-case collection table; refuses a file with an older header), `--eclipse-ref PATH` (default `<case>/eclipse_ref.json` if present), `--eclipse-values "[NAME:]KEY=VAL,..."` (aliases TV/VRX/PIV/V50/CI/GI/HI/D98/...; `V<n>Gy` resolved via Rx), `--eclipse-tol-pct` (default 5; rows outside are marked `!` and listed as warnings, exit code unchanged), `--no-eclipse-dvh`, `--no-viz`, `--no-viz-ct`.
@@ -61,14 +79,253 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no pytest suite, lint config, or build step in this repo. The only automated checks are `python -m dicom_file_modifier.analyzer --self-test` (synthetic geometry: XOR holes, keyhole contours, z-gaps), `python -m dicom_file_modifier.case_modifier <case> --self-test` (rigid-body round trip), `python -m dicom_file_modifier.dose_indices --self-test` (analytic sphere phantom with closed-form CI/GI/HI expectations) and `python -m dicom_file_modifier.rtstruct_writer --self-test` (mask → contour → RTSTRUCT round trip).
+There is no lint config yet; `pyproject.toml` declares ruff as a dependency group and builds the package with hatchling. The automated checks are:
+- `uv run pytest` (`tests/`, restricted via `testpaths`):
+  - `tests/test_import_graph.py` checks four things:
+    - no import cycles at module level;
+    - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
+    - layers: no core module imports `api` (except the entry point `cli`), and `api` never imports `gui`;
+    - every module, including `api/*`, imports first in a fresh interpreter.
+  - These tests use the demo case:
+    - `tests/test_dose_indices.py`: candidates, fixes, stages, progress and cancel;
+    - `tests/test_case_modifier.py`: stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
+    - `tests/test_modifier.py`: CT loader filters, `run_ct_transform`, resample progress and cancel, no browser, exit 2;
+    - `tests/test_analyzer_viz.py`: silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot;
+    - `tests/test_cli.py`: `dfm` forwards argv unchanged, one version everywhere, `dfm selftest`;
+    - `tests/test_api.py`. It checks:
+      - Settings ↔ argparse: every CLI option is a field or a known non-setting, defaults and choices match, and a round trip through the real parser gives the same settings;
+      - the dose CLI hands the core the same arguments as the API;
+      - API output = CLI output: structures byte-identical, dose report and RS contours, transform CT geometry and contours; the copied command reproduces the run;
+      - `inspect`/`preview` print nothing and load no pyplot, `visualizer`, `dose_viz` or plotly;
+      - preview = run: ROI names and the Eclipse-mode values;
+      - error classes and exit codes;
+      - the inputs stay unchanged.
+    - `tests/test_worker.py`: JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
+    - `tests/test_packaging.py`: the third-party notices generator runs without a build and names the LGPL components.
+    - `tests/test_gui.py` (offscreen, skipped without PySide6):
+      - the structure page, the dose page (locked fields, error marks, metric table with Eclipse columns) and the transform page (centre choice, run, CT only) end to end through the real worker;
+      - `DecimalSpinBox` and the CLI-option-to-field-name mapping;
+      - `JobRunner` cancel;
+      - the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
+- `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
+- `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
+- `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
+- `python -m dicom_file_modifier.rtstruct_writer --self-test`: mask → contour → RTSTRUCT round trip.
+- The golden-output harness `tools/golden.py`.
+
+**Golden harness (`tools/golden.py`):**
+- It runs 43 scenarios as subprocesses on the demo variants, plus optional local real cases (`real<n>_*`, case folder name replaced by `REAL<n>`).
+- One scenario is `cli_surface`: `tools/cli_surface.py` captures every `main()` parser's options, dests, defaults, choices and types.
+- It writes normalized snapshots. UIDs become `UID<n>` by first occurrence; paths, timestamps and `tempfile` names become placeholders; DICOM is stored as a tag dump plus a pixel hash, and CT pixel arrays go to `arrays.npz`.
+- The DICOM dump is independent of the pydicom version:
+  - `FileMetaInformationGroupLength` is masked, because pydicom 3 mints random UIDs of 62–64 characters.
+  - Tags without a keyword are written as `(gggg,eeee)`.
+  - Ambiguous VRs (`US or SS`) with integer values are stored as integers.
+- Every step records its runtime; it is not compared.
+- `compare --mode exact` is for refactoring PRs. `--mode migration` is for environment upgrades and uses the tolerances in `tools/golden_rules.json`:
+  - Integer strings (IS, counts) stay exact.
+  - Contour rings whose point count changed are compared geometrically (`contour`: same plane, Hausdorff ≤ simplify + extra; XOR area only when no ring is a vertex subset of the other).
+- Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change.
+- `expected_changes` in the rules file lists the intended diffs of the current PR for `compare --expected`. An entry maps a scenario pattern to one of two forms:
+  - a text: the whole scenario may differ;
+  - `{"reason", "only": [patterns of diff messages]}`: only those diffs are expected, and any other diff stays FAIL.
+
+  The first matching pattern wins. Remove the entries after the re-baseline.
+- In `exact` mode, numbers in the console output that differ are failures, not warnings.
+- The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
+- No goldens are committed. The synthetic snapshots are about 50 MB, and exact parity is only reliable on the same CPU.
+- Every change to a CLI module is compared exactly against the run of the previous state (`compare P11 P12 --mode exact`). The older run is then deleted, because real-case runs contain patient data.
+- CI is to run the base and the PR commit on the same runner and compare them exactly.
 
 ## Architecture
 
-Five runnable modules plus three libraries. `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+Five runnable modules plus three libraries, and the synthetic test-case generator `demo` (with `phantom`). `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+
+**Import rule:**
+- No package module imports the orchestrators `case_modifier` or `dose_indices`.
+- Helpers used by several modules live in two modules that import nothing from the package (except the package version):
+  - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
+  - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION` (= `__version__`), `LEVEL_COLORS`, `HELPER_COLORS`.
+- `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to the worker, without changing core signatures.
+- The remaining lazy imports are not cycles:
+  - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The GUI process never imports `dose_viz`.
+  - `case_modifier` → `visualizer`/`analyzer` and `visualizer` → `modifier` only load what the chosen code path needs.
+- `tests/test_import_graph.py` enforces the rule.
+
+### `api/` — interface for the CLI command, the worker and the GUI
+The layer sits above the core; the core never imports it (only `cli` does), and it never imports `gui`. Every workflow module has the same shape:
+
+| Module | Wraps | `dfm` equivalent |
+|---|---|---|
+| `api/structures.py` | `analyzer` + `visualizer` | `analyze … --output DIR` and `visualize … --output DIR` |
+| `api/dose.py` | `dose_indices` | `dose-indices` |
+| `api/transform.py` | `case_modifier` (with RS) or `modifier` (CT only) | `case-transform` / `ct-transform` |
+
+- **`Settings`** is a dataclass of `fields.setting(...)` fields, each with a `FieldMeta`:
+  - display: label, help, unit, level basic/advanced/expert;
+  - range: choices, min/max (inclusive);
+  - CLI mapping: `cli_flag`, `cli_invert` (positive field, `--no-x` flag), `cli_default` (e.g. `--center` is `None` on the CLI and `"volume"` in the API), `tools`, `kind` names/spec/path;
+  - `enabled_if(settings, info)` → reason when a field does not apply.
+- **Defaults are the CLI defaults.** `SettingsBase` provides:
+  - `to_argv(tool)`: only values that differ from the CLI default; a value starting with `-` is written as `--flag=value`;
+  - `from_namespace(ns, tool)` and `to_dict`/`from_dict` (type coercion, unknown keys are an error unless `strict=False`);
+  - `validate(info)` → `Issue`s, `disabled_fields(info)`, `non_default()`.
+
+  `NON_SETTINGS` lists the options that are selection, output or mode (e.g. `--rs`, `--output`, `--list`).
+- **Functions** of each workflow module:
+
+  | Function | Returns | Notes |
+  |---|---|---|
+  | `inspect(selection)` | info | Reads only, prints nothing, never raises; problems become `issues` |
+  | `preview(info, settings)` | preview | Pre-start check with the same functions as the run; writes nothing |
+  | `command(settings, selection, out_dir)` | list of `dfm` argv lists | `command_gaps` names what the CLI cannot express, e.g. a flat-export CT |
+  | `run(settings, selection, out_dir)` | `JobResult` | Always; prints the CLI console text (the worker turns it into log lines) and imports the plot modules only here |
+  | `default_folder(settings, selection)` | folder name | `<case_id><label>` or `<case_id>_STRUCT` |
+- **`selection.CaseSelection`** names the files explicitly: `case_id`, `case_dir`, `ct_files`, `rs`, `rd`, `rp`, `eclipse_ref`, `related`.
+  - `for_dose`, `for_transform`, `from_rtstruct` and `from_ct_dir` make exactly the CLI's choice in the standard layout.
+- **`outputs.OutputSpec(root, folder, policy)`** handles the result folder:
+  - `root` must be absolute; `folder_name_problem` applies the Windows name rules;
+  - `target_dir` picks `_2`, `_3`, … for `policy="suffix"`, or reuses the folder for `overwrite`.
+- **`results`:**
+  - `JobResult(workflow, status ok|ok_warnings|failed|cancelled, exit_code 0/2/3/1, output_dir, outputs, issues, summary, timings, manifest, command)`. Outputs are relative to `output_dir`.
+  - `run_guarded` wraps the run body in a `StageTimer`. That context forwards stage/progress/cancel and measures the stages. It also turns exceptions into issues.
+  - `blocked` is the result when validation fails before the start.
+- **`issues`** re-exports `Issue`/`UserInputError` and translates exceptions into German issues:
+
+  | Exception | Code |
+  |---|---|
+  | `InvalidDicomError` | `DICOM.INVALID` |
+  | `FileNotFoundError` | `FILE.NOT_FOUND` |
+  | `PermissionError` | `FILE.PERMISSION` |
+  | other `OSError` | `FILE.IO` |
+  | `MemoryError` | `SYSTEM.MEMORY` |
+  | pydicom `AttributeError` | `DICOM.MISSING_TAG` |
+  | `KeyError` / `ValueError` | `INPUT.*` |
+  | `JobCancelled` | `JOB.CANCELLED` |
+  | anything else | `INTERNAL`, with the traceback |
+
+  `exit_code_for(exc)` returns 2 for input errors (`ValueError`, `KeyError`, `OSError`, `InvalidDicomError`, missing tags), 3 for cancel and 1 otherwise.
+- **`sysinfo`:** `available_memory_bytes()` (Windows `GlobalMemoryStatusEx`) and `format_bytes`.
+- **Previews:**
+  - dose: effective values and locked fields (`resolve_effective`, `ECLIPSE_LOCKED`), targets, Rx, levels, ROI names (`rtstruct_writer.planned_roi_names`), fine grid with a memory estimate (`DOSE.GRID_TOO_LARGE` above `dose.MAX_FINE_VOXELS`, `SYSTEM.MEMORY_LOW` against free RAM) and the Eclipse sources. Errors carry the field they belong to (`target`, `rx`, `isodose`, `eclipse_values`, `append_csv`, `grid_mm`).
+  - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`).
+- **Result layout:** the CT-only transform writes `<out>/CT/` plus `visualization_3d.html`, so every transform result is again a case folder.
+- **Jobs (`api/jobs.py`):** a `Job` is a JSON file (workflow, settings, selection, output). `execute_job` works in four steps:
+  1. validate, writing nothing on errors (exit 2);
+  2. run in `<root>/.stg<job_id>` with `run.log` and `run.json`;
+  3. commit with `os.replace`, retrying on locked files; `overwrite` swaps the old folder out via `.old*`;
+  4. run the workflow's `after_commit` hook, e.g. the collection CSV rows.
+
+  `cleanup_staging` removes orphaned `.stg*`/`.old*` folders; `run_job_inprocess` runs a job without a worker.
+- **Worker (`api/worker.py`, `dfm worker --job JOB.json`):** one job per process.
+  - Events are JSON lines on a duplicate of fd 1: hello, stage, progress, log, issue, artifact, heartbeat, result. fd 1 then points to stderr, so `print` in the core becomes `log`.
+  - Exit codes are 0/2/3/1.
+  - Cancel works through the file `<job>.cancel` (`cancel_file`), polled in `check_cancel`. A hard kill is also safe: the app deletes the staging folder.
+  - **Never read stdin in the worker.** On Windows, a thread blocked reading a stdin pipe makes every `GetFileType(stdin)` wait. DLLs call that while loading (numpy/OpenBLAS), under the loader lock, so the worker hangs at the first import and even `os._exit` hangs. QProcess always gives the child a stdin pipe.
+
+### `gui/` — desktop app (PySide6, extra `[gui]`)
+The GUI uses only `api`. Every computation runs in the worker, and the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
+
+| Module | Role |
+|---|---|
+| `app.py` | `dfm gui [CASE]`; sets the window icon and, on Windows, the AppUserModelID (own taskbar icon when started from Python); cleans up orphaned staging folders at start; `--smoke-test` exit 5 = icons do not render |
+| `icons.py` | `assets/`: `app.png`/`app.ico` (window, taskbar, both EXEs) and SVG symbols for the sidebar pages and the toolbar (`page_icon`, `icon`); the brand colours of the app icon (`NAVY`, `TEAL`, `CORAL`, …); `placeholder_pixmap` for the empty state of an `ImageViewer`. It imports `PySide6.QtSvg` so PyInstaller bundles Qt6Svg |
+| `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
+| `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`; `set_placeholder_icon` shows the page symbol over "Noch kein Ergebnis", `WorkflowPage.build` sets it), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
+| `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (toolbar with SVG icons, sidebar with page icons and the selection in the icon's navy via a stylesheet on the list only, progress with cancel, log dock) |
+| `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
+| `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
+| `transform_page.py` | RS combo or "Nur das CT transformieren" (`selection.from_ct_dir`; the centre is kept and restored, the label still names the folder); motion grid on patient axes (X + links, Y + posterior, Z + superior; mm/° suffixes) built from `external` form fields; centre combo (Volumenmitte, markers, Koordinate) that writes the `center` spec; check with `describe_motion` (rotation order for two or more angles), centre, the new `Drehpunkt` marker, method and FoR choice, the largest clipping, planned files and memory; result tabs "Vorher/Nachher", "Verschiebung je ROI" and "Bericht" (matrix T, clipping table, centroid check from the run summary), button for the 3D HTML |
+| `dose_page.py` | inputs by label (StructureSetLabel, summation type and Dmax, RTPlanLabel; file names in the tooltip), form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), "Kennzahlen" tab from the result JSON (rows = metrics; per target value, Eclipse, deviation; a separate `… global` row where the comparison used the whole isodose), report, `dose_overview.png`, button for `validation.html` |
+
+`JobRunner` details:
+- It starts the worker through `subprocess` with `CREATE_NO_WINDOW` rather than QProcess, and turns the JSON lines into signals.
+- Cancel writes `<job>.cancel` and kills the worker after 5 s.
+- It always deletes the staging folder and the job file afterwards.
+
+`WorkflowPage` behaviour:
+- `inspect` runs in the thread pool with a token, so stale results are dropped.
+- `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
+- The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
+- The result header has a state line (status and folder name, full path in the tooltip), the summary, a row with the page's buttons, "Ordner öffnen" and a small "…" menu ("dfm-Befehl kopieren" via `command_string`, "run.json öffnen"; kept out of sight on purpose, user decision), and the run line: duration plus the settings that differ from the defaults.
+- The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
+- Opening a Datensatz clears the result area, and no other Datensatz can be opened while a job runs, so a result always belongs to the open Datensatz.
+- The state line and the start button sit below the scrolling left column, so they are always visible.
+- The run line leaves out fields that were locked at the start and the page's `summary_fields`, and adds units.
+- A page supplies `selection`, `on_inspected`, `check`, `clear_outputs`, `show_outputs` and `summary_text`.
+
+The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fall".
+
+**Packaging (`packaging/`):**
+- `dfm.spec` builds one PyInstaller onedir folder `dist/DICOM-RT-Toolkit/` with two EXEs:
+  - `DICOM-RT-Toolkit.exe`: windowed, the GUI;
+  - `dfm.exe`: console, the CLI and the worker, without Qt.
+
+  `cli.py` and `api.workflow()` import the tools through importlib, so the spec lists them as hidden imports.
+- After `COLLECT` the spec copies `LICENSE` as `LICENSE.txt` and calls `third_party_notices.write_notices`, which writes `THIRD-PARTY-NOTICES.txt` next to the EXEs: the bundled distributions (from the Analysis names, via `packages_distributions`) with version, licence, source and the licence texts of their dist-info, the native components (Python, Qt 6, GEOS, OpenBLAS, OpenSSL, libffi, MSVC runtime, PyInstaller bootloader) and the full LGPL 3 / GPL 3 / LGPL 2.1 / Apache 2.0 texts from `packaging/licenses/`. Qt and PySide6 are used under the LGPL 3, GEOS under the LGPL 2.1. `python packaging/third_party_notices.py` regenerates the file from `build/dfm`.
+- `check_bundle.py` checks the build:
+  - the size and that it holds no DICOM files;
+  - `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` (Qt 6, PySide6, GEOS, the LGPL text);
+  - the versions, `dfm selftest`, the demo case, dose indices with viz and a case transform with its before/after views;
+  - `DICOM-RT-Toolkit.exe --smoke-test CASE`: the window and sidebar icons render (Qt6Svg in the bundle), every page inspects the case, then the structure page runs through the frozen worker, offscreen;
+  - both EXEs carry the app icon (`app.ico`).
+- Build with `.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm`. A plain `uv sync` removes the `gui` extra and the `build` group again (exact sync); `uv run` keeps them.
+
+### `demo.py` / `phantom.py` — synthetic test case
+`demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
+- **Contents:**
+  - CT: 128² px at 2 mm, 80 slices at 1 mm, unsigned 12-bit with intercept −1024.
+  - RS: 14 ROIs incl. `Rückenmark` (ISO_IR 100), an XOR-hole OAR, a two-component OAR, `h_PTV_gesamt` typed PTV, a CONTROL ring, POINT markers `HS1`/`Iso` and an empty ROI.
+  - RP: two DoseReferences, PTV_1 20 Gy and PTV_2 18 Gy.
+  - RD: 1 mm grid, uint32 at `DoseGridScaling` 1e-6, relative GFOV, `DVHSequence` for PTV_1/PTV_2/BODY/Hirnstamm.
+- **File names** follow Eclipse (`CT.<uid>.dcm`, `RS.<uid>.dcm`, ...).
+- **UIDs** are deterministic via `generate_uid(PYDICOM_ROOT_UID, entropy_srcs=[seed, role, i])`.
+- **DS values** are formatted by `demo._ds` (≤ 16 chars); files are written with `pydicom.dcmwrite(..., enforce_file_format=True)`.
+- **`phantom.py`:**
+  - `HillField` gives one smooth dose field per target.
+  - `SphereTarget.expected` computes closed-form slab/eclipse values and PIV/PIV50 component vs global, neglecting cross-talk between the fields (< 0.02 Gy).
+  - `cumulative_dvh` builds a numeric DVH on a fine grid. The BODY DVH is sampled only inside the dose-grid box; outside it counts as 0 Gy, like a TPS.
+- **Validation:** the default case passes `validate_ct_geometry`, `validate_index_against_rs`, `dose_grid_from_dataset` (no warnings) and `read_dvh_sequence` (no notes). `dose_indices` reproduces `demo_expected.json` within ~1 %.
+- **Scope:** head-first only. Feet-first is out of scope for the tool.
 
 ### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` / `dose_viz.py` — dose indices
 Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → `build_eclipse_reference` / `compare_with_eclipse` (RTDOSE `DVHSequence` via `dose.read_dvh_sequence`, `eclipse_ref.json`, `--eclipse-values`; precedence cli > json > dvh, gaps filled by `derive_eclipse_values`) → RS export → `dose_viz.run_dose_visualization` (`validation.html` + `dose_overview.png`, wrapped in try/except like the RS export) → report/JSON/TXT/CSV.
+
+**Orchestration.** `run_dose_indices` runs three stages:
+- `prepare_dose_run` → `DoseRunPlan` runs three steps:
+  - discovery (or `files=` from `dose_files`: explicit files, CT as a folder or a file list);
+  - `load_dose_inputs` → `DoseInputs`: RS/RD/RP, dose grid, reference checks and CT index. An unusable CT is only recorded as `ct_error`.
+  - `plan_dose_run`: targets, Rx, levels, Eclipse reference, the CT decision (error with RS export or Eclipse mode, else a warning) and `eclipse_compat_settings`.
+
+  `out_dir=` sets the exact result folder instead of `<output>/<case_id><label>`.
+- `compute_dose_run` → `DoseIndexArtifacts`.
+- `write_dose_outputs` → report: RS export, viz, JSON/TXT/CSV.
+
+Supporting pieces:
+- `run_dose_indices_ex` returns `(report, artifacts)`.
+- `plan_fine_grid` builds the target specs and the fine grid without sampling. The API preview uses it for the voxel count, with `max_voxels=inf` to measure even an oversized grid.
+- `rtstruct_writer.build_ct_slice_index` accepts a folder or a list of files.
+
+**Candidates without aborting**, for a GUI:
+- `target_candidates` and `rx_candidates` return the automatic choice with a reason. `select_targets` and `resolve_prescription` build on them and keep their messages.
+- `roi_table` is public.
+
+**Progress and cancel.** The stages and the loops call `_runtime.current()`:
+- stages: `prepare` / `compute` / `rs_export` / `viz` / `reports`;
+- loops: dose sampling per plane, per isodose level, per target.
+
+Without a context everything is a no-op. `_runtime.use(ctx)` sets a `JobContext`, whose `check_cancel()` may raise `JobCancelled`. RS-export and viz errors become warnings, but `JobCancelled` is re-raised.
+
+**Behaviour:**
+- An isodose level on Rx or Rx/2 given in Gy gets the key `"100"` / `"50"`.
+- An `eclipse_ref.json` target that is not evaluated only adds a note; ambiguous names stay errors.
+- Untrusted DVHs are not overlaid: they reference another structure set, so `dvh_map` is `{}`.
+- `--list` needs no RD (`discover_dose_case(need_rd=False)`).
+- With `--no-rs` and no `--eclipse-compat`, an unusable CT folder is a warning (no CT reference, no CT background).
+- The RS is written as `RS_*.dcm.tmp` and moved into place with `os.replace` after `verify_rtstruct`.
+- The pydicom `writing_validation_mode` toggle is locked.
+- `SoftwareVersions` is written in full (VR LO allows 64 characters).
 
 Key conventions:
 - All volumes come from the same fine grid; target-derived volumes (TV, TV∩PIV, underdosed) carry the slab weights, isodose-derived ones (PIV, PIV50, spill) do not, so TV∩PIV ≤ min(TV, PIV) always holds. Comparisons are inclusive (`>=`). `D_x` = dose received by x % of the weighted target volume (D98 = 2nd weighted percentile).
@@ -76,11 +333,24 @@ Key conventions:
 - `rtstruct_writer.write_isodose_rtstruct` builds a *fresh* Dataset (patient/study/FoR copied from the original RS, everything else new), one `CLOSED_PLANAR` contour per ring (holes are separate rings with negative area, Eclipse convention), `ContourImageSequence` referencing the CT slice at that z, explicit VR LE with a proper `FileMetaDataset`, written under `writing_validation_mode = RAISE`, then re-read by `verify_rtstruct`. Isodose contours come from `dose.mask_to_contours` (marching squares at 0.5) or, with `--iso-contours field` / `--eclipse-compat`, from `dose.field_to_contours` (isoline of the sampled dose; one vertex coordinate lies exactly on the grid lines, which is how Eclipse exports its "High"/"Default" resolution contours).
 - ROI names: `ISO_100%_20.0Gy`, `<Ziel>_x_ISO100`, `<Ziel>_minus_ISO100`, `ISO100_minus_<Ziel>`; `analyzer.classify_structure` files CONTROL/DOSE_REGION types and these name patterns under HELPER so they stay out of the clinical plots.
 - New-module console output is pure ASCII (`TV&PIV`, `>=`, `cm3`): the Windows console is cp1252 and `∩`/`≥` would raise `UnicodeEncodeError`. Files are UTF-8.
-- Eclipse comparison: `dose.EclipseDVH` reads the DVH bins at the **left edge** (bin 0 = total volume, last non-empty bin at `DVHMaximumDose`); a target DVH gives TV/TV∩PIV/D-values, only a body (`EXTERNAL`) DVH gives PIV/PIV50. `compare_with_eclipse` always compares against `piv_global_cm3`/`piv50_global_cm3`, appends out-of-tolerance rows to `result['warnings']` and never changes the exit code. `CSV_COLUMNS` carries the `ecl_*`/`d_*_pct` columns, so `_check_csv_header` refuses `--append-csv` onto an old collection file before anything is computed. JSON stays additive: `targets[name].eclipse`, `meta.eclipse_reference`, `outputs.viz_html_path/viz_png_path`.
+- Eclipse comparison: `dose.EclipseDVH` reads the DVH bins at the **left edge** (bin 0 = total volume, last non-empty bin at `DVHMaximumDose`); a target DVH gives TV/TV∩PIV/D-values, only a body (`EXTERNAL`) DVH gives PIV/PIV50. `compare_with_eclipse` always compares against `piv_global_cm3`/`piv50_global_cm3`; with PIV scope component it also recomputes CI and GI from those global volumes (TV∩PIV is the same in both scopes; row note `mit globalem PIV`), so a scoped tool CI never raises a false Eclipse alarm. It appends out-of-tolerance rows to `result['warnings']` and never changes the exit code. `CSV_COLUMNS` carries the `ecl_*`/`d_*_pct` columns, so `_check_csv_header` refuses `--append-csv` onto an old collection file before anything is computed. JSON stays additive: `targets[name].eclipse`, `meta.eclipse_reference`, `outputs.viz_html_path/viz_png_path`.
 - `dose_viz` reads `tm.result`, `art.eclipse` and `art.eclipse_dvh` (not `art.results`, which is only filled after the hook). It needs `ct_index['z_to_path']` (added to `build_ct_slice_index`) to load only the CT slices inside the fine grid; wash/CT are strided to ≤128 px per axis, meshes to ≤96 px in-plane, contours are never thinned; isodose meshes come from the dose field (marching cubes at the level), the target mesh from its mask. With `--no-rs` the ROI specs are still built for the view, so the report shows the would-be ROI names. Plotly's slider restyles all traces, so legend toggles do not survive a slice change (documented limitation).
 
 ### `analyzer.py` — RTSTRUCT geometric analysis
 Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions → `run_analysis` aggregates everything into a single results dict that is also written as `<rtstruct-stem>_analysis.json`.
+
+**Silent core and inspection:**
+- `analyze_rtstruct(path_or_ds, targets, oars)` → `(results, info)` prints nothing. `results` is exactly what `run_analysis` returns and writes to JSON.
+- `info` carries `names`/`types`/`categories`, the chosen ROI numbers, the analysis order `analyzed` (complete even with duplicate ROI names) and `issues`.
+- `run_analysis` is the print layer around it, with identical text.
+- Swallowed geometry errors are collected per ROI as `Issue` via a context variable. The values stay unchanged. Codes: `ANA.CONTOUR_DROPPED`, `ANA.SLICE_SKIPPED`, `ANA.RASTER_CONTOUR_SKIPPED`, `ANA.SURFACE_FAILED`, `ANA.HULL_FAILED`, `ANA.COMPONENTS_FAILED`, `ANA.ELONGATION_FAILED`, `ANA.CONTOUR_REPAIR_FALLBACK`, `ANA.POINTS_CAPPED`.
+- The thinning RNG (`_rng()`, seed 0) is fresh per `analyze_rtstruct` call, so a long-lived process matches a fresh CLI run.
+- `inspect_rtstruct(path_or_ds, volumes=True)` gives the quick ROI table (number, name, type, category, geometric types, contour count, planimetric volume, colour, marker), POINT markers, FoR UIDs and structure-set label/date.
+- `parse_name_list` trims `--targets`/`--oars` in both CLIs.
+- `find_point_markers` lives in `dicom_utils`.
+- `select_rois(names, categories, targets, oars)` is the ROI choice of `analyze_rtstruct`; the API preview uses it too.
+- `write_analysis_json` writes `<stem>_analysis.json` for `--output`.
+- `run_analysis(return_info=True)` also returns `info`, including the issues.
 
 Key conventions:
 - Contours are kept as a `list[np.ndarray]`, one (N,3) array per contour (a slice may hold several: islands and holes). `contours_to_points` flattens them when a unified point cloud is needed.
@@ -95,31 +365,70 @@ Two transform paths sharing the same affine math:
 
 Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` — in SciPy uppercase = intrinsic; the same matrix as an extrinsic ZYX rotation) about the volume's geometric centre; the offset is folded into `T` so a single 4×4 matrix represents the whole transform. All output series get fresh `SeriesInstanceUID` and per-slice `SOPInstanceUID`s. Optional Plotly HTML viz extracts surfaces with marching cubes (`skimage.measure.marching_cubes`).
 
-### `case_modifier.py` — case-level lockstep transform of CT + RTSTRUCT
-Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both. Pipeline:
+**Loading, checks and API:**
+- `load_ct_headers(dir_or_files, series_uid=None)` and `load_ct_series_files(files, series_uid=None)` keep only `Modality` CT with IPP. They require exactly one series (`series_uid` chooses; otherwise `UserInputError` `CT.MULTIPLE_SERIES`) and reject duplicate SOPs. The header loader filters first; then only the chosen files are read in full. So a flat Eclipse export, with RS/RP/RD next to the CT, works.
+- `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` calls it in the preflight.
+- `run_ct_transform(ct_dir, output_dir, tx..rz, method=, order=, viz=, viz_html=, series_uid=)` is the CLI run as a function and returns a dict (`n_slices`, `series_uid`, `sop_map`, `T`, `rotation_center`, `viz_html_path`). `ct_dir` may also be a list of CT files.
+- `main` catches input errors: exit 2 instead of a traceback.
+- `resample_volume` reports progress and checks for cancel per 20-slice chunk. Stages are `load` / `transform` / `viz`.
+- `visualize_3d` writes the HTML and returns the figure. It opens a browser only with `show=True`.
+- `save_ct_series` takes pre-assigned `series_uid` / `sop_map` and a `series_number_offset`.
+- Help texts for a supine patient: `--rx` pitch, `--ry` yaw, `--rz` roll.
 
-1. `discover_case` auto-finds `CT/` subdir and the unique `RS*.dcm` (override with `--rs`); warns about sibling `RP*`/`RD*` that do not get transformed.
-2. `validate_ct_geometry` enforces uniform `ImageOrientationPatient`, `PixelSpacing`, and slice spacing within 1% (it does not check that the orientation is axial or head-first). `validate_for_consistency` checks that the RTSTRUCT references the CT's `FrameOfReferenceUID`.
-3. `find_point_markers` enumerates all ROIs whose `ContourGeometricType == "POINT"` — these become valid rotation centres alongside `volume` and explicit `x,y,z`. `parse_center_spec` handles all three forms; `interactive_center_prompt` is used when stdin is a TTY and no `--center` is given.
-4. CT transform runs through `modifier`'s `build_rigid_transform`, `resample_volume` / `apply_metadata_transform`, and `save_ct_series`. `save_ct_series` returns a `{series_uid, frame_of_reference_uid_used, sop_map}` dict so the RS rewrite can map old→new SOP UIDs.
-5. `transform_rtstruct` applies `T` to every `ContourData` triple (rigid → no point-cloud distortion; 3D volume preserved), rewrites every `ReferencedSOPInstanceUID` via `sop_map`, updates `RTReferencedSeriesSequence.SeriesInstanceUID` to point at the new CT, optionally mints a new `FrameOfReferenceUID` (--new-frame-of-reference), and inserts a synthetic POINT-type ROI named `Drehpunkt` at `centre + (tx,ty,tz)` so the planner sees the rotation centre at a glance.
-6. Aria-visible metadata: `StructureSetLabel` truncated to DICOM SH (16 chars) with the suffix preserved; `StructureSetDescription` (VR ST; the tool truncates to 64 chars) carries the transform string via `build_transform_description`; `SeriesDescription` mirrors the CT's; `SeriesNumber += 1000` so the transformed series is distinct from the original.
-7. `--self-test` runs three metadata-mode checks: an identity round trip (all `ContourData` within 1e-4 mm of the input) and pairwise-distance preservation under a 15° Z- and a 5° X-rotation (within 1e-3 mm). `--verify` after a real run computes per-ROI centroids and compares with `T @ centroid_orig` (centroids are linear under rigid transforms). `--dry-run` validates inputs and prints `T` + planned output paths without writing.
+### `case_modifier.py` — case-level lockstep transform of CT + RTSTRUCT
+Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both.
+
+**Stages.** `run_case_transform` runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
+- **`preflight_case` → `CasePreflight`** reads headers only:
+  - `discover_case` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`; it prints nothing.
+  - `modifier.load_ct_headers` reads the CT headers (`stop_before_pixels`, CT only, one series, sorted by z) and rejects duplicate SOP UIDs.
+  - `validate_ct_geometry` checks for uniform IOP/`PixelSpacing`, slice spacing within 1 %, and the **orientation guard** `unit(IPP₁−IPP₀)·cross(row, col) ≥ 0.999`. It rejects feet-first and gantry tilt with `UserInputError` `CT.ORIENTATION_UNSUPPORTED`; HFS/HFP pass.
+  - `validate_for_consistency` checks that the RS references the CT's FoR.
+  - `validate_label` rejects `--label` values that Windows forbids in the output dir name or `RS<label>.dcm`: characters `<>:"/\|?*`, reserved names, a trailing dot or space.
+- **`resolve_center`** takes `volume`, `marker:NAME` or `x,y,z`. The prompt appears only if interactive and stdin is a TTY; stdin may be `None` under pythonw/GUI.
+- **`plan_transform` → `TransformPlan`** builds `T` and the paths, and pre-assigns all UIDs: CT series, `sop_map` old→new, optional FoR. It already runs `transform_rtstruct` and `check_contour_clipping`, so a bad RS reference (`KeyError`) fails before anything is written. The dry run stops here and loads no pixels.
+  - For `resample` the grid stays fixed, so `align_contour_images` then re-points each contour's `ContourImageSequence` to the output slice at its new position (the nearest plane along the slice normal); `metadata` keeps the index mapping, because its slices move with the contours.
+  - It counts the non-POINT contours that were in a slice plane before and are not afterwards (tolerance `PLANE_TOL_MM`). These are contours tilted by an X/Y rotation, or between two slices after a z-shift that is not a multiple of the slice spacing; contours beyond the first or last slice count as clipping instead.
+  - Any such contour produces the warning `CASE.CONTOURS_OFF_PLANE` and one console line.
+- **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
+- The result dict adds these keys:
+  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`. `CASE.FOR_KEPT` is only an info (user decision): keeping the FoR is the intended default, because it lets the TPS show the original plan on the moved anatomy (a simulated setup error). The console box stays;
+  - `clipping`, `method` and `for_strategy`;
+  - `viz`: the `{'written', 'skipped'}` report of the before/after plots.
+- For the API:
+  - `preflight_case(..., ct_files=, case_id=, siblings=, quiet=)` accepts an explicit CT file list with `--rs` instead of `<case>/CT/`;
+  - `plan_transform(..., out_dir=, quiet=)` takes the exact result folder;
+  - `quiet` silences both functions for the preview.
+- Stages reported to `_runtime`: `preflight` / `plan` / `ct_transform` / `rs_write` / `verify` / `viz`, with a cancel check between them.
+
+**What gets written:**
+- `transform_rtstruct` applies `T` to every `ContourData` triple (rigid, so no point-cloud distortion; the 3D volume is preserved). It rewrites every `ReferencedSOPInstanceUID` via `sop_map`, points `RTReferencedSeriesSequence.SeriesInstanceUID` at the new CT, optionally sets the new `FrameOfReferenceUID` (`--new-frame-of-reference`), and inserts a POINT ROI `Drehpunkt` at `centre + (tx,ty,tz)`. The RS SOP/series UIDs can be passed in (`rs_sop_uid`, `rs_series_uid`).
+- Aria-visible metadata:
+  - `StructureSetLabel` is cut to DICOM SH (16 chars) with the suffix preserved.
+  - `StructureSetDescription` (VR ST; the tool cuts it to 64 chars) carries the transform string from `build_transform_description`.
+  - `SeriesDescription` mirrors the CT's.
+  - `SeriesNumber += 1000` on CT and RS.
+
+**Checks:**
+- `--self-test` runs three metadata-mode checks: an identity round trip (all `ContourData` within 1e-4 mm) and pairwise-distance preservation under a 15° Z- and a 5° X-rotation (within 1e-3 mm).
+- `--verify` compares per-ROI centroids with `T @ centroid_orig`, since centroids are linear under rigid transforms. It returns `passed` against `VERIFY_THRESHOLD_MM` (1e-3). It prints a warning only on FAIL, and the exit code is unchanged.
 
 After a real (non-`--dry-run`) write, unless `--no-viz` is given, it calls `visualizer.run_case_visualization` with the in-memory original + transformed RS, `T`, the rotation centre, the `Drehpunkt` position, and the POINT-marker list, writing the three before/after plots into the case output dir. The call is wrapped in a try/except so a visualisation failure never invalidates the already-written transform.
 
 Default FoR behaviour is **keep** (original FoR is preserved on transformed CT+RS), with a runtime warning that legacy plans/doses sharing the FoR will be auto-overlaid by Aria. Use `--new-frame-of-reference` to mint a fresh FoR when this is undesired.
 
 ### `visualizer.py` — plots and statistics
-Takes either an analysis-results dict (from `analyzer.run_analysis`) or, via its CLI, runs the analyzer first and then renders. Outputs (into `output/`): `volumes.png` (log scale, grouped by category), `shape_metrics.png` (category heatmap of sphericity/solidity/elongation, single-component anatomical structures only), `distances.png` (lollipop of min-distance + HD95 for Target↔serial-OAR pairs, 3/5 mm thresholds), `centroids_3d.png` (category-coloured, numbered targets), plus the SRS plots `proximity_matrix.png`, `nearest_critical_oar.png`, `sphericity_vs_elongation.png`, `gtv_ptv_margin.png`, and `statistics.txt`. All single-RTSTRUCT plots key off the `analyzer.classify_structure` categories (Target / serial-OAR / parallel-OAR / helper / external / marker) via the shared `CATEGORY_COLORS` / `_iter_structures` / `_category_sort_key` helpers, so helper/union/optimisation structures and POINT markers / external body are kept out of the clinical plots. The CLI accepts the same `--targets`/`--oars` filters as the analyzer.
+Takes either an analysis-results dict (from `analyzer.run_analysis`) or, via its CLI, runs the analyzer first and then renders. Outputs (into `output/`): `volumes.png` (log scale, grouped by category), `shape_metrics.png` (category heatmap of sphericity/solidity/elongation, single-component anatomical structures only), `distances.png` (lollipop of min-distance + HD95 for Target↔serial-OAR pairs, 3/5 mm thresholds), `centroids_3d.png` (category-coloured, numbered targets), plus the SRS plots `proximity_matrix.png`, `nearest_critical_oar.png`, `sphericity_vs_elongation.png`, `gtv_ptv_margin.png`, and `statistics.txt`. All single-RTSTRUCT plots key off the `analyzer.classify_structure` categories (Target / serial-OAR / parallel-OAR / helper / external / marker) via the shared `CATEGORY_COLORS` / `_iter_structures` / `_category_sort_key` helpers, so helper/union/optimisation structures and POINT markers / external body are kept out of the clinical plots. The CLI accepts the same `--targets`/`--oars` filters as the analyzer. Plots use the object-oriented matplotlib API (`_figure` / `_subplots` with an Agg canvas; pyplot is never imported, no `matplotlib.use`). Every plot function returns its path or `None` when skipped, and `run_visualization` / `run_case_visualization` return `{'written': ..., 'skipped': ...}`. `dose_viz` renders its PNG the same way; `tests/test_analyzer_viz.py` checks that no package module imports pyplot.
 
 This module also hosts the **case-transform visualisation** used by `case_modifier` (it has no CLI of its own). `run_case_visualization(orig_ds, new_ds, center, drehpunkt_pos, translation, T, output_dir, markers=…, geom=…, volume_hu=…, ct_surface=…)` compares the original RTSTRUCT to the transformed one and emits: `transform_3d.html` (interactive Plotly — original vs transformed contour point clouds, with the rotation centre/`Drehpunkt`, translation vector, POINT markers, axis triad, and an opt-in CT body surface all as independently legend-toggleable traces), `transform_overview.png` (static tri-planar axial/coronal/sagittal before/after), and `displacement.png` (per-ROI centroid displacement `‖T(c)−c‖` vs the `‖t‖` reference line). It works from contour points alone — no CT pixels needed unless `ct_surface=True`, which calls `modifier._extract_surface`. `_structure_pointclouds` skips POINT-type contours so markers/`Drehpunkt` don't pollute the structure clouds.
 
 ## Notes for editing
 
+- One version number: `__version__` in `__init__.py` must equal `[project] version` in `pyproject.toml`; `dose_constants.TOOL_VERSION` (`SoftwareVersions`, JSON `meta.tool_version`, `dfm --version`) is derived from it, and `tests/test_cli.py` checks all of them against the installed metadata. After a bump run `uv lock` and `uv sync --extra gui --group build`, then rebuild the bundle (the ZIP carries the version).
 - DICOM patient coordinate system is **LPS** (X=left, Y=posterior, Z=superior); all distances/translations are in mm, rotations in degrees.
 - `data/` and `output/` are gitignored — don't commit DICOM files or generated artifacts.
-- Assign a new `SOPInstanceUID` only via `modifier.set_sop_instance_uid`: it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
+- Assign a new `SOPInstanceUID` only via `dicom_utils.set_sop_instance_uid` (also importable as `modifier.set_sop_instance_uid`): it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
 - Some user-facing strings and argparse help text are in German; keep that consistent within each module rather than mixing languages.
+- Windows `MAX_PATH` (260): Eclipse-style input names (`RS.<64-char uid>.dcm`) plus deep output folders can exceed it. For example, `analyzer --output` writes `<stem>_analysis.json` and fails with `FileNotFoundError` under the long scratchpad path. Keep test and golden work dirs short.
 - The README contains substantial mathematical documentation (volume, sphericity, Hausdorff, affine math, interpolation orders) — consult it before changing the geometric formulas, since the implementations are derived from those exact definitions.
 - README math: write display equations as ` ```math ` fenced blocks, not `$$…$$`, and keep inline `$…$` free of backslash-punctuation (`\{`, `\|`, `\,`, `\;`, `\!`, `\\`; use `\lbrace`, `\lVert … \rVert` etc.). GitHub's Markdown parser strips those backslash escapes before MathJax runs, which silently corrupts or breaks the formula.
