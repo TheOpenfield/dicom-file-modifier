@@ -8,9 +8,10 @@ Python toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set 
 
 ## Common Commands
 
-Install dependencies:
+Install dependencies (Python ≥ 3.12; `uv.lock` pins the tested versions on Python 3.14):
 ```bash
-pip install -r requirements.txt
+uv sync                  # .venv with Python 3.14 and the locked dependencies
+pip install -e .         # alternative: minimum versions from pyproject.toml (requirements.txt does the same)
 ```
 
 Each module is invoked as `python -m dicom_file_modifier.<module>`:
@@ -60,7 +61,7 @@ python -m dicom_file_modifier.demo output/demo [--layout flat] [--rd-set plan+2b
 # Golden-output harness (CLI parity); work dir %USERPROFILE%\dfm-golden (outside the repo)
 python tools/golden.py make-inputs
 python tools/golden.py run --label G0 [--only PATTERN] [--real data/<case-id> ...]
-python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected]
+python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected] [--stats]
 ```
 
 `dose_indices` flags: `--target NAME[,NAME]` (default: PTVs classified as targets; a RTPLAN `DoseReferenceDescription` prefix narrows to one), `--rx GY` / `--rx-pct-of-max PCT` (default: RTPLAN `TargetPrescriptionDose`), `--isodose 100,50[,80,12Gy]`, `--grid {1.0,0.5,0.25,0.1}` (in-plane mm, default 0.25; z stays on the dose planes), `--dose-interp {linear,cubic}`, `--volume-model {slab,eclipse}` (eclipse = end slabs count half), `--piv-scope {global,component}` (default component: only the Rx-isodose component(s) overlapping the target), `--iso-contours {mask,field}`, `--eclipse-compat {high,default}` (sets grid = 1 or 2 CT pixels aligned to the CT pixel raster, eclipse volume model, global PIV, linear, field isolines, no simplification), `--label` (default `_IDX`), `--no-rs`, `--include-target`, `--simplify-mm`, `--transfer-syntax`, `--max-name-len`, `--append-csv PATH` (cross-case collection table; refuses a file with an older header), `--eclipse-ref PATH` (default `<case>/eclipse_ref.json` if present), `--eclipse-values "[NAME:]KEY=VAL,..."` (aliases TV/VRX/PIV/V50/CI/GI/HI/D98/...; `V<n>Gy` resolved via Rx), `--eclipse-tol-pct` (default 5; rows outside are marked `!` and listed as warnings, exit code unchanged), `--no-eclipse-dvh`, `--no-viz`, `--no-viz-ct`.
@@ -69,7 +70,7 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no pytest suite, lint config, or build step in this repo yet. The only automated checks are:
+There is no pytest suite or lint config yet. `pyproject.toml` declares pytest and ruff as dependency groups and builds the package with hatchling. The only automated checks are:
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -80,10 +81,25 @@ There is no pytest suite, lint config, or build step in this repo yet. The only 
 - It runs 43 scenarios as subprocesses on the demo variants, plus optional local real cases (`real<n>_*`, case folder name replaced by `REAL<n>`).
 - One scenario is `cli_surface`: `tools/cli_surface.py` captures every `main()` parser's options, dests, defaults, choices and types.
 - It writes normalized snapshots. UIDs become `UID<n>` by first occurrence; paths, timestamps and `tempfile` names become placeholders; DICOM is stored as a tag dump plus a pixel hash, and CT pixel arrays go to `arrays.npz`.
-- `compare --mode exact` is for refactoring PRs. `--mode migration` is for environment upgrades and uses the tolerances in `tools/golden_rules.json`.
+- The DICOM dump is independent of the pydicom version:
+  - `FileMetaInformationGroupLength` is masked, because pydicom 3 mints random UIDs of 62–64 characters.
+  - Tags without a keyword are written as `(gggg,eeee)`.
+  - Ambiguous VRs (`US or SS`) with integer values are stored as integers.
+- Every step records its runtime and, on Windows, the peak working set and peak commit of the child process. Neither is compared.
+- `compare --mode exact` is for refactoring PRs. `--mode migration` is for environment upgrades and uses the tolerances in `tools/golden_rules.json`:
+  - Integer strings (IS, counts) stay exact.
+  - Contour rings whose point count changed are compared geometrically (`contour`: same plane, Hausdorff ≤ simplify + extra; XOR area only when no ring is a vertex subset of the other).
+- `--stats` appends to the report:
+  - every numeric deviation, including those within tolerance, per rule;
+  - pixel differences per scenario;
+  - runtime and peak memory;
+  - stderr warnings that are new or gone.
 - Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change (`expected_changes` in the rules file).
 - The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
-- `tools/legacy/requirements-py38.txt` pins the pre-upgrade environment the baseline `G0` was recorded with.
+- No goldens are committed. The synthetic snapshots are about 50 MB, and exact parity is only reliable on the same CPU.
+- The local reference is `G3b` (Python 3.14 from `uv.lock`).
+- CI (Phase 1) is to run the base and the PR commit on the same runner and compare them exactly.
+- `docs/migration-py314.md` documents the 3.8 → 3.14 drift. `tools/legacy/requirements-py38.txt` pins the old environment.
 
 ## Architecture
 

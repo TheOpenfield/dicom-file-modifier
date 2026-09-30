@@ -53,6 +53,12 @@ coverage.xml
 data/
 output/
 .claude/
+# Nie DICOM-Dateien einchecken (Patientendaten); Demo-Faelle werden zur Laufzeit erzeugt
+*.dcm
+*.DCM
+DICOMDIR
+# Zusaetzliche Umgebungen (z.B. .venv314 neben der alten .venv)
+.venv*/
 .pytest_cache/
 cover/
 

@@ -1,7 +1,4 @@
-pydicom
-numpy
-scipy
-shapely
-matplotlib
-scikit-image
-plotly
+# Compatibility for 'pip install -r requirements.txt': installs the package with the
+# dependencies from pyproject.toml (minimum versions). The tested versions are
+# pinned in uv.lock (use 'uv sync').
+-e .
