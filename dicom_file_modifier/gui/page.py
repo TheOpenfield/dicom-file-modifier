@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-                               QScrollArea, QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout, QLabel, QMenu, QPushButton,
+                               QScrollArea, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from ..api import jobs as api_jobs
 from ..api.fields import command_string
@@ -84,13 +84,21 @@ class WorkflowPage(QWidget):
         self.summary_label.hide()
         self.open_button = QPushButton("Ordner öffnen")
         self.open_button.clicked.connect(lambda: open_path(self.last_result["output_dir"]))
-        self.command_button = QPushButton("Befehl kopieren")
-        self.command_button.setToolTip("Gleichwertigen dfm-Befehl in die Zwischenablage kopieren")
-        self.command_button.clicked.connect(self._copy_command)
-        self.runjson_button = QPushButton("run.json")
-        self.runjson_button.setToolTip("Protokoll des Laufs: Versionen, Einstellungen, Eingaben mit UIDs")
-        self.runjson_button.clicked.connect(lambda: open_path(Path(self.last_result["output_dir"]) / "run.json"))
-        for b in (self.open_button, self.command_button, self.runjson_button):
+        menu = QMenu(self)                              # Nachvollziehbarkeit, bewusst unauffaellig
+        menu.setToolTipsVisible(True)
+        self.command_action = menu.addAction("dfm-Befehl kopieren")
+        self.command_action.triggered.connect(self._copy_command)
+        self.runjson_action = menu.addAction("run.json öffnen")
+        self.runjson_action.setToolTip("Protokoll des Laufs: Versionen, Einstellungen, Eingaben mit UIDs")
+        self.runjson_action.triggered.connect(
+            lambda: open_path(Path(self.last_result["output_dir"]) / "run.json"))
+        self.more_button = QToolButton()
+        self.more_button.setText("…")
+        self.more_button.setToolTip("Weitere Aktionen")
+        self.more_button.setMenu(menu)
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more_button.setMinimumHeight(self.open_button.sizeHint().height())
+        for b in (self.open_button, self.more_button):
             b.setEnabled(False)
         self.result_issues = IssueList()
         self.result_issues.hide()
@@ -132,7 +140,7 @@ class WorkflowPage(QWidget):
         lay.addWidget(self.result_state)
         lay.addWidget(self.summary_label)
         row = QHBoxLayout()                             # eigene Zeile: der Text behaelt die volle Breite
-        for b in list(buttons) + [self.command_button, self.runjson_button, self.open_button]:
+        for b in list(buttons) + [self.open_button, self.more_button]:
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
@@ -268,7 +276,7 @@ class WorkflowPage(QWidget):
         self.result_state.set_state(None, "Läuft …")
         self.result_state.setToolTip("")
         self.summary_label.hide()
-        for b in (self.open_button, self.command_button, self.runjson_button):
+        for b in (self.open_button, self.more_button):
             b.setEnabled(False)
         self.result_issues.set_issues([])
         self.clear_outputs()
@@ -303,10 +311,11 @@ class WorkflowPage(QWidget):
         self.summary_label.setText("\n".join(lines))
         self.summary_label.setVisible(bool(lines))
         self.open_button.setEnabled(bool(out))
-        self.runjson_button.setEnabled(bool(out) and (Path(out) / "run.json").is_file())
-        self.command_button.setEnabled(bool(result.get("command")))
-        self.command_button.setToolTip(command_string(result.get("command") or []) or
+        self.runjson_action.setEnabled(bool(out) and (Path(out) / "run.json").is_file())
+        self.command_action.setEnabled(bool(result.get("command")))
+        self.command_action.setToolTip(command_string(result.get("command") or []) or
                                        "Kein Befehl verfügbar")
+        self.more_button.setEnabled(self.runjson_action.isEnabled() or self.command_action.isEnabled())
         self.result_issues.set_issues(result.get("issues", []))
         if out:
             self.show_outputs(result, Path(out))

@@ -75,8 +75,9 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
     assert out == tmp_path / "results" / f"{demo.root.name}_STRUCT" and (out / "run.json").is_file()
     assert page.gallery.count() == sum(1 for p in out.glob("*.png")) > 0
     assert "statistics" in res["outputs"] and page.stats_view.toPlainText().strip()
-    assert "Zielvolumen" in page.summary_label.text() and page.runjson_button.isEnabled()
-    page.command_button.click()
+    assert "Zielvolumen" in page.summary_label.text()
+    assert page.more_button.isEnabled() and page.runjson_action.isEnabled()      # im Menu "…"
+    page.command_action.trigger()
     assert QApplication.clipboard().text().startswith("dfm analyze")
     assert page.start_button.isEnabled() and not win.cancel_button.isVisible()
     assert page.out_label.text().endswith("_STRUCT_2")          # naechster Lauf in neuen Ordner
@@ -166,7 +167,7 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     report = page.report.toPlainText()
     assert "Matrix T" in report and "Drehpunkt     Marker HS1" in report and "FoR           beibehalten" in report
     assert "2 mm nach links" in page.summary_label.text() and "Verschiebung X" not in page.summary_label.text()
-    page.command_button.click()
+    page.command_action.trigger()
     assert QApplication.clipboard().text().startswith("dfm case-transform")
 
     # nur CT: Drehpunkt fest auf der Volumenmitte, FoR gesperrt, Kennung nur fuer den Ordner

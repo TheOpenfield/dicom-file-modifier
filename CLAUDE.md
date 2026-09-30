@@ -257,7 +257,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 - `inspect` runs in the thread pool with a token, so stale results are dropped.
 - `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
 - The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
-- The result header has a state line (status and folder name, full path in the tooltip), the summary, a row of buttons with "Befehl kopieren" (`command_string`) and `run.json`, and the run line: duration plus the settings that differ from the defaults.
+- The result header has a state line (status and folder name, full path in the tooltip), the summary, a row with the page's buttons, "Ordner öffnen" and a small "…" menu ("dfm-Befehl kopieren" via `command_string`, "run.json öffnen"; kept out of sight on purpose, user decision), and the run line: duration plus the settings that differ from the defaults.
 - The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
 - The state line and the start button sit below the scrolling left column, so they are always visible.
 - The run line leaves out fields that were locked at the start and the page's `summary_fields`, and adds units.
