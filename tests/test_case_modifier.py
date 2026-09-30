@@ -181,6 +181,7 @@ def test_metadata_run_writes_series_number_offset_in_one_pass(demo, tmp_path):
     assert int(pydicom.dcmread(str(first)).SeriesNumber) == int(orig.SeriesNumber) + 1000
     assert res["verify"]["passed"] and res["verify"]["threshold_mm"] == cm.VERIFY_THRESHOLD_MM
     assert {"CASE.SIBLINGS_NOT_TRANSFORMED", "CASE.FOR_KEPT"} <= _codes(res)
+    assert next(i for i in res["issues"] if i["code"] == "CASE.FOR_KEPT")["level"] == "info"   # gewollt
     assert res["for_strategy"] == "keep" and res["clipping"] == []
 
 

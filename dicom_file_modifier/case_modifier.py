@@ -937,12 +937,13 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
         say(f"  ! Konturen  : {n_off} von {n_all} nicht mehr in einer CT-Schichtebene"
             + (f" ({n_tilt} gekippt)" if n_tilt else "")
             + f", bis {align['max_offset_mm']:.2f} mm daneben; ein TPS kann sie verwerfen.")
-    if for_strategy == "keep":
+    if for_strategy == "keep":                     # gewollter Standard, daher nur Info
         issues.append(Issue(
-            "warning", "CASE.FOR_KEPT",
+            "info", "CASE.FOR_KEPT",
             "Original und transformierter Datensatz tragen dieselbe FrameOfReferenceUID.",
             hint_de="Das TPS legt vorhandene Plaene/Dosen des Originals ungeprueft auf das "
-                    "transformierte CT. Fuer getrennte Planung eine neue FoR vergeben.",
+                    "transformierte CT; so laesst sich der Originalplan bei einem Lagerungsfehler "
+                    "auswerten. Fuer getrennte Planung eine neue FoR vergeben.",
             field="new_frame_of_reference"))
     if clipping:
         issues.append(Issue(

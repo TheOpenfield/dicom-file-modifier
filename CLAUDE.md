@@ -401,7 +401,7 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
   - Any such contour produces the warning `CASE.CONTOURS_OFF_PLANE` and one console line.
 - **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
 - The result dict adds these keys:
-  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`;
+  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`. `CASE.FOR_KEPT` is only an info (user decision): keeping the FoR is the intended default, because it lets the TPS show the original plan on the moved anatomy (a simulated setup error). The console box stays;
   - `clipping`, `method` and `for_strategy`;
   - `viz`: the `{'written', 'skipped'}` report of the before/after plots.
 - For the API (P0.8b):
