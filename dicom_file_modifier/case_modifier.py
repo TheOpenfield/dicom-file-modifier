@@ -720,9 +720,9 @@ def preflight_case(case_dir: "str | None", rs_override: "str | None" = None, lab
         say(_siblings_note(siblings))
         issues.append(Issue(
             "info", "CASE.SIBLINGS_NOT_TRANSFORMED",
-            "Plan- und Dosisdateien im Fallordner werden nicht mit-transformiert: "
-            + ", ".join(Path(p).name for p in siblings),
-            hint_de="RTPLAN/RTDOSE passen nach der Transformation nicht mehr zum CT."))
+            f"{len(siblings)} Plan- und Dosisdatei(en) im Fallordner werden nicht mit-transformiert.",
+            hint_de="RTPLAN/RTDOSE passen nach der Transformation nicht mehr zum CT.",
+            detail="\n".join(Path(p).name for p in siblings)))
     say(f"  CT-Ordner   : {ct_dir}")
     say(f"  RTSTRUCT    : {rs_path}")
 

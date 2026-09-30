@@ -245,7 +245,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
 | `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
-| `transform_page.py` | RS combo or "Nur das CT transformieren" (`selection.from_ct_dir`); motion grid on patient axes (X + links, Y + posterior, Z + superior; mm/° suffixes) built from `external` form fields; centre combo (Volumenmitte, markers, Koordinate) that writes the `center` spec; check with `describe_motion`, centre, the new `Drehpunkt` marker, planned files and memory; result: `transform_overview.png`, `displacement.png`, button for the 3D HTML |
+| `transform_page.py` | RS combo or "Nur das CT transformieren" (`selection.from_ct_dir`; the centre is kept and restored, the label still names the folder); motion grid on patient axes (X + links, Y + posterior, Z + superior; mm/° suffixes) built from `external` form fields; centre combo (Volumenmitte, markers, Koordinate) that writes the `center` spec; check with `describe_motion` (rotation order for two or more angles), centre, the new `Drehpunkt` marker, method and FoR choice, the largest clipping, planned files and memory; result tabs "Vorher/Nachher", "Verschiebung je ROI" and "Bericht" (matrix T, clipping table, centroid check from the run summary), button for the 3D HTML |
 | `dose_page.py` | inputs by label (StructureSetLabel, summation type and Dmax, RTPlanLabel; file names in the tooltip), form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), "Kennzahlen" tab from the result JSON (rows = metrics; per target value, Eclipse, deviation; a separate `… global` row where the comparison used the whole isodose), report, `dose_overview.png`, button for `validation.html` |
 
 `JobRunner` details:
@@ -259,6 +259,8 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 - The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
 - The result header has a state line (status and folder name, full path in the tooltip), the summary, a row of buttons with "Befehl kopieren" (`command_string`) and `run.json`, and the run line: duration plus the settings that differ from the defaults.
 - The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
+- The state line and the start button sit below the scrolling left column, so they are always visible.
+- The run line leaves out fields that were locked at the start and the page's `summary_fields`, and adds units.
 - A page supplies `selection`, `on_inspected`, `check`, `clear_outputs`, `show_outputs` and `summary_text`.
 
 The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fall".

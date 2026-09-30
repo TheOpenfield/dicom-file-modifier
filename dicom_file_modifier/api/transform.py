@@ -10,7 +10,7 @@ CLI-Entsprechung: ``dfm case-transform`` bzw. ``dfm ct-transform``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -58,11 +58,17 @@ class TransformSettings(SettingsBase):
     tz: float = setting(0.0, label="Verschiebung Z", unit="mm", cli_flag="--tz",
                         help="Positiv = nach superior (kranial).")
     rx: float = setting(0.0, label="Rotation um die Links-Rechts-Achse", unit="Grad", min=-180.0,
-                        max=180.0, cli_flag="--rx", help="X-Achse; in Rueckenlage Pitch.")
+                        max=180.0, cli_flag="--rx",
+                        help="Um die X-Achse; positiv nach der Rechte-Hand-Regel: +Y (posterior) dreht "
+                             "nach +Z (superior). In Rueckenlage Pitch.")
     ry: float = setting(0.0, label="Rotation um die anterior-posteriore Achse", unit="Grad",
-                        min=-180.0, max=180.0, cli_flag="--ry", help="Y-Achse; in Rueckenlage Yaw.")
+                        min=-180.0, max=180.0, cli_flag="--ry",
+                        help="Um die Y-Achse; positiv: +Z (superior) dreht nach +X (links). "
+                             "In Rueckenlage Yaw.")
     rz: float = setting(0.0, label="Rotation um die Kopf-Fuss-Achse", unit="Grad", min=-180.0,
-                        max=180.0, cli_flag="--rz", help="Z-Achse; in Rueckenlage Roll.")
+                        max=180.0, cli_flag="--rz",
+                        help="Um die Z-Achse; positiv: +X (links) dreht nach +Y (posterior). "
+                             "In Rueckenlage Roll.")
     center: str = setting(
         "volume", label="Drehpunkt", kind="spec", cli_flag="--center", cli_default=None,
         tools=(CASE_TOOL,), enabled_if=_needs_rs,
@@ -72,8 +78,9 @@ class TransformSettings(SettingsBase):
         help="resample = Neuabtastung, achsiale Schichten; metadata = Pixel unveraendert, nur "
              "Lage-Tags (schraege Schichten, nicht jedes TPS nimmt sie an).")
     label: str = setting(
-        "_RB", label="Kennung", cli_flag="--label", tools=(CASE_TOOL,), enabled_if=_needs_rs,
-        help="Suffix fuer Ergebnisordner, RS-Datei, StructureSetLabel und SeriesDescription.")
+        "_RB", label="Kennung", cli_flag="--label", tools=(CASE_TOOL,),
+        help="Suffix des Ergebnisordners; mit RTSTRUCT auch fuer RS-Datei, StructureSetLabel und "
+             "SeriesDescription.")
     new_frame_of_reference: bool = setting(
         False, label="Neue FrameOfReferenceUID", cli_flag="--new-frame-of-reference",
         tools=(CASE_TOOL,), enabled_if=_needs_rs,
@@ -226,10 +233,14 @@ def preview(info: TransformCaseInfo, settings: TransformSettings) -> TransformPr
     vol_c = info.volume_center
     pv.memory_bytes = estimate_memory_bytes(info.geom["shape"], s.method, s.order,
                                             s.viz and s.viz_ct_surface and info.has_rs)
+    try:
+        cm.validate_label(s.label, info.case_id)                # auch der Ordnername ohne RTSTRUCT
+    except UserInputError as exc:
+        issues.append(exc.issue)
+        return pv
     if info.has_rs:
         pre = info.preflight
         try:
-            cm.validate_label(s.label, info.case_id)
             center, center_label = cm.resolve_center(s.center, pre.rs_ds, vol_c, interactive=False)
             plan = cm.plan_transform(pre, s.tx, s.ty, s.tz, s.rx, s.ry, s.rz, out_dir=".",
                                      method=s.method, order=s.order, label=s.label, center=center,
@@ -239,7 +250,10 @@ def preview(info: TransformCaseInfo, settings: TransformSettings) -> TransformPr
             issues.append(exc.issue)
             return pv
         except Exception as exc:  # noqa: BLE001 - z.B. unbekannter Marker
-            issues.append(issue_from_exception(exc, field="center"))
+            issue = issue_from_exception(exc, field="center")
+            if not s.center.strip().lower().startswith(("marker:", "volume")):
+                issue = replace(issue, hint_de="Koordinate als x,y,z in mm (LPS) angeben, z. B. 12.5,-3,0.")
+            issues.append(issue)
             return pv
         issues += plan.issues
         pv.T, pv.center_mm, pv.center_label = plan.T.tolist(), plan.center.tolist(), plan.center_label
@@ -369,7 +383,8 @@ def run(settings: TransformSettings, selection: CaseSelection, out_dir) -> JobRe
                    "rotation_center_mm": res["rotation_center"],
                    "rotation_center_label": res["rotation_center_label"],
                    "drehpunkt_mm": res["drehpunkt_pos"], "n_clipped_rois": len(res["clipping"]),
-                   "verify": res["verify"], "description": describe_motion(s)}
+                   "clipping": res["clipping"], "verify": res["verify"], "T": plan.T.tolist(),
+                   "description": describe_motion(s)}
         return outputs, issues, summary
 
     def body_ct():
@@ -379,7 +394,7 @@ def run(settings: TransformSettings, selection: CaseSelection, out_dir) -> JobRe
         outputs = {"ct_dir": res["output_dir"], "viz_html": res["viz_html_path"]}
         summary = {"case_id": selection.case_id, "tool": CT_TOOL, "method": res["method"],
                    "n_slices": res["n_slices"], "rotation_center_mm": res["rotation_center"],
-                   "rotation_center_label": "Volumenmitte", "description": describe_motion(s)}
+                   "rotation_center_label": "Volumenmitte", "T": res["T"], "description": describe_motion(s)}
         return outputs, [], summary
 
     return run_guarded(WORKFLOW, out_dir, body_case if selection.rs else body_ct, pre_issues, cmd)

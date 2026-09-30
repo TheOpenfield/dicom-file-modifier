@@ -151,7 +151,8 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     page.form.widget("tx").setValue(2.0)
     page.form.widget("rz").setValue(5.0)
     text = page.preview_label.text()
-    assert "2 mm nach links · +5° um die Kopf-Fuss-Achse" in text and "Drehpunkt: Marker 'HS1'" in text
+    assert "2 mm nach links · +5° um die Kopf-Fuss-Achse" in text and "Drehpunkt: Marker HS1 (" in text
+    assert "FrameOfReference: beibehalten" in text
 
     page.start_button.click()
     wait_until(app, lambda: page.last_result is not None)
@@ -159,16 +160,21 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     assert res["status"] in ("ok", "ok_warnings"), res["issues"]
     out = Path(res["output_dir"])
     assert out.name == f"{demo.root.name}_RB" and (out / "CT").is_dir() and (out / "RS_RB.dcm").is_file()
-    assert page.gallery.count() == 2 and page.view3d_button.isEnabled()
-    assert "2 mm nach links" in page.summary_label.text()
+    assert page.overview.count() == page.displacement.count() == 1 and page.view3d_button.isEnabled()
+    assert "Matrix T" in page.report.toPlainText() and "Drehpunkt     Marker HS1" in page.report.toPlainText()
+    assert "2 mm nach links" in page.summary_label.text() and "Verschiebung X" not in page.summary_label.text()
     page.command_button.click()
     assert QApplication.clipboard().text().startswith("dfm case-transform")
 
-    # nur CT: Drehpunkt fest auf der Volumenmitte, Kennung und FoR gesperrt
+    # nur CT: Drehpunkt fest auf der Volumenmitte, FoR gesperrt, Kennung nur fuer den Ordner
     page.ct_only.setChecked(True)
     wait_until(app, page.start_button.isEnabled)
     assert page.form.settings().center == "volume" and not page.center_combo.isEnabled()
-    assert not page.form.widget("label").isEnabled() and "nur das CT" in page.preview_label.text()
+    assert not page.form.widget("new_frame_of_reference").isEnabled() and page.form.widget("label").isEnabled()
+    assert "nur das CT" in page.preview_label.text()
+    page.ct_only.setChecked(False)                                # die Wahl von vorher kommt zurueck
+    wait_until(app, page.start_button.isEnabled)
+    assert page.form.settings().center == "marker:HS1"
     win.close()
 
 

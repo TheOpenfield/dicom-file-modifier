@@ -212,6 +212,7 @@ class SettingsForm(QWidget):
             outer.addWidget(self.advanced_button)
             outer.addWidget(self.advanced_box)
             more = QFormLayout(self.advanced_box)
+            more.setContentsMargins(0, 0, 0, 0)                 # buendig mit den Zeilen darueber
             more.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             sections.append((more, advanced))
         for layout, names in sections:

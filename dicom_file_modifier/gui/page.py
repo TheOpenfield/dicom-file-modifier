@@ -27,12 +27,16 @@ MAX_PATH = 259
 RESULT_LEVEL = {"ok": "ok", "ok_warnings": "warning", "failed": "error", "cancelled": "info"}
 
 
-def _value_text(v) -> str:
+def _value_text(v, unit: str = "") -> str:
     if isinstance(v, bool):
         return "ja" if v else "nein"
     if isinstance(v, (list, tuple)):
         return ", ".join(map(str, v))
-    return "aus" if v is None else str(v)
+    if v is None:
+        return "aus"
+    if isinstance(v, (int, float)) and unit:
+        return f"{v:g} {unit}"
+    return str(v)
 
 
 def names_text(names: list, limit: int = 8) -> str:
@@ -46,6 +50,7 @@ class WorkflowPage(QWidget):
     title = ""
     start_text = "Starten"
     api = None                          # Workflow-Modul: api.structures, api.dose, api.transform
+    summary_fields = ()                 # Felder, die schon die Kurzfassung nennt (nicht in der Lauf-Zeile)
 
     def __init__(self, main):
         super().__init__()
@@ -54,16 +59,19 @@ class WorkflowPage(QWidget):
         self._token = 0
         self._running = self._ok = False
         self._job_settings = None
+        self._job_disabled: set = set()
         self.state = StateLine()
         self.preview_label = QLabel("Kein Datensatz geöffnet.")
         self.preview_label.setWordWrap(True)
         self.out_label = QLabel()
         self.out_label.setWordWrap(True)
         self.issues = IssueList()
+        self.issues.max_height = 120
         self.issues.hide()
         self.start_button = QPushButton(self.start_text)
         self.start_button.setEnabled(False)
         self.start_button.setMinimumHeight(34)
+        self.start_button.setMinimumWidth(200)
         font = self.start_button.font()
         font.setBold(True)
         self.start_button.setFont(font)
@@ -101,16 +109,23 @@ class WorkflowPage(QWidget):
         col.addWidget(box)
         check = QGroupBox("Prüfung vor dem Start")
         lay = QVBoxLayout(check)
-        for w in (self.state, self.preview_label, self.issues, self.out_label):
+        for w in (self.preview_label, self.issues, self.out_label):
             lay.addWidget(w)
         col.addWidget(check)
-        col.addWidget(self.start_button)
         if not any(stretch for _, stretch in inputs):
             col.addStretch(1)                           # Gruppen oben kompakt halten
         self._left = left
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(left)
+        side = QWidget()                                # Zustand und Start immer sichtbar unter der Spalte
+        lay = QVBoxLayout(side)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(scroll, 1)
+        foot = QHBoxLayout()
+        foot.addWidget(self.state, 1)
+        foot.addWidget(self.start_button)
+        lay.addLayout(foot)
 
         result = QGroupBox("Ergebnis")
         lay = QVBoxLayout(result)
@@ -126,7 +141,7 @@ class WorkflowPage(QWidget):
             lay.addWidget(widget, stretch)
 
         outer = QSplitter()
-        outer.addWidget(scroll)
+        outer.addWidget(side)
         outer.addWidget(result)
         outer.setStretchFactor(1, 1)
         outer.setSizes([580, 740])
@@ -246,6 +261,7 @@ class WorkflowPage(QWidget):
     # -- Lauf und Ergebnis -------------------------------------------------------------
     def _start(self) -> None:
         self._job_settings = self.form.settings()
+        self._job_disabled = set(self._job_settings.disabled_fields(self.info))    # wirkten nicht
         job = api_jobs.new_job(self.api.WORKFLOW, self._job_settings, self.info.selection,
                                self.output_spec())
         self.last_result = None
@@ -268,10 +284,12 @@ class WorkflowPage(QWidget):
         if total is not None:
             parts.append(f"Dauer {total:.1f} s")
         if self._job_settings is not None:
-            changed = self._job_settings.non_default()
+            metas = self.form.cls.field_meta()
+            changed = {k: v for k, v in self._job_settings.non_default().items()
+                       if k not in self._job_disabled and k not in self.summary_fields}
             if changed:
                 parts.append("abweichend vom Standard: " + ", ".join(
-                    f"{self.form.label_of(k)} = {_value_text(v)}" for k, v in changed.items()))
+                    f"{metas[k].label} = {_value_text(v, metas[k].unit)}" for k, v in changed.items()))
         return "  ·  ".join(parts)
 
     def show_result(self, result: dict) -> None:
