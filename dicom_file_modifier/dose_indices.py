@@ -56,9 +56,7 @@ from . import _runtime
 from . import analyzer as ana
 from . import dose as dm
 from . import rtstruct_writer as rw
-# Seit P0.3 in dose_constants (loest den Zyklus mit rtstruct_writer/dose_viz);
-# hier weiter importierbar (alte Importpfade)
-from .dose_constants import HELPER_COLORS, LEVEL_COLORS, TOOL_NAME, TOOL_VERSION  # noqa: F401
+from .dose_constants import LEVEL_COLORS, TOOL_NAME, TOOL_VERSION
 
 DEFAULT_ISODOSE = "100,50"
 GRID_CHOICES = (1.0, 0.5, 0.25, 0.1)
@@ -206,9 +204,6 @@ def roi_table(rs_ds: pydicom.Dataset) -> list:
         cat = ana.classify_structure(name, types.get(num, ""), geoms.get(num, set()))
         out.append((int(num), name, types.get(num, ""), cat))
     return out
-
-
-_roi_table = roi_table        # alter Name (bis P0.4 privat)
 
 
 def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None) -> dict:

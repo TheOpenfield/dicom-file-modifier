@@ -2,9 +2,8 @@
 dose_constants.py - Gemeinsame Konstanten der Dosisindex-Module.
 
 Eigenes Modul, damit ``rtstruct_writer`` und ``dose_viz`` die Konstanten ohne
-Import von ``dose_indices`` nutzen koennen; vorher bestand ein Import-Zyklus
-(Plan P0.3).  ``dose_indices`` re-exportiert alle Namen.  Das Modul importiert
-nichts.
+Import von ``dose_indices`` nutzen koennen (sonst entstuende ein Import-Zyklus).
+Das Modul importiert nichts.
 """
 
 TOOL_NAME = "dose_indices"

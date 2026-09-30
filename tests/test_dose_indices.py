@@ -100,9 +100,10 @@ def test_rx_candidates_match_resolve_prescription(plan_inputs):
         di.resolve_prescription(None, None, rp_refs, dose, ["PTV_1", "PTV_2"])
 
 
-def test_roi_table_is_public_and_keeps_the_old_name(plan_inputs):
-    rs_ds = plan_inputs[0]
-    assert di.roi_table(rs_ds) == di._roi_table(rs_ds)
+def test_roi_table_lists_every_roi_with_its_category(plan_inputs):
+    rows = di.roi_table(plan_inputs[0])
+    assert len(rows) == 14 and [r[1] for r in rows][:2] == ["BODY", "PTV_1"]
+    assert all(r[3] for r in rows)
 
 
 # -- Eclipse-Referenz --------------------------------------------------------

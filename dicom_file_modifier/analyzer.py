@@ -687,25 +687,6 @@ def _cap_points(pts: np.ndarray, cap: int) -> np.ndarray:
     return pts
 
 
-def min_distance(pts_a: np.ndarray, pts_b: np.ndarray,
-                 cap: int = 50000) -> float:
-    """Exakter minimaler Abstand zwischen zwei Punktwolken in mm.
-
-    Volle KD-Baum-Abfrage (kein verlustbehaftetes Subsampling); nur jenseits
-    von ``cap`` Punkten wird deterministisch ausgedünnt.
-    """
-    if len(pts_a) == 0 or len(pts_b) == 0:
-        return float("inf")
-
-    pts_a = _cap_points(pts_a, cap)
-    pts_b = _cap_points(pts_b, cap)
-
-    from scipy.spatial import cKDTree
-    tree = cKDTree(pts_b)
-    dists, _ = tree.query(pts_a, k=1)
-    return float(np.min(dists))
-
-
 def hausdorff_distance(pts_a: np.ndarray, pts_b: np.ndarray,
                        cap: int = 50000) -> float:
     """Exakter (symmetrischer Maximum-)Hausdorff-Abstand in mm.

@@ -58,9 +58,7 @@ from pydicom.uid import generate_uid
 
 from . import _runtime
 from . import modifier as mod
-# Seit P0.6 in modifier; hier weiter importierbar (alte Importpfade)
 from .modifier import load_ct_headers, validate_ct_geometry
-# Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
 from .dicom_utils import (_label_with_suffix, _truncate, find_point_markers,
                           get_rs_frame_of_references)
 from .issues import Issue, UserInputError
@@ -73,8 +71,7 @@ PLANE_TOL_MM = 0.01             # resample: Kontur liegt in einer CT-Schichteben
 # Auto-Discovery
 # ---------------------------------------------------------------------------
 
-def discover_case(case_dir: str, rs_override: "str | None" = None, *,
-                  return_siblings: bool = False) -> tuple:
+def discover_case(case_dir: str, rs_override: "str | None" = None) -> tuple:
     """
     Sucht im ``case_dir`` den ``CT/``-Unterordner und genau eine ``RS*.dcm``-Datei.
 
@@ -82,9 +79,8 @@ def discover_case(case_dir: str, rs_override: "str | None" = None, *,
     falls die Konvention verletzt ist.  Bei mehreren RS-Dateien wird der Aufrufer
     aufgefordert, mit ``--rs <pfad>`` explizit auszuwaehlen.
 
-    Rueckgabe ``(ct_dir, rs_path)``; parallel liegende RP*/RD*-Dateien werden
-    dann als Hinweis gedruckt.  Mit ``return_siblings=True`` still und
-    ``(ct_dir, rs_path, siblings)`` (Liste der RP*/RD*-Pfade).
+    Rueckgabe ``(ct_dir, rs_path, siblings)``; ``siblings`` sind die parallel
+    liegenden RP*/RD*-Dateien (sie werden nicht transformiert).  Druckt nichts.
     """
     case = Path(case_dir)
     if not case.is_dir():
@@ -117,11 +113,7 @@ def discover_case(case_dir: str, rs_override: "str | None" = None, *,
         rs_path = rs_files[0]
 
     extras = sorted(list(case.glob("RP*.dcm")) + list(case.glob("RD*.dcm")))
-    if return_siblings:
-        return ct_dir, rs_path, extras
-    if extras:
-        print(_siblings_note(extras))
-    return ct_dir, rs_path
+    return ct_dir, rs_path, extras
 
 
 def _siblings_note(extras: list) -> str:
@@ -752,8 +744,7 @@ def preflight_case(case_dir: "str | None", rs_override: "str | None" = None, lab
     ctx.stage("preflight", "Fall pruefen")
     say = _printer(quiet)
     if ct_files is None:
-        ct_dir, rs_path, siblings = discover_case(case_dir, rs_override=rs_override,
-                                                  return_siblings=True)
+        ct_dir, rs_path, siblings = discover_case(case_dir, rs_override=rs_override)
         ct_source = ct_dir
     else:
         if rs_override is None:
@@ -1269,7 +1260,7 @@ def _run_self_test(args: argparse.Namespace) -> int:
     import tempfile
     from .analyzer import load_rtstruct, extract_contours, get_structure_names
 
-    _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override, return_siblings=True)
+    _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override)
     orig = load_rtstruct(str(rs_path))
     names = get_structure_names(orig)
 
@@ -1389,8 +1380,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
         # --list-markers: nur RS oeffnen und Marker auflisten, dann beenden.
         if args.list_markers:
-            _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override,
-                                          return_siblings=True)
+            _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override)
             rs_ds = pydicom.dcmread(str(rs_path))
             print_marker_table(find_point_markers(rs_ds))
             return 0

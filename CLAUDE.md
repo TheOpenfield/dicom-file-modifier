@@ -81,12 +81,11 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 There is no lint config yet; `pyproject.toml` declares ruff as a dependency group and builds the package with hatchling. The automated checks are:
 - `uv run pytest` (`tests/`, restricted via `testpaths`):
-  - `tests/test_import_graph.py` checks five things:
+  - `tests/test_import_graph.py` checks four things:
     - no import cycles at module level;
     - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
     - layers: no core module imports `api` (except the entry point `cli`), and `api` never imports `gui`;
-    - every module, including `api/*`, imports first in a fresh interpreter;
-    - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
+    - every module, including `api/*`, imports first in a fresh interpreter.
   - These tests use the demo case:
     - `tests/test_dose_indices.py`: candidates, fixes, stages, progress and cancel;
     - `tests/test_case_modifier.py`: stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
@@ -151,7 +150,6 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
 - Helpers used by several modules live in two modules that import nothing from the package:
   - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
   - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION`, `LEVEL_COLORS`, `HELPER_COLORS`.
-- Both are re-exported at their old locations (`case_modifier`, `modifier`, `dose_indices`).
 - `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to the worker, without changing core signatures.
 - The remaining lazy imports are not cycles:
   - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The GUI process never imports `dose_viz`.
@@ -313,7 +311,7 @@ Supporting pieces:
 
 **Candidates without aborting**, for a GUI:
 - `target_candidates` and `rx_candidates` return the automatic choice with a reason. `select_targets` and `resolve_prescription` build on them and keep their messages.
-- `roi_table` is public; `_roi_table` remains as an alias.
+- `roi_table` is public.
 
 **Progress and cancel.** The stages and the loops call `_runtime.current()`:
 - stages: `prepare` / `compute` / `rs_export` / `viz` / `reports`;
@@ -351,7 +349,7 @@ Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions �
 - The thinning RNG (`_rng()`, seed 0) is fresh per `analyze_rtstruct` call, so a long-lived process matches a fresh CLI run.
 - `inspect_rtstruct(path_or_ds, volumes=True)` gives the quick ROI table (number, name, type, category, geometric types, contour count, planimetric volume, colour, marker), POINT markers, FoR UIDs and structure-set label/date.
 - `parse_name_list` trims `--targets`/`--oars` in both CLIs.
-- `find_point_markers` lives in `dicom_utils` (re-exported by `case_modifier`).
+- `find_point_markers` lives in `dicom_utils`.
 - `select_rois(names, categories, targets, oars)` is the ROI choice of `analyze_rtstruct`; the API preview uses it too.
 - `write_analysis_json` writes `<stem>_analysis.json` for `--output`.
 - `run_analysis(return_info=True)` also returns `info`, including the issues.
@@ -371,8 +369,7 @@ Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` 
 
 **Loading, checks and API:**
 - `load_ct_headers(dir_or_files, series_uid=None)` and `load_ct_series_files(files, series_uid=None)` keep only `Modality` CT with IPP. They require exactly one series (`series_uid` chooses; otherwise `UserInputError` `CT.MULTIPLE_SERIES`) and reject duplicate SOPs. The header loader filters first; then only the chosen files are read in full. So a flat Eclipse export, with RS/RP/RD next to the CT, works.
-- `load_ct_series(dir)` stays unchanged for old callers.
-- `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` re-exports it.
+- `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` calls it in the preflight.
 - `run_ct_transform(ct_dir, output_dir, tx..rz, method=, order=, viz=, viz_html=, series_uid=)` is the CLI run as a function and returns a dict (`n_slices`, `series_uid`, `sop_map`, `T`, `rotation_center`, `viz_html_path`). `ct_dir` may also be a list of CT files.
 - `main` catches input errors: exit 2 instead of a traceback.
 - `resample_volume` reports progress and checks for cancel per 20-slice chunk. Stages are `load` / `transform` / `viz`.
@@ -385,7 +382,7 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
 
 **Stages.** `run_case_transform` runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
 - **`preflight_case` → `CasePreflight`** reads headers only:
-  - `discover_case(..., return_siblings=True)` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`. Called the old way, it still prints the sibling note and returns `(ct_dir, rs_path)`.
+  - `discover_case` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`; it prints nothing.
   - `modifier.load_ct_headers` reads the CT headers (`stop_before_pixels`, CT only, one series, sorted by z) and rejects duplicate SOP UIDs.
   - `validate_ct_geometry` checks for uniform IOP/`PixelSpacing`, slice spacing within 1 %, and the **orientation guard** `unit(IPP₁−IPP₀)·cross(row, col) ≥ 0.999`. It rejects feet-first and gantry tilt with `UserInputError` `CT.ORIENTATION_UNSUPPORTED`; HFS/HFP pass.
   - `validate_for_consistency` checks that the RS references the CT's FoR.

@@ -52,29 +52,6 @@ from .issues import Issue, UserInputError
 #  Laden
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_ct_series(ct_dir: str) -> list:
-    """Lädt alle DICOM-Dateien aus einem Verzeichnis, sortiert nach Z-Position."""
-    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
-    if not files:
-        raise FileNotFoundError(f"Keine DICOM-Dateien in {ct_dir!r}")
-
-    slices = []
-    for f in files:
-        try:
-            ds = pydicom.dcmread(f)
-            if hasattr(ds, "ImagePositionPatient") and hasattr(ds, "PixelData"):
-                slices.append(ds)
-        except Exception:
-            pass
-
-    if not slices:
-        raise ValueError(f"Keine gültigen CT-Slices in {ct_dir!r}")
-
-    # Nach Z-Koordinate der Slice-Normalenkomponente sortieren
-    slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
-    return slices
-
-
 def ct_dir_files(ct_dir) -> list:
     """``*.dcm`` in ``ct_dir`` (sortiert; Klammern im Pfad sind kein Glob-Muster)."""
     return sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
@@ -136,9 +113,9 @@ def load_ct_headers(ct_dir_or_files, series_uid: "str | None" = None,
 def load_ct_series_files(files, series_uid: "str | None" = None,
                          where: "str | None" = None) -> list:
     """
-    CT-Schichten mit Pixeldaten aus einer Dateiliste, nach z sortiert.  Anders
-    als ``load_ct_series`` nur Modality CT und genau eine Serie (``series_uid``
-    waehlt bei mehreren); RTDOSE, RTSTRUCT & Co. in einem flachen
+    CT-Schichten mit Pixeldaten aus einer Dateiliste, nach z sortiert.  Nur
+    Modality CT und genau eine Serie (``series_uid`` waehlt bei mehreren);
+    RTDOSE, RTSTRUCT & Co. in einem flachen
     Eclipse-Export werden uebergangen.  Gefiltert wird ueber die Header, erst
     dann werden die gewaehlten Dateien komplett gelesen.
     """

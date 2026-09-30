@@ -1,5 +1,5 @@
 """
-Importgraph des Pakets (Plan P0.3, Schichten ab P0.8).
+Importgraph des Pakets.
 
 - Auf Modulebene gibt es keine Import-Zyklen.
 - Kein Paketmodul importiert die CLI-Orchestratoren ``case_modifier`` oder
@@ -8,14 +8,11 @@ Importgraph des Pakets (Plan P0.3, Schichten ab P0.8).
   ``cli``); ``api`` importiert nie ``gui``.
 - Jedes Modul (auch in ``api/``) laesst sich in einem frischen Interpreter als
   erstes importieren.
-- Die nach ``dicom_utils``/``dose_constants`` verschobenen Namen sind unter den
-  alten Pfaden dieselben Objekte.
 """
 
 from __future__ import annotations
 
 import ast
-import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -136,24 +133,3 @@ def test_module_imports_first_in_fresh_interpreter(module):
     proc = subprocess.run([sys.executable, "-c", f"import {PKG}.{module}"],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-2000:]
-
-
-@pytest.mark.parametrize("old, new", [
-    ("case_modifier.get_rs_frame_of_references", "dicom_utils.get_rs_frame_of_references"),
-    ("case_modifier._label_with_suffix", "dicom_utils._label_with_suffix"),
-    ("case_modifier._truncate", "dicom_utils._truncate"),
-    ("modifier.set_sop_instance_uid", "dicom_utils.set_sop_instance_uid"),
-    ("case_modifier.find_point_markers", "dicom_utils.find_point_markers"),
-    ("case_modifier.validate_ct_geometry", "modifier.validate_ct_geometry"),
-    ("case_modifier.load_ct_headers", "modifier.load_ct_headers"),
-    ("dose_indices.TOOL_NAME", "dose_constants.TOOL_NAME"),
-    ("dose_indices.TOOL_VERSION", "dose_constants.TOOL_VERSION"),
-    ("dose_indices.LEVEL_COLORS", "dose_constants.LEVEL_COLORS"),
-    ("dose_indices.HELPER_COLORS", "dose_constants.HELPER_COLORS"),
-])
-def test_old_import_paths_still_work(old, new):
-    def resolve(dotted: str):
-        mod, attr = dotted.split(".")
-        return getattr(importlib.import_module(f"{PKG}.{mod}"), attr)
-
-    assert resolve(old) is resolve(new)

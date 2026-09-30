@@ -95,7 +95,6 @@ def test_dry_run_reads_no_pixels(demo, tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("Dry-Run darf keine Pixel laden")
 
-    monkeypatch.setattr(mod, "load_ct_series", forbidden)
     monkeypatch.setattr(mod, "load_ct_series_files", forbidden)
     monkeypatch.setattr(mod, "slices_to_hu", forbidden)
     res = _run(demo.root, tmp_path / "out", dry_run=True)
@@ -191,10 +190,9 @@ def test_new_frame_of_reference_has_no_for_warning(demo, tmp_path):
 
 
 def test_discover_case_reports_siblings_quietly(demo, capsys):
-    ct_dir, rs, sib = cm.discover_case(str(demo.root), return_siblings=True)
+    ct_dir, rs, sib = cm.discover_case(str(demo.root))
+    assert ct_dir.is_dir() and rs.is_file()
     assert {p.name[:2] for p in sib} == {"RP", "RD"} and capsys.readouterr().out == ""
-    assert cm.discover_case(str(demo.root)) == (ct_dir, rs)
-    assert "Hinweis" in capsys.readouterr().out
 
 
 # -- Zentrum ------------------------------------------------------------------

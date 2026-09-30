@@ -71,7 +71,7 @@ def for_transform(case_dir: str, rs: Optional[str] = None) -> CaseSelection:
     from .. import case_modifier as cm
     from .. import modifier as mod
 
-    ct_dir, rs_path, siblings = cm.discover_case(case_dir, rs_override=rs, return_siblings=True)
+    ct_dir, rs_path, siblings = cm.discover_case(case_dir, rs_override=rs)
     return CaseSelection(case_id=_case_id(case_dir), case_dir=str(case_dir),
                          ct_files=mod.ct_dir_files(ct_dir), rs=str(rs_path),
                          related=[str(p) for p in siblings])
