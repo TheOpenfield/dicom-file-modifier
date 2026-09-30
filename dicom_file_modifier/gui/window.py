@@ -56,6 +56,7 @@ class Case:
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
+        from .dose_page import DosePage
         from .structures_page import StructuresPage
 
         self.config = config
@@ -81,7 +82,8 @@ class MainWindow(QMainWindow):
         self.root_action = bar.addAction("Ergebnisordner …", self.choose_results_root)
 
         self.structures = StructuresPage(self)
-        self.pages = [self.structures]
+        self.dose = DosePage(self)
+        self.pages = [self.structures, self.dose]
         self.nav = QListWidget()
         self.nav.setFixedWidth(170)
         self.stack = QStackedWidget()

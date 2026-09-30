@@ -240,16 +240,24 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `app.py` | `dfm gui [CASE]`; cleans up orphaned staging folders at start |
 | `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
 | `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
-| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints), `IssueList`, `Gallery` |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, optional collapsible `advanced` fields), `IssueList`, `Gallery`, `make_table`/`fill_table`, `report_view` |
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
-| `structures_page.py` | inspect in the background → ROI table → form → `preview` on every change → job → gallery and `statistics.txt` |
+| `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
+| `structures_page.py` | RS combo, ROI table, gallery and `statistics.txt` |
+| `dose_page.py` | files and dose info, form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), metric table from `summary`, report, `dose_overview.png`, button for `validation.html` |
 
 `JobRunner` details:
 - It starts the worker through `subprocess` with `CREATE_NO_WINDOW` rather than QProcess, and turns the JSON lines into signals.
 - Cancel writes `<job>.cancel` and kills the worker after 5 s.
 - It always deletes the staging folder and the job file afterwards.
 
-New pages follow the structure page.
+`WorkflowPage` behaviour:
+- `inspect` runs in the thread pool with a token, so stale results are dropped.
+- `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
+- The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
+- A page supplies `selection`, `on_inspected`, `check`, `clear_outputs` and `show_outputs`.
+
+The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fall".
 
 **Packaging (`packaging/`):**
 - `dfm.spec` builds one PyInstaller onedir folder `dist/DICOM-RT-Toolkit/` with two EXEs:

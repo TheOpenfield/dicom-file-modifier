@@ -77,6 +77,43 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
     win.close()
 
 
+def test_dose_page_end_to_end(app, demo, tmp_path):
+    win = MainWindow(AppConfig(results_root=tmp_path / "results", jobs_dir=tmp_path / "jobs"))
+    win.show()
+    win.open_case(demo.root)
+    page = win.dose
+    wait_until(app, page.start_button.isEnabled)
+    text = page.preview_label.text()
+    assert "PTV_1" in text and "20.00 Gy (aus dem RTPLAN)" in text and "Feingitter: 0.25 mm" in text
+    assert "RD:" in page.files_label.text() and "Dmax" in page.dose_label.text()
+
+    # Eclipse-kompatibel sperrt die Rasterfelder und zeigt die effektiven Werte
+    mode, grid = page.form.widget("eclipse_compat"), page.form.widget("grid_mm")
+    mode.setCurrentIndex(mode.findData("high"))
+    assert not grid.isEnabled() and "Gesperrt" in grid.toolTip()
+    assert "am CT-Pixelraster" in page.preview_label.text() and page.start_button.isEnabled()
+    mode.setCurrentIndex(0)
+    assert grid.isEnabled()
+
+    # ungueltige Isodosen: Feld rot umrandet, Start gesperrt
+    iso = page.form.widget("isodose")
+    iso.setText("100,abc")
+    assert not page.start_button.isEnabled() and "border" in iso.styleSheet()
+    page.form.set_settings(dose.Settings(viz=False))
+    assert page.start_button.isEnabled() and iso.styleSheet() == ""
+
+    page.start_button.click()
+    wait_until(app, lambda: page.last_result is not None)
+    res = page.last_result
+    assert res["status"] in ("ok", "ok_warnings"), res["issues"]
+    assert page.metrics.rowCount() == len(res["summary"]["targets"]) == 1
+    ci = res["summary"]["targets"]["PTV_1"]["ci_paddick"]
+    assert page.metrics.item(0, 0).text() == "PTV_1" and page.metrics.item(0, 4).text() == f"{ci:.3f}"
+    assert "PTV_1" in page.report.toPlainText() and not page.viz_button.isEnabled()
+    assert (Path(res["output_dir"]) / "run.json").is_file()
+    win.close()
+
+
 def test_job_runner_cancel_leaves_nothing(app, demo, tmp_path):
     runner = JobRunner(tmp_path / "jobs")
     got = {}
@@ -109,10 +146,11 @@ def test_gui_process_never_loads_plot_modules(demo, tmp_path):
         "win = MainWindow(AppConfig(results_root=tmp / 'r', jobs_dir=tmp / 'j'))\n"
         "win.open_case(sys.argv[1])\n"
         "end = time.monotonic() + 120\n"
-        "while not win.structures.start_button.isEnabled() and time.monotonic() < end:\n"
+        "ready = lambda: all(pg.start_button.isEnabled() for pg in win.pages)\n"
+        "while not ready() and time.monotonic() < end:\n"
         "    app.processEvents(); time.sleep(0.02)\n"
         f"bad = sorted(m for m in sys.modules if m in {FORBIDDEN!r})\n"
-        "print(json.dumps({'ready': win.structures.start_button.isEnabled(), 'bad': bad}))\n")
+        "print(json.dumps({'ready': ready(), 'bad': bad}))\n")
     out = subprocess.run([sys.executable, "-c", code, str(demo.root), str(tmp_path)],
                          capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
     assert out.returncode == 0, out.stderr

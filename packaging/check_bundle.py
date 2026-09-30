@@ -56,11 +56,16 @@ def run(step: str, cmd: list, env=None, timeout: float = 900) -> subprocess.Comp
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    sys.stdout.reconfigure(errors="replace")         # Ausgaben der EXEs auf der cp1252-Konsole
     make_zip = "--zip" in argv
     rest = [a for a in argv if a != "--zip"]
     bundle = Path(rest[0]) if rest else DEFAULT_BUNDLE
     version = "?"
     dfm, gui = bundle / "dfm.exe", bundle / "DICOM-RT-Toolkit.exe"
+    missing_exe = [p.name for p in (dfm, gui) if not p.is_file()]
+    if missing_exe:
+        print(f"FEHLER Bundle unvollstaendig, es fehlt: {', '.join(missing_exe)}")
+        return 1
     errors = []
 
     size_mb = sum(p.stat().st_size for p in bundle.rglob("*") if p.is_file()) / 2**20
