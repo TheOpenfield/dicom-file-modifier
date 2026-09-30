@@ -351,14 +351,13 @@ The case is head-first supine: a water cylinder with a bone shell (CT 128 × 128
 
 UIDs are deterministic. `demo_expected.json` holds the closed-form reference values: TV, PIV (component and global), CI, GI, HI and D98/D50/D2 for the slab and Eclipse volume models, plus the planimetric structure volumes.
 
-`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. In migration mode, contour rings whose point count changed are compared geometrically (same plane, Hausdorff distance, XOR area). It is the safety net for refactoring the CLI modules and for environment upgrades. Each run also records the runtime and, on Windows, the peak memory of every CLI call. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local. No snapshots are committed: the synthetic ones alone are about 50 MB, and exact parity is only reliable on the same machine.
+`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. In migration mode, contour rings whose point count changed are compared geometrically (same plane, Hausdorff distance, XOR area). It is the safety net for refactoring the CLI modules and for environment upgrades. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local. No snapshots are committed: the synthetic ones alone are about 50 MB, and exact parity is only reliable on the same machine.
 
 ```bash
 python tools/golden.py make-inputs                 # generate the synthetic inputs once (+ SHA-256 manifest)
 python tools/golden.py run --label G0              # run all scenarios, write normalized snapshots
 python tools/golden.py run --label G0 --only "real*" --real data/<case-id>   # add local real cases
 python tools/golden.py compare G0 G1 --mode exact  # or --mode migration
-python tools/golden.py compare G0 G1 --mode migration --stats   # plus drift statistics, runtime/memory, warnings
 ```
 
 ## Dependencies

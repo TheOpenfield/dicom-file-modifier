@@ -70,7 +70,7 @@ python -m dicom_file_modifier.demo output/demo [--layout flat] [--rd-set plan+2b
 # Golden-output harness (CLI parity); work dir %USERPROFILE%\dfm-golden (outside the repo)
 python tools/golden.py make-inputs
 python tools/golden.py run --label G0 [--only PATTERN] [--real data/<case-id> ...]
-python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected] [--stats]
+python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected]
 ```
 
 `dose_indices` flags: `--target NAME[,NAME]` (default: PTVs classified as targets; a RTPLAN `DoseReferenceDescription` prefix narrows to one), `--rx GY` / `--rx-pct-of-max PCT` (default: RTPLAN `TargetPrescriptionDose`), `--isodose 100,50[,80,12Gy]`, `--grid {1.0,0.5,0.25,0.1}` (in-plane mm, default 0.25; z stays on the dose planes), `--dose-interp {linear,cubic}`, `--volume-model {slab,eclipse}` (eclipse = end slabs count half), `--piv-scope {global,component}` (default component: only the Rx-isodose component(s) overlapping the target), `--iso-contours {mask,field}`, `--eclipse-compat {high,default}` (sets grid = 1 or 2 CT pixels aligned to the CT pixel raster, eclipse volume model, global PIV, linear, field isolines, no simplification), `--label` (default `_IDX`), `--no-rs`, `--include-target`, `--simplify-mm`, `--transfer-syntax`, `--max-name-len`, `--append-csv PATH` (cross-case collection table; refuses a file with an older header), `--eclipse-ref PATH` (default `<case>/eclipse_ref.json` if present), `--eclipse-values "[NAME:]KEY=VAL,..."` (aliases TV/VRX/PIV/V50/CI/GI/HI/D98/...; `V<n>Gy` resolved via Rx), `--eclipse-tol-pct` (default 5; rows outside are marked `!` and listed as warnings, exit code unchanged), `--no-eclipse-dvh`, `--no-viz`, `--no-viz-ct`.
@@ -120,15 +120,10 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
   - `FileMetaInformationGroupLength` is masked, because pydicom 3 mints random UIDs of 62–64 characters.
   - Tags without a keyword are written as `(gggg,eeee)`.
   - Ambiguous VRs (`US or SS`) with integer values are stored as integers.
-- Every step records its runtime and, on Windows, the peak working set and peak commit of the child process. Neither is compared.
+- Every step records its runtime; it is not compared.
 - `compare --mode exact` is for refactoring PRs. `--mode migration` is for environment upgrades and uses the tolerances in `tools/golden_rules.json`:
   - Integer strings (IS, counts) stay exact.
   - Contour rings whose point count changed are compared geometrically (`contour`: same plane, Hausdorff ≤ simplify + extra; XOR area only when no ring is a vertex subset of the other).
-- `--stats` appends to the report:
-  - every numeric deviation, including those within tolerance, per rule;
-  - pixel differences per scenario;
-  - runtime and peak memory;
-  - stderr warnings that are new or gone.
 - Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change.
 - `expected_changes` in the rules file lists the intended diffs of the current PR for `compare --expected`. An entry maps a scenario pattern to one of two forms:
   - a text: the whole scenario may differ;
