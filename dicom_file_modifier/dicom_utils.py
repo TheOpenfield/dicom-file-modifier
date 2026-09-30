@@ -2,16 +2,15 @@
 dicom_utils.py - Kleine DICOM-Helfer ohne Abhaengigkeit von den CLI-Modulen.
 
 Mehrere Module brauchen diese Funktionen (``case_modifier``, ``modifier``,
-``dose``, ``rtstruct_writer``, ``analyzer``).  Frueher lagen sie in
-``case_modifier`` bzw. ``modifier`` (``find_point_markers`` bis P0.7 in
-``case_modifier``); dort werden sie weiter re-exportiert, damit bestehende
-Importe gueltig bleiben (Plan P0.3).  Das Modul importiert nichts aus dem Paket.
+``dose``, ``rtstruct_writer``, ``analyzer``, ``demo``).  Das Modul importiert
+nichts aus dem Paket.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pydicom
+from pydicom.uid import ExplicitVRLittleEndian
 
 
 def get_rs_frame_of_references(rs_ds: pydicom.Dataset) -> set[str]:
@@ -81,3 +80,39 @@ def find_point_markers(rs_ds: pydicom.Dataset) -> list[tuple[str, np.ndarray]]:
             markers.append((name_map.get(roi_num, f"ROI#{roi_num}"), pts[0].copy()))
             break  # erster POINT je ROI reicht
     return markers
+
+
+# Tags, deren Werte vom alten Pixelinhalt bzw. von der alten PixelRepresentation
+# (VR US/SS) abhaengen und nach dem Neuschreiben der Pixel nicht mehr stimmen.
+_STALE_PIXEL_TAGS = ("SmallestImagePixelValue", "LargestImagePixelValue",
+                     "PixelPaddingValue", "PixelPaddingRangeLimit")
+
+
+def replace_pixel_data(ds: pydicom.Dataset, stored: np.ndarray) -> None:
+    """
+    Ersetzt die Pixeldaten von ``ds`` durch das 2D-Array ``stored`` als
+    vorzeichenbehaftetes int16 (unkomprimiert, VR OW).
+
+    Eine komprimierte oder Big-Endian-Transfer-Syntax der Quelle wird auf
+    Explicit VR Little Endian umgestellt (sonst entstuende beim Speichern ein
+    Absturz bzw. eine inkonsistente Datei); ``Smallest/LargestImagePixelValue``
+    und ``PixelPadding*`` werden entfernt, weil sie nach dem Resampling nicht
+    mehr gelten.  Rows/Columns/Bits*/PixelRepresentation werden gesetzt.
+    """
+    arr = np.ascontiguousarray(stored, dtype=np.int16)
+    fm = getattr(ds, "file_meta", None)
+    ts = fm.get("TransferSyntaxUID") if fm is not None else None
+    if ts is not None and (ts.is_compressed or not ts.is_little_endian):
+        fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    for kw in _STALE_PIXEL_TAGS:
+        if kw in ds:
+            del ds[kw]
+    ds.PixelData = arr.tobytes()
+    elem = ds["PixelData"]
+    elem.VR = "OW"
+    elem.is_undefined_length = False
+    ds.Rows, ds.Columns = arr.shape
+    ds.BitsAllocated = 16
+    ds.BitsStored = 16
+    ds.HighBit = 15
+    ds.PixelRepresentation = 1

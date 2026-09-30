@@ -44,9 +44,7 @@ from scipy.ndimage import map_coordinates, spline_filter
 from scipy.spatial.transform import Rotation
 
 from . import _runtime
-from ._compat import replace_pixel_data
-# Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
-from .dicom_utils import set_sop_instance_uid
+from .dicom_utils import replace_pixel_data, set_sop_instance_uid
 from .issues import Issue, UserInputError
 
 
@@ -496,7 +494,7 @@ def save_ct_series(
             stored = np.clip(stored, -32768, 32767).astype(np.int16)
 
             # int16 vorzeichenbehaftet, unkomprimiert; komprimierte Quellen werden
-            # auf Explicit VR Little Endian umgestellt (siehe _compat)
+            # auf Explicit VR Little Endian umgestellt (dicom_utils.replace_pixel_data)
             replace_pixel_data(nd, stored)
 
         out_path = os.path.join(output_dir, f"CT_{k:04d}.dcm")

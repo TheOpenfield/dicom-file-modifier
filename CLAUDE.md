@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Python toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set (RTSTRUCT) files and CT DICOM series used in radiotherapy planning. The package is `dicom_file_modifier/` and ships four runnable modules.
+Python toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set (RTSTRUCT) files and CT DICOM series used in radiotherapy planning. The package is `dicom_file_modifier/` and ships five runnable modules.
 
 ## Common Commands
 
 Install dependencies (Python ≥ 3.12; `uv.lock` pins the tested versions on Python 3.14):
 ```bash
 uv sync                  # .venv with Python 3.14 and the locked dependencies
-pip install -e .         # alternative: minimum versions from pyproject.toml (requirements.txt does the same)
+pip install -e .         # alternative: minimum versions from pyproject.toml
 uv run pytest            # test suite in tests/
 ```
 
@@ -88,12 +88,12 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
     - every module, including `api/*`, imports first in a fresh interpreter;
     - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
   - These tests use the demo case:
-    - `tests/test_dose_indices.py` (P0.4): candidates, fixes, stages, progress and cancel;
-    - `tests/test_case_modifier.py` (P0.5): stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
-    - `tests/test_modifier.py` (P0.6): CT loader filters, `run_ct_transform`, resample progress and cancel, no browser, exit 2;
-    - `tests/test_analyzer_viz.py` (P0.7): silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot;
-    - `tests/test_cli.py` (P0.8a): `dfm` forwards argv unchanged, one version everywhere, `dfm selftest`;
-    - `tests/test_api.py` (P0.8b). It checks:
+    - `tests/test_dose_indices.py`: candidates, fixes, stages, progress and cancel;
+    - `tests/test_case_modifier.py`: stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
+    - `tests/test_modifier.py`: CT loader filters, `run_ct_transform`, resample progress and cancel, no browser, exit 2;
+    - `tests/test_analyzer_viz.py`: silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot;
+    - `tests/test_cli.py`: `dfm` forwards argv unchanged, one version everywhere, `dfm selftest`;
+    - `tests/test_api.py`. It checks:
       - Settings ↔ argparse: every CLI option is a field or a known non-setting, defaults and choices match, and a round trip through the real parser gives the same settings;
       - the dose CLI hands the core the same arguments as the API;
       - API output = CLI output: structures byte-identical, dose report and RS contours, transform CT geometry and contours; the copied command reproduces the run;
@@ -101,7 +101,7 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - preview = run: ROI names and the Eclipse-mode values;
       - error classes and exit codes;
       - the inputs stay unchanged.
-    - `tests/test_worker.py` (P0.8c): JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
+    - `tests/test_worker.py`: JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
     - `tests/test_gui.py` (offscreen, skipped without PySide6):
       - the structure page, the dose page (locked fields, error marks, metric table with Eclipse columns) and the transform page (centre choice, run, CT only) end to end through the real worker;
       - `DecimalSpinBox` and the CLI-option-to-field-name mapping;
@@ -139,29 +139,26 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
 - In `exact` mode, numbers in the console output that differ are failures, not warnings.
 - The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
 - No goldens are committed. The synthetic snapshots are about 50 MB, and exact parity is only reliable on the same CPU.
-- `G3b` (Python 3.14 from `uv.lock`) is the migration anchor.
-  - Each step is compared exactly against the run of the previous step (`compare P07 P08b --mode exact`).
-  - The older run is then deleted, because real-case runs contain patient data.
-- CI (Phase 1) is to run the base and the PR commit on the same runner and compare them exactly.
-- `docs/migration-py314.md` documents the 3.8 → 3.14 drift. `tools/legacy/requirements-py38.txt` pins the old environment.
+- Every change to a CLI module is compared exactly against the run of the previous state (`compare P11 P12 --mode exact`). The older run is then deleted, because real-case runs contain patient data.
+- CI is to run the base and the PR commit on the same runner and compare them exactly.
 
 ## Architecture
 
-Five runnable modules plus three libraries, and the synthetic test-case generator `demo` (with `phantom` and `_compat`). `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+Five runnable modules plus three libraries, and the synthetic test-case generator `demo` (with `phantom`). `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
 
-**Import rule (P0.3):**
+**Import rule:**
 - No package module imports the orchestrators `case_modifier` or `dose_indices`.
 - Helpers used by several modules live in two modules that import nothing from the package:
   - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
   - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION`, `LEVEL_COLORS`, `HELPER_COLORS`.
 - Both are re-exported at their old locations (`case_modifier`, `modifier`, `dose_indices`).
-- `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to a future worker, without changing core signatures.
+- `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to the worker, without changing core signatures.
 - The remaining lazy imports are not cycles:
-  - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The planned GUI process must never import `dose_viz`.
+  - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The GUI process never imports `dose_viz`.
   - `case_modifier` → `visualizer`/`analyzer` and `visualizer` → `modifier` only load what the chosen code path needs.
 - `tests/test_import_graph.py` enforces the rule.
 
-### `api/` — interface for the CLI command, the worker and the GUI (P0.8b)
+### `api/` — interface for the CLI command, the worker and the GUI
 The layer sits above the core; the core never imports it (only `cli` does), and it never imports `gui`. Every workflow module has the same shape:
 
 | Module | Wraps | `dfm` equivalent |
@@ -192,7 +189,6 @@ The layer sits above the core; the core never imports it (only `cli` does), and 
   | `default_folder(settings, selection)` | folder name | `<case_id><label>` or `<case_id>_STRUCT` |
 - **`selection.CaseSelection`** names the files explicitly: `case_id`, `case_dir`, `ct_files`, `rs`, `rd`, `rp`, `eclipse_ref`, `related`.
   - `for_dose`, `for_transform`, `from_rtstruct` and `from_ct_dir` make exactly the CLI's choice in the standard layout.
-  - The scanner (P0.8d) will build selections for other layouts.
 - **`outputs.OutputSpec(root, folder, policy)`** handles the result folder:
   - `root` must be absolute; `folder_name_problem` applies the Windows name rules;
   - `target_dir` picks `_2`, `_3`, … for `policy="suffix"`, or reuses the folder for `overwrite`.
@@ -220,7 +216,7 @@ The layer sits above the core; the core never imports it (only `cli` does), and 
   - dose: effective values and locked fields (`resolve_effective`, `ECLIPSE_LOCKED`), targets, Rx, levels, ROI names (`rtstruct_writer.planned_roi_names`), fine grid with a memory estimate (`DOSE.GRID_TOO_LARGE` above `dose.MAX_FINE_VOXELS`, `SYSTEM.MEMORY_LOW` against free RAM) and the Eclipse sources. Errors carry the field they belong to (`target`, `rx`, `isodose`, `eclipse_values`, `append_csv`, `grid_mm`).
   - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`).
 - **Result layout:** the CT-only transform writes `<out>/CT/` plus `visualization_3d.html`, so every transform result is again a case folder.
-- **Jobs (`api/jobs.py`, P0.8c):** a `Job` is a JSON file (workflow, settings, selection, output). `execute_job` works in four steps:
+- **Jobs (`api/jobs.py`):** a `Job` is a JSON file (workflow, settings, selection, output). `execute_job` works in four steps:
   1. validate, writing nothing on errors (exit 2);
   2. run in `<root>/.stg<job_id>` with `run.log` and `run.json`;
   3. commit with `os.replace`, retrying on locked files; `overwrite` swaps the old folder out via `.old*`;
@@ -280,7 +276,7 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
   - both EXEs carry the app icon (`app.ico`).
 - Build with `.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm`. A plain `uv sync` removes the `gui` extra and the `build` group again (exact sync); `uv run` keeps them.
 
-### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
+### `demo.py` / `phantom.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
 - **Contents:**
   - CT: 128² px at 2 mm, 80 slices at 1 mm, unsigned 12-bit with intercept −1024.
@@ -289,7 +285,7 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
   - RD: 1 mm grid, uint32 at `DoseGridScaling` 1e-6, relative GFOV, `DVHSequence` for PTV_1/PTV_2/BODY/Hirnstamm.
 - **File names** follow Eclipse (`CT.<uid>.dcm`, `RS.<uid>.dcm`, ...).
 - **UIDs** are deterministic via `generate_uid(PYDICOM_ROOT_UID, entropy_srcs=[seed, role, i])`.
-- **DS values** are formatted by `demo._ds` (≤ 16 chars, identical on pydicom 2/3); files are written through `_compat.dcmwrite_file_format`.
+- **DS values** are formatted by `demo._ds` (≤ 16 chars); files are written with `pydicom.dcmwrite(..., enforce_file_format=True)`.
 - **`phantom.py`:**
   - `HillField` gives one smooth dose field per target.
   - `SphereTarget.expected` computes closed-form slab/eclipse values and PIV/PIV50 component vs global, neglecting cross-talk between the fields (< 0.02 Gy).
@@ -300,7 +296,7 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
 ### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` / `dose_viz.py` — dose indices
 Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → `build_eclipse_reference` / `compare_with_eclipse` (RTDOSE `DVHSequence` via `dose.read_dvh_sequence`, `eclipse_ref.json`, `--eclipse-values`; precedence cli > json > dvh, gaps filled by `derive_eclipse_values`) → RS export → `dose_viz.run_dose_visualization` (`validation.html` + `dose_overview.png`, wrapped in try/except like the RS export) → report/JSON/TXT/CSV.
 
-**Orchestration (P0.4, split further in P0.8b).** `run_dose_indices` keeps its signature and output and runs three stages:
+**Orchestration.** `run_dose_indices` runs three stages:
 - `prepare_dose_run` → `DoseRunPlan` runs three steps:
   - discovery (or `files=` from `dose_files`: explicit files, CT as a folder or a file list);
   - `load_dose_inputs` → `DoseInputs`: RS/RD/RP, dose grid, reference checks and CT index. An unusable CT is only recorded as `ct_error`.
@@ -325,7 +321,7 @@ Supporting pieces:
 
 Without a context everything is a no-op. `_runtime.use(ctx)` sets a `JobContext`, whose `check_cancel()` may raise `JobCancelled`. RS-export and viz errors become warnings, but `JobCancelled` is re-raised.
 
-**Behaviour since P0.4:**
+**Behaviour:**
 - An isodose level on Rx or Rx/2 given in Gy gets the key `"100"` / `"50"`.
 - An `eclipse_ref.json` target that is not evaluated only adds a note; ambiguous names stay errors.
 - Untrusted DVHs are not overlaid: they reference another structure set, so `dvh_map` is `{}`.
@@ -333,7 +329,7 @@ Without a context everything is a no-op. `_runtime.use(ctx)` sets a `JobContext`
 - With `--no-rs` and no `--eclipse-compat`, an unusable CT folder is a warning (no CT reference, no CT background).
 - The RS is written as `RS_*.dcm.tmp` and moved into place with `os.replace` after `verify_rtstruct`.
 - The pydicom `writing_validation_mode` toggle is locked.
-- `SoftwareVersions` is no longer cut to 16 characters.
+- `SoftwareVersions` is written in full (VR LO allows 64 characters).
 
 Key conventions:
 - All volumes come from the same fine grid; target-derived volumes (TV, TV∩PIV, underdosed) carry the slab weights, isodose-derived ones (PIV, PIV50, spill) do not, so TV∩PIV ≤ min(TV, PIV) always holds. Comparisons are inclusive (`>=`). `D_x` = dose received by x % of the weighted target volume (D98 = 2nd weighted percentile).
@@ -347,7 +343,7 @@ Key conventions:
 ### `analyzer.py` — RTSTRUCT geometric analysis
 Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions → `run_analysis` aggregates everything into a single results dict that is also written as `<rtstruct-stem>_analysis.json`.
 
-**Silent core and inspection (P0.7):**
+**Silent core and inspection:**
 - `analyze_rtstruct(path_or_ds, targets, oars)` → `(results, info)` prints nothing. `results` is exactly what `run_analysis` returns and writes to JSON.
 - `info` carries `names`/`types`/`categories`, the chosen ROI numbers, the analysis order `analyzed` (complete even with duplicate ROI names) and `issues`.
 - `run_analysis` is the print layer around it, with identical text.
@@ -373,7 +369,7 @@ Two transform paths sharing the same affine math:
 
 Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` — in SciPy uppercase = intrinsic; the same matrix as an extrinsic ZYX rotation) about the volume's geometric centre; the offset is folded into `T` so a single 4×4 matrix represents the whole transform. All output series get fresh `SeriesInstanceUID` and per-slice `SOPInstanceUID`s. Optional Plotly HTML viz extracts surfaces with marching cubes (`skimage.measure.marching_cubes`).
 
-**Loading, checks and API (P0.6):**
+**Loading, checks and API:**
 - `load_ct_headers(dir_or_files, series_uid=None)` and `load_ct_series_files(files, series_uid=None)` keep only `Modality` CT with IPP. They require exactly one series (`series_uid` chooses; otherwise `UserInputError` `CT.MULTIPLE_SERIES`) and reject duplicate SOPs. The header loader filters first; then only the chosen files are read in full. So a flat Eclipse export, with RS/RP/RD next to the CT, works.
 - `load_ct_series(dir)` stays unchanged for old callers.
 - `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` re-exports it.
@@ -387,7 +383,7 @@ Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` 
 ### `case_modifier.py` — case-level lockstep transform of CT + RTSTRUCT
 Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both.
 
-**Stages (P0.5).** `run_case_transform` keeps its signature and runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
+**Stages.** `run_case_transform` runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
 - **`preflight_case` → `CasePreflight`** reads headers only:
   - `discover_case(..., return_siblings=True)` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`. Called the old way, it still prints the sibling note and returns `(ct_dir, rs_path)`.
   - `modifier.load_ct_headers` reads the CT headers (`stop_before_pixels`, CT only, one series, sorted by z) and rejects duplicate SOP UIDs.
@@ -404,11 +400,10 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
   - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`. `CASE.FOR_KEPT` is only an info (user decision): keeping the FoR is the intended default, because it lets the TPS show the original plan on the moved anatomy (a simulated setup error). The console box stays;
   - `clipping`, `method` and `for_strategy`;
   - `viz`: the `{'written', 'skipped'}` report of the before/after plots.
-- For the API (P0.8b):
+- For the API:
   - `preflight_case(..., ct_files=, case_id=, siblings=, quiet=)` accepts an explicit CT file list with `--rs` instead of `<case>/CT/`;
   - `plan_transform(..., out_dir=, quiet=)` takes the exact result folder;
   - `quiet` silences both functions for the preview.
-- Console output is unchanged, except that the sibling note appears once instead of twice.
 - Stages reported to `_runtime`: `preflight` / `plan` / `ct_transform` / `rs_write` / `verify` / `viz`, with a cancel check between them.
 
 **What gets written:**

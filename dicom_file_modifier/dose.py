@@ -954,6 +954,9 @@ def _trace_rings(values: np.ndarray, level: float, grid: FineGrid, k: int,
             continue
         if simplify_mm > 0:
             try:
+                # GEOS >= 3.13 entfernt dabei auch den Ring-Startpunkt, wenn er innerhalb
+                # der Toleranz liegt (aeltere Versionen behielten ihn immer); der Startpunkt
+                # hat keine geometrische Bedeutung, die Abweichung bleibt < simplify_mm
                 simp = LinearRing(xy).simplify(simplify_mm, preserve_topology=True)
                 coords = np.asarray(simp.coords)[:-1]
                 if len(coords) >= 3:

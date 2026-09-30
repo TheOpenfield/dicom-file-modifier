@@ -51,6 +51,10 @@ PROTOCOL_VERSION = 1
 HEARTBEAT_S = 2.0
 PROGRESS_INTERVAL_S = 0.1
 CANCEL_POLL_S = 0.2
+# OpenBLAS sagt beim Import je Thread rund 30 MB Commit zu, einmal fuer numpy und
+# einmal fuer scipy (eigene Kopie): bei 24 Kernen gut 1,5 GB je Prozess, mit
+# OPENBLAS_NUM_THREADS=1 rund 40 MB.  Die rechenintensiven Teile (map_coordinates,
+# cKDTree) nutzen kein BLAS.
 THREAD_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
 
 

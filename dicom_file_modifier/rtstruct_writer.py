@@ -32,7 +32,6 @@ from pydicom.uid import (PYDICOM_IMPLEMENTATION_UID, ExplicitVRLittleEndian,
 
 from . import dose as dm
 from . import analyzer as ana
-from ._compat import dcmwrite_file_format
 from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references, set_sop_instance_uid
 from .dose_constants import HELPER_COLORS, TOOL_NAME, TOOL_VERSION
 
@@ -482,8 +481,7 @@ def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with _writing_validation(pdconfig.RAISE):
-        # Kodierung aus der Transfer Syntax (pydicom 2.x: Flags, 3.x: enforce_file_format)
-        dcmwrite_file_format(out_path, ds)
+        pydicom.dcmwrite(str(out_path), ds, enforce_file_format=True)   # Kodierung aus der Transfer Syntax
     return ds
 
 

@@ -50,20 +50,15 @@ dicom-file-modifier/
 │   ├── dicom_utils.py       # Small DICOM helpers shared by several modules (FoR lookup, SOP UID, label length)
 │   ├── dose_constants.py    # Constants shared by the dose-index modules (tool version, ROI colours)
 │   ├── issues.py            # Structured findings (code, German message, hint) for CLI and GUI
-│   ├── _runtime.py          # Progress/cancel context for long computations
-│   └── _compat.py           # pydicom 2.x/3.x compatibility shims
+│   └── _runtime.py          # Progress/cancel context for long computations
 ├── tests/                   # pytest suite (uv run pytest)
 ├── tools/
 │   ├── golden.py            # Golden-output harness (CLI parity before/after refactors and upgrades)
 │   ├── golden_rules.json    # Comparison tolerances for the migration mode
-│   ├── cli_surface.py       # argparse snapshot of every CLI (flags, defaults, choices, types)
-│   └── legacy/              # Pinned package list of the environment the baseline was recorded with
-├── docs/
-│   └── migration-py314.md   # Drift report of the Python 3.8 → 3.14 environment upgrade
+│   └── cli_surface.py       # argparse snapshot of every CLI (flags, defaults, choices, types)
 ├── pyproject.toml           # Package metadata and dependencies (hatchling)
 ├── uv.lock                  # Locked dependency versions (uv)
 ├── .python-version          # Python version for uv (3.14)
-├── requirements.txt         # pip compatibility: installs the package from pyproject.toml
 ├── LICENSE                  # MIT
 └── README.md                # This file
 ```
@@ -85,7 +80,7 @@ With pip (minimum versions from `pyproject.toml`, not pinned):
 ```bash
 python -m venv .venv
 .venv\Scripts\activate          # Windows; Linux/macOS: source .venv/bin/activate
-pip install -e .                # equivalent: pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Usage
@@ -356,7 +351,7 @@ The case is head-first supine: a water cylinder with a bone shell (CT 128 × 128
 
 UIDs are deterministic. `demo_expected.json` holds the closed-form reference values: TV, PIV (component and global), CI, GI, HI and D98/D50/D2 for the slab and Eclipse volume models, plus the planimetric structure volumes.
 
-`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. In migration mode, contour rings whose point count changed are compared geometrically (same plane, Hausdorff distance, XOR area). It is the safety net for refactoring the CLI modules and for environment upgrades. Each run also records the runtime and, on Windows, the peak memory of every CLI call. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local. No snapshots are committed: the synthetic ones alone are about 50 MB, and exact parity is only reliable on the same machine. The drift of the Python 3.8 → 3.14 upgrade is documented in [docs/migration-py314.md](docs/migration-py314.md).
+`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. In migration mode, contour rings whose point count changed are compared geometrically (same plane, Hausdorff distance, XOR area). It is the safety net for refactoring the CLI modules and for environment upgrades. Each run also records the runtime and, on Windows, the peak memory of every CLI call. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local. No snapshots are committed: the synthetic ones alone are about 50 MB, and exact parity is only reliable on the same machine.
 
 ```bash
 python tools/golden.py make-inputs                 # generate the synthetic inputs once (+ SHA-256 manifest)

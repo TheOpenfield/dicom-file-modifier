@@ -60,7 +60,7 @@ default-groups = ["test"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# bekannt und im Drift-Bericht dokumentiert (scikit-image 0.26 unter numpy 2.5)
+# scikit-image 0.26 (marching_cubes) unter numpy 2.5; betrifft nur die Warnung, nicht die Ergebnisse
 filterwarnings = ["ignore:Setting the shape on a NumPy array:DeprecationWarning:skimage"]
 
 [tool.hatch.build.targets.wheel]

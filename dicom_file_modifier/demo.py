@@ -37,7 +37,6 @@ from pydicom.uid import (PYDICOM_IMPLEMENTATION_UID, PYDICOM_ROOT_UID, ExplicitV
 
 from . import analyzer as ana
 from . import phantom as ph
-from ._compat import dcmwrite_file_format
 
 DEMO_VERSION = "1"
 
@@ -184,7 +183,7 @@ def _base(sop_class: str, sop_uid: str, modality: str, ctx: dict) -> Dataset:
 
 def _write(ds: Dataset, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    dcmwrite_file_format(path, ds)
+    pydicom.dcmwrite(str(path), ds, enforce_file_format=True)
     return path
 
 

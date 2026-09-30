@@ -56,7 +56,6 @@ from . import _runtime
 from . import analyzer as ana
 from . import dose as dm
 from . import rtstruct_writer as rw
-from ._compat import PYDICOM_MAJOR
 # Seit P0.3 in dose_constants (loest den Zyklus mit rtstruct_writer/dose_viz);
 # hier weiter importierbar (alte Importpfade)
 from .dose_constants import HELPER_COLORS, LEVEL_COLORS, TOOL_NAME, TOOL_VERSION  # noqa: F401
@@ -2113,8 +2112,6 @@ def _synthetic_rtdose_dataset(dose: dm.DoseGrid, absolute_gfov: bool = False) ->
     ds = Dataset()
     ds.file_meta = FileMetaDataset()
     ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-    if PYDICOM_MAJOR < 3:   # pydicom 2.x braucht die Flags fuer pixel_array im Speicher
-        ds.is_little_endian, ds.is_implicit_VR = True, False
     ds.Modality = "RTDOSE"
     ds.SOPInstanceUID = "1.2.3.4"
     ds.FrameOfReferenceUID = "1.2.3"
