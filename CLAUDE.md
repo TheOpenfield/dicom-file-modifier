@@ -101,6 +101,7 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - error classes and exit codes;
       - the inputs stay unchanged.
     - `tests/test_worker.py`: JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
+    - `tests/test_packaging.py`: the third-party notices generator runs without a build and names the LGPL components.
     - `tests/test_gui.py` (offscreen, skipped without PySide6):
       - the structure page, the dose page (locked fields, error marks, metric table with Eclipse columns) and the transform page (centre choice, run, CT only) end to end through the real worker;
       - `DecimalSpinBox` and the CLI-option-to-field-name mapping;
@@ -142,9 +143,9 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
 
 **Import rule:**
 - No package module imports the orchestrators `case_modifier` or `dose_indices`.
-- Helpers used by several modules live in two modules that import nothing from the package:
+- Helpers used by several modules live in two modules that import nothing from the package (except the package version):
   - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
-  - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION`, `LEVEL_COLORS`, `HELPER_COLORS`.
+  - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION` (= `__version__`), `LEVEL_COLORS`, `HELPER_COLORS`.
 - `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to the worker, without changing core signatures.
 - The remaining lazy imports are not cycles:
   - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The GUI process never imports `dose_viz`.
@@ -262,8 +263,10 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
   - `dfm.exe`: console, the CLI and the worker, without Qt.
 
   `cli.py` and `api.workflow()` import the tools through importlib, so the spec lists them as hidden imports.
+- After `COLLECT` the spec copies `LICENSE` as `LICENSE.txt` and calls `third_party_notices.write_notices`, which writes `THIRD-PARTY-NOTICES.txt` next to the EXEs: the bundled distributions (from the Analysis names, via `packages_distributions`) with version, licence, source and the licence texts of their dist-info, the native components (Python, Qt 6, GEOS, OpenBLAS, OpenSSL, libffi, MSVC runtime, PyInstaller bootloader) and the full LGPL 3 / GPL 3 / LGPL 2.1 / Apache 2.0 texts from `packaging/licenses/`. Qt and PySide6 are used under the LGPL 3, GEOS under the LGPL 2.1. `python packaging/third_party_notices.py` regenerates the file from `build/dfm`.
 - `check_bundle.py` checks the build:
   - the size and that it holds no DICOM files;
+  - `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` (Qt 6, PySide6, GEOS, the LGPL text);
   - the versions, `dfm selftest`, the demo case, dose indices with viz and a case transform with its before/after views;
   - `DICOM-RT-Toolkit.exe --smoke-test CASE`: the window and sidebar icons render (Qt6Svg in the bundle), every page inspects the case, then the structure page runs through the frozen worker, offscreen;
   - both EXEs carry the app icon (`app.ico`).
@@ -421,6 +424,7 @@ This module also hosts the **case-transform visualisation** used by `case_modifi
 
 ## Notes for editing
 
+- One version number: `__version__` in `__init__.py` must equal `[project] version` in `pyproject.toml`; `dose_constants.TOOL_VERSION` (`SoftwareVersions`, JSON `meta.tool_version`, `dfm --version`) is derived from it, and `tests/test_cli.py` checks all of them against the installed metadata. After a bump run `uv lock` and `uv sync --extra gui --group build`, then rebuild the bundle (the ZIP carries the version).
 - DICOM patient coordinate system is **LPS** (X=left, Y=posterior, Z=superior); all distances/translations are in mm, rotations in degrees.
 - `data/` and `output/` are gitignored — don't commit DICOM files or generated artifacts.
 - Assign a new `SOPInstanceUID` only via `dicom_utils.set_sop_instance_uid` (also importable as `modifier.set_sop_instance_uid`): it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.

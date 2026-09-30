@@ -56,6 +56,11 @@ dicom-file-modifier/
 │   ├── golden.py            # Golden-output harness (CLI parity before/after refactors and upgrades)
 │   ├── golden_rules.json    # Comparison tolerances for the migration mode
 │   └── cli_surface.py       # argparse snapshot of every CLI (flags, defaults, choices, types)
+├── packaging/
+│   ├── dfm.spec             # PyInstaller build of the Windows app (two EXEs in one folder)
+│   ├── check_bundle.py      # Bundle check; --zip writes the portable ZIP
+│   ├── third_party_notices.py  # THIRD-PARTY-NOTICES.txt of the bundle (licences of the bundled components)
+│   └── licenses/            # LGPL 3, GPL 3, LGPL 2.1 and Apache 2.0 texts for the notices
 ├── pyproject.toml           # Package metadata and dependencies (hatchling)
 ├── uv.lock                  # Locked dependency versions (uv)
 ├── .python-version          # Python version for uv (3.14)
@@ -96,9 +101,17 @@ dfm selftest              # installation check: all self-tests (case modifier on
 dfm --version --json      # versions of the package, the tools and the libraries
 ```
 
-### Desktop app (early version)
+### Desktop app
 
-The desktop app needs the `gui` extra (`uv sync --extra gui` or `pip install -e .[gui]`). Start it with `dfm gui [CASE]` or `dicom-rt-toolkit`.
+**Download and first start** (Windows 10/11, 64-bit; no Python and no admin rights needed):
+1. Download `DICOM-RT-Toolkit-<version>-win64.zip` from the [Releases](https://github.com/TheOpenfield/dicom-file-modifier/releases) page.
+2. Right-click the ZIP → Properties → tick *Unblock*, then extract it to a short path such as `C:\Tools\` (Windows path limit of 260 characters).
+3. Start `DICOM-RT-Toolkit.exe` from the extracted folder. The EXEs are not code-signed yet, so SmartScreen may show "Windows protected your PC": choose *More info* → *Run anyway*. On managed PCs an application-control policy (AppLocker) can block EXEs in user folders; ask IT to allow the folder.
+4. `dfm.exe` in the same folder is the command line: `dfm.exe selftest` checks the installation, `dfm.exe --help` lists the commands.
+
+The folder also holds `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` with the licences of the bundled components (Qt 6/PySide6 under the LGPL v3, GEOS under the LGPL v2.1).
+
+From source, the app needs the `gui` extra (`uv sync --extra gui` or `pip install -e .[gui]`). Start it with `dfm gui [CASE]` or `dicom-rt-toolkit`.
 
 To run an analysis:
 1. Open a case folder, or drag it onto the window.
@@ -113,7 +126,7 @@ The app has three pages:
 
 Every run happens in a separate worker process (`dfm worker`). It writes to a staging folder that becomes the result folder only when the run succeeds. A cancelled run leaves nothing behind. The results go under `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`; the toolbar changes this folder.
 
-Build the Windows app as a folder (PyInstaller onedir, no installer yet). `dist\DICOM-RT-Toolkit\` then holds `DICOM-RT-Toolkit.exe` (the app) and `dfm.exe` (CLI and worker). The check tests the bundle: self-tests, demo case, dose indices and an app smoke test through the frozen worker.
+Build the Windows app as a folder (PyInstaller onedir, no installer yet). `dist\DICOM-RT-Toolkit\` then holds `DICOM-RT-Toolkit.exe` (the app), `dfm.exe` (CLI and worker), `LICENSE.txt` and the generated `THIRD-PARTY-NOTICES.txt`. The check tests the bundle: licence files, self-tests, demo case, dose indices and an app smoke test through the frozen worker.
 ```bash
 uv sync --extra gui --group build
 .venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm
@@ -122,7 +135,7 @@ uv sync --extra gui --group build
 
 ### Python API
 
-`dicom_file_modifier.api` offers the three workflows as functions: structure analysis, dose indices and transformation. The planned desktop app is built on this layer, and scripts can use it as well. Each workflow module has the same steps:
+`dicom_file_modifier.api` offers the three workflows as functions: structure analysis, dose indices and transformation. The desktop app is built on this layer, and scripts can use it as well. Each workflow module has the same steps:
 
 | Step | What it does |
 |---|---|
