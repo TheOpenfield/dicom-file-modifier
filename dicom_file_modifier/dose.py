@@ -30,6 +30,7 @@ import pydicom
 from scipy import ndimage
 from scipy.integrate import trapezoid
 
+from . import _runtime
 from . import analyzer as ana
 from .dicom_utils import get_rs_frame_of_references
 
@@ -762,8 +763,12 @@ def sample_dose_on_grid(dose: DoseGrid, grid: FineGrid, order: int = 1) -> np.nd
     vol, offset = _crop_for_sampling(dose, corners, order)
     out = np.empty(grid.shape, dtype=np.float32)
     ny, nx = len(grid.gy), len(grid.gx)
-    for k in range(len(grid.gz)):
+    ctx = _runtime.current()
+    nz = len(grid.gz)
+    for k in range(nz):
+        ctx.check_cancel()
         out[k] = _sample(vol, offset, dose, grid.plane_points(k), order).reshape(ny, nx)
+        ctx.progress(k + 1, nz, "Dosis auf dem Feingitter abtasten")
     return out
 
 

@@ -136,7 +136,7 @@ SCENARIOS = [
     _sc("dose_ecl_values", "dose_indices", ["{case}", "--eclipse-values", "PIV=5.65,V10Gy=14.4", "--no-viz",
                                             "--output", "{out}"], case="std"),
     _sc("dose_rx_gy_crash", "dose_indices", ["{case}", "--isodose", "20Gy", "--no-viz", "--output", "{out}"],
-        case="std", tags=["known_bug"]),
+        case="std"),
     _sc("dose_rx_pct", "dose_indices", ["{case}", "--rx-pct-of-max", "80", "--no-viz", "--output", "{out}"],
         case="std"),
     _sc("dose_flat", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="flat"),
@@ -145,8 +145,7 @@ SCENARIOS = [
     _sc("dose_nodvh", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="nodvh"),
     _sc("dose_evr", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="evr"),
     _sc("dose_ecl1", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="ecl1"),
-    _sc("dose_ecl2", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="ecl2",
-        tags=["known_bug"]),
+    _sc("dose_ecl2", "dose_indices", ["{case}", "--no-viz", "--output", "{out}"], case="ecl2"),
 ]
 
 # Szenarien je echtem Fall (nur lokal; Voraussetzungen werden geprueft)
@@ -1083,7 +1082,9 @@ def _compare_snap_into(a: dict, b: dict, rules: Rules, arrays: tuple, diff: Diff
     for i, (sa, sb) in enumerate(zip(a["steps"], b["steps"])):
         if sa["exit_code"] != sb["exit_code"]:
             diff.fail(f"Schritt {i}: Exit {sa['exit_code']} vs {sb['exit_code']}")
-        _cmp_lines(sa["stdout"], sb["stdout"], rules, f"stdout[{i}]", diff, numeric_warn=True)
+        # Zahlen im Konsolentext: im Migrationsmodus nur Warnung, exakt ein Fehler
+        _cmp_lines(sa["stdout"], sb["stdout"], rules, f"stdout[{i}]", diff,
+                   numeric_warn=rules.mode != "exact")
     fa, fb = a["files"], b["files"]
     for f in sorted(set(fa) | set(fb)):
         if f not in fa or f not in fb:
@@ -1302,13 +1303,23 @@ def cmd_compare(args) -> int:
                 stats_results.append((n, d, _stderr_warnings(a, d.redact), _stderr_warnings(b, d.redact),
                                       _step_usage(a), _step_usage(b)))
             status = "FAIL" if d.fails else ("WARN" if d.warns else "PASS")
-            detail = d.fails[:args.max_details] + [f"(Warnung) {w}" for w in d.warns[:args.max_details]]
-            if len(d.fails) > args.max_details:
-                detail.append(f"... {len(d.fails) - args.max_details} weitere Abweichungen")
-            reason = next((msg for pat, msg in rules.expected.items() if fnmatch.fnmatch(n, pat)), None)
-            if status == "FAIL" and args.expected and reason:
-                status = "EXPECTED"
-                detail.insert(0, f"erwartete Aenderung: {reason}")
+            fails = d.fails
+            spec = next((s for pat, s in rules.expected.items() if fnmatch.fnmatch(n, pat)), None)
+            head = []
+            if status == "FAIL" and args.expected and spec is not None:
+                # Eintrag: Text (ganzes Szenario) oder {"reason", "only": [Muster der Abweichungen]}
+                reason = spec if isinstance(spec, str) else spec.get("reason", "")
+                only = [] if isinstance(spec, str) else list(spec.get("only", []))
+                unexpected = [f for f in fails if only and not any(fnmatch.fnmatch(f, p) for p in only)]
+                if unexpected:
+                    head = [f"erwartete Aenderung ({reason}), dazu {len(unexpected)} UNERWARTETE Abweichungen:"]
+                    fails = unexpected
+                else:
+                    status = "EXPECTED"
+                    head = [f"erwartete Aenderung: {reason}"]
+            detail = head + fails[:args.max_details] + [f"(Warnung) {w}" for w in d.warns[:args.max_details]]
+            if len(fails) > args.max_details:
+                detail.append(f"... {len(fails) - args.max_details} weitere Abweichungen")
         n_fail += status == "FAIL"
         n_warn += status == "WARN"
         n_exp += status == "EXPECTED"

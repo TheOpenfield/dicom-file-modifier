@@ -40,6 +40,7 @@ import csv
 import datetime as _dt
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ import pydicom
 from pydicom.valuerep import format_number_as_ds
 from scipy.integrate import trapezoid
 
+from . import _runtime
 from . import analyzer as ana
 from . import dose as dm
 from . import rtstruct_writer as rw
@@ -84,14 +86,16 @@ CSV_COLUMNS = [
 def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = None,
                        rd_override: Optional[str] = None,
                        rp_override: Optional[str] = None,
-                       eclipse_ref_override: Optional[str] = None) -> dict:
+                       eclipse_ref_override: Optional[str] = None,
+                       need_rd: bool = True) -> dict:
     """
     ``{'case_id', 'case_dir', 'rs', 'rd', 'rp'|None, 'ct_dir'|None, 'eclipse_ref'|None}``.
     Sucht ``RS*.dcm``/``RD*.dcm``/``RP*.dcm`` im Case-Ordner; Overrides haben
     Vorrang.  Bei mehreren RD-Kandidaten wird die PLAN-Summendosis bevorzugt,
     die den RP referenziert; bleibt es mehrdeutig -> ``ValueError``.
     ``eclipse_ref`` = ``--eclipse-ref`` (muss existieren) oder
-    ``<case>/eclipse_ref.json``, falls vorhanden.
+    ``<case>/eclipse_ref.json``, falls vorhanden.  ``need_rd=False`` (``--list``)
+    sucht kein RD (``rd`` ist dann None bzw. der Override).
     """
     def _pick(kind: str, override: Optional[str], required: bool):
         if override is not None:
@@ -133,9 +137,9 @@ def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = Non
     if case_dir is not None and not Path(case_dir).is_dir():
         raise FileNotFoundError(f"Case-Ordner nicht gefunden: {case_dir!r}")
     rs = _pick("RS", rs_override, True)
-    rd = _pick("RD", rd_override, True)
+    rd = _pick("RD", rd_override, True) if (need_rd or rd_override is not None) else None
     rp = _pick("RP", rp_override, False)
-    base = Path(case_dir) if case_dir is not None else rd.parent
+    base = Path(case_dir) if case_dir is not None else (rd or rs).parent
     ct_dir = base / "CT"
     if eclipse_ref_override is not None:
         eclipse_ref = Path(eclipse_ref_override)
@@ -153,8 +157,8 @@ def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = Non
     }
 
 
-def _roi_table(rs_ds: pydicom.Dataset) -> list:
-    """[(roi_number, name, rt_type, category)] fuer alle ROIs."""
+def roi_table(rs_ds: pydicom.Dataset) -> list:
+    """``[(roi_number, name, rt_type, category)]`` fuer alle ROIs (Kategorie aus ``analyzer``)."""
     names = ana.get_structure_names(rs_ds)
     types = ana.get_structure_type(rs_ds)
     geoms = ana.get_structure_geom_types(rs_ds)
@@ -165,18 +169,50 @@ def _roi_table(rs_ds: pydicom.Dataset) -> list:
     return out
 
 
+_roi_table = roi_table        # alter Name (bis P0.4 privat)
+
+
+def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None) -> dict:
+    """
+    Zielvorschlag ohne Abbruch, fuer die Auswahl in einer Oberflaeche:
+    ``{'rois': roi_table, 'targets': TARGET-ROIs, 'ptvs': PTVs darunter,
+    'default': [(roi_number, name), ...], 'reason': Begruendung, 'notes': [...]}``.
+    ``default`` ist die Auto-Auswahl von ``select_targets``: alle PTVs; passt
+    eine RTPLAN-``DoseReferenceDescription`` (SH, 16 Zeichen) als Praefix auf
+    genau eines von mehreren, nur dieses.  Ohne PTV ist ``default`` leer.
+    """
+    table = roi_table(rs_ds)
+    targets = [r for r in table if r[3] == ana.CAT_TARGET]
+    ptvs = [r for r in targets if r[1].upper().startswith("PTV")]
+    chosen, notes = ptvs, []
+    reason = "alle PTVs (Kategorie TARGET, Name beginnt mit PTV)" if ptvs else "kein PTV gefunden"
+    for ref in rp_refs or []:
+        desc = (ref.get("description") or "").strip()
+        if not desc:
+            continue
+        hits = [r for r in ptvs if r[1].lower().startswith(desc.lower())]
+        if len(hits) == 1 and len(ptvs) > 1:
+            chosen = hits
+            rest = ", ".join(repr(r[1]) for r in ptvs if r not in hits)
+            notes.append(
+                f"RTPLAN-Verschreibung '{desc}' passt auf {hits[0][1]!r}; "
+                f"weitere PTVs ({rest}) nicht ausgewertet (--target fuer alle)."
+            )
+            reason = f"RTPLAN-Verschreibung '{desc}'"
+            break
+    return {"rois": table, "targets": targets, "ptvs": ptvs,
+            "default": [(r[0], r[1]) for r in chosen], "reason": reason, "notes": notes}
+
+
 def select_targets(rs_ds: pydicom.Dataset, target_arg: Optional[str],
                    rp_refs: Optional[list] = None) -> tuple:
     """
     Liefert ``([(roi_number, name), ...], hinweise)``.
     ``--target``: exakter Name, sonst eindeutiger case-insensitiver Teilstring.
-    Auto: Kategorie TARGET und Name beginnt mit PTV; ist eine RTPLAN-
-    ``DoseReferenceDescription`` (SH, 16 Zeichen) Praefix genau eines
-    Kandidaten, wird nur dieser genommen.
+    Auto: ``target_candidates()['default']``; ohne PTV -> ``ValueError``.
     """
-    table = _roi_table(rs_ds)
-    notes = []
     if target_arg:
+        table = roi_table(rs_ds)
         chosen = []
         for token in [t.strip() for t in target_arg.split(",") if t.strip()]:
             exact = [r for r in table if r[1] == token]
@@ -192,31 +228,44 @@ def select_targets(rs_ds: pydicom.Dataset, target_arg: Optional[str],
                 )
             if exact[0] not in chosen:
                 chosen.append(exact[0])
-        return [(r[0], r[1]) for r in chosen], notes
+        return [(r[0], r[1]) for r in chosen], []
 
-    targets = [r for r in table if r[3] == ana.CAT_TARGET]
-    ptvs = [r for r in targets if r[1].upper().startswith("PTV")]
-    if not ptvs:
-        listing = ", ".join(f"{r[1]!r}" for r in targets) or "keine"
+    cand = target_candidates(rs_ds, rp_refs)
+    if not cand["ptvs"]:
+        listing = ", ".join(f"{r[1]!r}" for r in cand["targets"]) or "keine"
         raise ValueError(
             "Kein PTV gefunden. Zielvolumen mit --target NAME waehlen "
             f"(TARGET-Kandidaten: {listing})."
         )
-    chosen = ptvs
-    for ref in rp_refs or []:
-        desc = (ref.get("description") or "").strip()
-        if not desc:
-            continue
-        hits = [r for r in ptvs if r[1].lower().startswith(desc.lower())]
-        if len(hits) == 1 and len(ptvs) > 1:
-            chosen = hits
-            rest = ", ".join(repr(r[1]) for r in ptvs if r not in hits)
-            notes.append(
-                f"RTPLAN-Verschreibung '{desc}' passt auf {hits[0][1]!r}; "
-                f"weitere PTVs ({rest}) nicht ausgewertet (--target fuer alle)."
-            )
-            break
-    return [(r[0], r[1]) for r in chosen], notes
+    return cand["default"], cand["notes"]
+
+
+def rx_candidates(rp_refs: Optional[list], dose: Optional[dm.DoseGrid] = None,
+                  target_names: Optional[list] = None) -> dict:
+    """
+    Verschreibungsvorschlaege ohne Abbruch, fuer die Auswahl in einer
+    Oberflaeche: ``{'refs': RTPLAN-DoseReferences mit TargetPrescriptionDose
+    (Typ TARGET oder leer), 'default': ref | None, 'reason': Begruendung,
+    'dmax_gy': Dmax fuer "% von Dmax" | None}``.  ``default`` ist die Wahl von
+    ``resolve_prescription`` ohne ``--rx``: die einzige Verschreibung oder die,
+    deren Beschreibung Praefix genau eines Zielnamens ist; sonst ``None``.
+    """
+    refs = [r for r in (rp_refs or [])
+            if r.get("target_prescription_dose_gy") is not None
+            and (r.get("reference_type", "").upper() in ("TARGET", ""))]
+    default, reason = None, "keine Verschreibung im RTPLAN"
+    if len(refs) == 1:
+        default, reason = refs[0], "einzige Verschreibung im RTPLAN"
+    elif len(refs) > 1:
+        lowered = [n.lower() for n in (target_names or [])]
+        pref = [r for r in refs if r.get("description")
+                and any(n.startswith(r["description"].lower()) for n in lowered)]
+        if len(pref) == 1:
+            default, reason = pref[0], f"Beschreibung '{pref[0]['description']}' passt zum Ziel"
+        else:
+            reason = "mehrere Verschreibungen, keine passt eindeutig zu den Zielen"
+    return {"refs": refs, "default": default, "reason": reason,
+            "dmax_gy": float(dose.dmax) if dose is not None else None}
 
 
 def resolve_prescription(rx_cli: Optional[float], rx_pct_of_max: Optional[float],
@@ -234,27 +283,20 @@ def resolve_prescription(rx_cli: Optional[float], rx_pct_of_max: Optional[float]
             raise ValueError("--rx-pct-of-max muss in (0, 100] liegen.")
         rx = rx_pct_of_max / 100.0 * dose.dmax
         return float(rx), "pct_of_max", f"{rx_pct_of_max:g} % von Dmax {dose.dmax:.2f} Gy"
-    refs = [r for r in (rp_refs or [])
-            if r.get("target_prescription_dose_gy") is not None
-            and (r.get("reference_type", "").upper() in ("TARGET", ""))]
+    cand = rx_candidates(rp_refs, dose, target_names)
+    refs = cand["refs"]
     if not refs:
         raise ValueError(
             "Keine Verschreibung gefunden (RTPLAN fehlt oder ohne TargetPrescriptionDose). "
             "Bitte --rx <Gy> oder --rx-pct-of-max <Prozent> angeben."
         )
-    if len(refs) > 1:
-        lowered = [n.lower() for n in target_names]
-        pref = [r for r in refs if r.get("description")
-                and any(n.startswith(r["description"].lower()) for n in lowered)]
-        if len(pref) == 1:
-            refs = pref
-        else:
-            listing = "; ".join(f"{r['description']!r}: {r['target_prescription_dose_gy']:g} Gy"
-                                for r in refs)
-            raise ValueError(
-                f"Mehrere Verschreibungen im RTPLAN ({listing}). Bitte --rx angeben."
-            )
-    r = refs[0]
+    r = cand["default"]
+    if r is None:
+        listing = "; ".join(f"{x['description']!r}: {x['target_prescription_dose_gy']:g} Gy"
+                            for x in refs)
+        raise ValueError(
+            f"Mehrere Verschreibungen im RTPLAN ({listing}). Bitte --rx angeben."
+        )
     return (float(r["target_prescription_dose_gy"]), "rtplan",
             f"DoseReferenceSequence '{r['description']}'")
 
@@ -263,6 +305,9 @@ def parse_isodose_levels(spec: str, rx_gy: float) -> tuple:
     """
     ``'100,50,80,12Gy'`` -> ``[{'key','label','pct','gy'}, ...]`` absteigend
     nach Gy; 100 und 50 werden bei Bedarf ergaenzt (Hinweis in ``notes``).
+    Ein Level, das auf Rx bzw. Rx/2 faellt (auch in Gy angegeben, z.B. ``20Gy``
+    bei Rx 20 Gy), bekommt den Schluessel ``'100'`` bzw. ``'50'``; die Indizes
+    greifen ueber diese Schluessel zu.
     """
     levels, notes = [], []
     for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
@@ -280,6 +325,9 @@ def parse_isodose_levels(spec: str, rx_gy: float) -> tuple:
             raise ValueError(f"Ungueltiges Isodosen-Level: {tok!r} (z.B. 100,50,80 oder 12Gy)")
         if gy <= 0:
             raise ValueError(f"Isodosen-Level muss > 0 sein: {tok!r}")
+        for need, canon in ((100.0, "100"), (50.0, "50")):
+            if abs(pct - need) < 1e-6:
+                key = canon
         levels.append({"key": key, "label": label, "pct": pct, "gy": gy})
     for need, lab in ((100.0, "100"), (50.0, "50")):
         if not any(abs(lv["pct"] - need) < 1e-6 for lv in levels):
@@ -422,8 +470,12 @@ class EclipseReference:
         return sorted({v["source"] for vals in self.values.values() for v in vals.values()})
 
 
-def match_target_name(token: str, target_names: list) -> str:
-    """exakt -> case-insensitiv -> eindeutiger Praefix; ``*``/leer nur bei genau einem Ziel."""
+def match_target_name(token: str, target_names: list, allow_unknown: bool = False) -> Optional[str]:
+    """
+    exakt -> case-insensitiv -> eindeutiger Praefix; ``*``/leer nur bei genau
+    einem Ziel.  ``allow_unknown``: passt der Name auf gar kein Ziel, ``None``
+    statt ``ValueError`` (mehrdeutige Namen bleiben ein Fehler).
+    """
     tok = (token or "").strip()
     if tok in ("", "*"):
         if len(target_names) == 1:
@@ -440,6 +492,8 @@ def match_target_name(token: str, target_names: list) -> str:
     pre = [n for n in target_names if n.lower().startswith(tok.lower())]
     if len(pre) == 1:
         return pre[0]
+    if not pre and allow_unknown:
+        return None
     cands = ", ".join(repr(n) for n in (pre or target_names)) or "keine"
     raise ValueError(f"Eclipse-Referenz: Ziel {token!r} nicht eindeutig (Kandidaten: {cands}).")
 
@@ -461,6 +515,8 @@ def eclipse_reference_from_dict(d: dict, target_names: list, rx_gy: Optional[flo
     """
     ``{"<Ziel>": {alias: wert, ...}, "_meta": {...}}`` -> ``EclipseReference``.
     ``"*"`` als Zielschluessel bei genau einem Ziel; ``null`` wird uebersprungen.
+    Ziele, die in diesem Lauf nicht ausgewertet werden (die Datei darf mehr
+    Ziele enthalten), ergeben einen Hinweis statt eines Fehlers.
     """
     ref = EclipseReference()
     if not isinstance(d, dict):
@@ -472,7 +528,12 @@ def eclipse_reference_from_dict(d: dict, target_names: list, rx_gy: Optional[flo
             continue
         if not isinstance(vals, dict):
             raise ValueError(f"Eclipse-Referenz: Eintrag {tkey!r} muss ein Objekt mit Schluessel/Wert-Paaren sein.")
-        target = match_target_name(tkey, target_names)
+        target = match_target_name(tkey, target_names, allow_unknown=True)
+        if target is None:
+            evaluated = ", ".join(repr(n) for n in target_names) or "keine"
+            ref.notes.append(f"Eclipse-Referenz: Ziel {tkey!r} wird in diesem Lauf nicht ausgewertet "
+                             f"(ausgewertet: {evaluated}); Werte ignoriert.")
+            continue
         for k, v in vals.items():
             fv = _to_float(v, f"{tkey}/{k}")
             if fv is None:
@@ -524,7 +585,7 @@ def eclipse_reference_from_dvh(dvh_map: dict, rs_ds: Optional[pydicom.Dataset],
     names = {int(n): nm for n, nm in targets}
     body = None
     if rs_ds is not None:
-        for num, name, _rt, cat in _roi_table(rs_ds):
+        for num, name, _rt, cat in roi_table(rs_ds):
             if cat == ana.CAT_EXTERNAL and num in dvh_map:
                 body = (num, name)
                 break
@@ -590,7 +651,9 @@ def build_eclipse_reference(rd_ds: Optional[pydicom.Dataset], rs_ds: Optional[py
                             dose: Optional[dm.DoseGrid] = None) -> tuple:
     """
     Alle Quellen zusammenfuehren (Vorrang ``cli > json > dvh``), dann Luecken
-    ableiten.  Liefert ``(EclipseReference, dvh_map, hinweise)``.
+    ableiten.  Liefert ``(EclipseReference, dvh_map, hinweise)``; ``dvh_map``
+    ist leer, wenn die DVHs nicht zu diesem RTSTRUCT gehoeren (dann zeigt auch
+    die Validierungsansicht kein Eclipse-DVH).
     """
     ref = EclipseReference()
     dvh_map = {}
@@ -609,6 +672,8 @@ def build_eclipse_reference(rd_ds: Optional[pydicom.Dataset], rs_ds: Optional[py
             ref.merge(eclipse_reference_from_dvh(dvh_map, rs_ds, targets, rx_gy))
         elif not dvh_map:
             ref.notes.append("Keine DVHSequence in der RTDOSE (kein automatischer Eclipse-DVH-Abgleich).")
+        if not trusted:
+            dvh_map = {}
     if json_path:
         ref.merge(load_eclipse_reference_json(json_path, names, rx_gy))
     if cli_string:
@@ -936,9 +1001,12 @@ def evaluate_on_grid(grid: dm.FineGrid, dose_fine: np.ndarray, dose: dm.DoseGrid
     ``{name, roi_number, contours, color, rt_type}``; ``level_specs`` aus
     ``parse_isodose_levels``.  Der Self-Test injiziert hier ein analytisches Feld.
     """
+    ctx = _runtime.current()
     warnings = []
     levels = {}
-    for lv in level_specs:
+    for i, lv in enumerate(level_specs):
+        ctx.check_cancel()
+        ctx.progress(i, len(level_specs), f"Isodose {lv['label']}")
         mask = dm.isodose_mask(dose_fine, lv["gy"])
         labels, n = dm.label_components(mask)
         levels[lv["key"]] = IsodoseLevel(
@@ -955,7 +1023,9 @@ def evaluate_on_grid(grid: dm.FineGrid, dose_fine: np.ndarray, dose: dm.DoseGrid
         warnings.append("Isodose beruehrt den Gitterrand (BBox oder Dosisgitter zu klein).")
 
     targets = {}
-    for spec in target_specs:
+    for i, spec in enumerate(target_specs):
+        ctx.check_cancel()
+        ctx.progress(i, len(target_specs), f"Ziel {spec['name']}")
         tm = evaluate_target(
             spec["name"], spec["roi_number"], spec["contours"], spec.get("color", (255, 0, 0)),
             spec.get("rt_type", ""), grid, dose_fine, rx_gy, levels, volume_model, piv_scope,
@@ -1369,6 +1439,53 @@ def write_txt(lines: list, path: Path) -> None:
 # 5. Orchestrierung
 # ---------------------------------------------------------------------------
 
+def _say(quiet: bool, msg: str = "") -> None:
+    if not quiet:
+        print(msg)
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass                         # z.B. von einem Virenscanner gesperrt
+
+
+@dataclass
+class DoseRunPlan:
+    """
+    Ergebnis von ``prepare_dose_run``: geladene Objekte, Auswahl und die
+    effektiven Einstellungen (nach ``--eclipse-compat``), noch ohne Rechnung.
+    ``options`` enthaelt die uebrigen Laufoptionen, wie uebergeben.
+    """
+    files: dict
+    case_id: str
+    rs_ds: pydicom.Dataset
+    rd_ds: pydicom.Dataset
+    rp_ds: Optional[pydicom.Dataset]
+    dose: dm.DoseGrid
+    rp_refs: list
+    targets: list
+    rx_gy: float
+    rx_source: str
+    rx_detail: str
+    level_specs: list
+    ecl_ref: EclipseReference
+    dvh_map: dict
+    ct_index: Optional[dict]
+    align: Optional[tuple]
+    grid_mm: float
+    dose_interp: str
+    volume_model: str
+    piv_scope: str
+    iso_contours: str
+    simplify_mm: float
+    write_rs: bool
+    warnings: list                    # echte Warnungen (! WARNUNG !)
+    notes: list                       # informative Hinweise
+    options: dict
+
+
 def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None,
                      rd: Optional[str] = None, rp: Optional[str] = None,
                      target: Optional[str] = None, rx: Optional[float] = None,
@@ -1392,10 +1509,52 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     Pixelzentren, Default = 2 Pixel mit Halbpixel-Versatz), Volumenmodell
     ``eclipse``, PIV global, lineare Interpolation, Isodosen-Konturen als
     Feld-Isolinien (Vertices auf den Gitterlinien) ohne Vereinfachung.
+
+    Ablauf in drei Stufen: ``prepare_dose_run`` -> ``compute_dose_run`` ->
+    ``write_dose_outputs``; ``run_dose_indices_ex`` liefert zusaetzlich die
+    Artefakte.
     """
+    report, _art = run_dose_indices_ex(**locals())      # alle Parameter unveraendert weiter
+    return report
+
+
+def run_dose_indices_ex(case_dir: Optional[str] = None, **options) -> tuple:
+    """Wie ``run_dose_indices``, liefert aber ``(report, DoseIndexArtifacts)``."""
+    plan = prepare_dose_run(case_dir, **options)
+    art = compute_dose_run(plan)
+    return write_dose_outputs(plan, art), art
+
+
+def prepare_dose_run(case_dir: Optional[str] = None, *, rs: Optional[str] = None,
+                     rd: Optional[str] = None, rp: Optional[str] = None,
+                     target: Optional[str] = None, rx: Optional[float] = None,
+                     rx_pct_of_max: Optional[float] = None, isodose: str = DEFAULT_ISODOSE,
+                     grid_mm: float = 0.25, dose_interp: str = "linear",
+                     volume_model: str = "slab", piv_scope: str = "component",
+                     output: str = "output", label: str = "_IDX", write_rs: bool = True,
+                     include_target: bool = False, simplify_mm: float = 0.1,
+                     transfer_syntax: str = "explicit", max_name_len: int = 64,
+                     append_csv: Optional[str] = None, eclipse_compat: Optional[str] = None,
+                     iso_contours: str = "mask", quiet: bool = False,
+                     eclipse_ref: Optional[str] = None, eclipse_values: Optional[str] = None,
+                     eclipse_tol_pct: float = 5.0, no_eclipse_dvh: bool = False,
+                     no_viz: bool = False, viz_ct: bool = True) -> DoseRunPlan:
+    """
+    Stufe 1: Discovery, Laden und Pruefen der Dateien, Ziel-, Rx- und
+    Level-Auswahl, Eclipse-Referenz, CT-Schichtindex und ``--eclipse-compat``.
+    Druckt den Kopf des Laufs.  Eingabefehler -> ``ValueError`` bzw.
+    ``FileNotFoundError`` (CLI-Exit 2).
+    """
+    ctx = _runtime.current()
+    ctx.stage("prepare", "Daten lesen und pruefen")
+    options = {"output": output, "label": label, "include_target": include_target,
+               "transfer_syntax": transfer_syntax, "max_name_len": max_name_len,
+               "append_csv": append_csv, "eclipse_compat": eclipse_compat, "quiet": quiet,
+               "eclipse_values": eclipse_values, "eclipse_tol_pct": eclipse_tol_pct,
+               "no_viz": no_viz, "viz_ct": viz_ct}
+
     def say(msg=""):
-        if not quiet:
-            print(msg)
+        _say(quiet, msg)
 
     files = discover_dose_case(case_dir, rs, rd, rp, eclipse_ref)
     _check_csv_header(append_csv)                    # fail fast, bevor gerechnet wird
@@ -1438,15 +1597,23 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
         src_bits.append("--eclipse-values")
     say(f"  Eclipse-Referenz: {'; '.join(src_bits) if src_bits else 'keine'}")
 
-    # CT-Schichtindex (fuer RS-Export, z-Beschraenkung und Eclipse-Raster)
+    # CT-Schichtindex (fuer RS-Export, z-Beschraenkung und Eclipse-Raster).  Ohne
+    # RS-Export und ohne --eclipse-compat wird das CT nicht zwingend gebraucht:
+    # ein unbrauchbarer CT-Ordner ist dann eine Warnung statt eines Abbruchs.
     ct_index = None
     if files["ct_dir"] is not None:
-        ct_index = rw.build_ct_slice_index(str(files["ct_dir"]))
-        warns += rw.validate_index_against_rs(ct_index, rs_ds)
+        try:
+            ct_index = rw.build_ct_slice_index(str(files["ct_dir"]))
+            warns += rw.validate_index_against_rs(ct_index, rs_ds)
+        except Exception as e:  # noqa: BLE001 - nur ohne RS-Export und Eclipse-Raster
+            if write_rs or eclipse_compat:
+                raise
+            ct_index = None
+            warns.append(f"CT-Ordner nicht verwendbar ({type(e).__name__}: {e}); ohne CT-Bezug "
+                         "gerechnet, Validierungsansicht ohne CT-Hintergrund.")
     elif write_rs:
         notes.append("Kein CT-Ordner gefunden; RS-Export uebersprungen (nur Indizes).")
         write_rs = False
-    restrict_z = ct_index["z_values"] if ct_index is not None else None
 
     align = None
     if eclipse_compat:
@@ -1470,66 +1637,116 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
             f"(Ursprung x={align[0]:.4f}, y={align[1]:.4f}), Volumenmodell eclipse, PIV global, "
             "Interpolation linear, Isodosen als Feld-Isolinien ohne Vereinfachung."
         )
-    extra = {"eclipse_compat": eclipse_compat, "iso_contours": iso_contours,
-             "simplify_mm": float(simplify_mm)}
+    return DoseRunPlan(
+        files=files, case_id=case_id, rs_ds=rs_ds, rd_ds=rd_ds, rp_ds=rp_ds, dose=dose,
+        rp_refs=rp_refs, targets=targets, rx_gy=rx_gy, rx_source=rx_source, rx_detail=rx_detail,
+        level_specs=level_specs, ecl_ref=ecl_ref, dvh_map=dvh_map, ct_index=ct_index, align=align,
+        grid_mm=grid_mm, dose_interp=dose_interp, volume_model=volume_model, piv_scope=piv_scope,
+        iso_contours=iso_contours, simplify_mm=simplify_mm, write_rs=write_rs, warnings=warns,
+        notes=notes, options=options,
+    )
 
-    art = compute_dose_indices(rs_ds, dose, targets, rx_gy, rx_source, level_specs,
-                               grid_mm=grid_mm, dose_interp=dose_interp,
-                               volume_model=volume_model, piv_scope=piv_scope,
-                               restrict_z_to=restrict_z, align=align, extra_settings=extra)
-    say(f"  Feingitter: {art.grid.shape[2]} x {art.grid.shape[1]} x {art.grid.shape[0]} Voxel "
-        f"({art.grid.n_voxels / 1e6:.2f} M) @ {grid_mm:g} mm, z {art.grid.dz:.2f} mm")
-    art.eclipse_dvh = dvh_map
-    art.eclipse = compare_with_eclipse(art, ecl_ref, eclipse_tol_pct)
 
-    out_dir = Path(output) / f"{case_id}{label}"
+def compute_dose_run(plan: DoseRunPlan) -> DoseIndexArtifacts:
+    """Stufe 2: Feingitter, Dosis-Sampling, Indizes und Eclipse-Abgleich (ohne Dateien)."""
+    ctx = _runtime.current()
+    ctx.check_cancel()
+    ctx.stage("compute", "Feingitter, Dosis und Indizes berechnen")
+    o = plan.options
+    restrict_z = plan.ct_index["z_values"] if plan.ct_index is not None else None
+    extra = {"eclipse_compat": o["eclipse_compat"], "iso_contours": plan.iso_contours,
+             "simplify_mm": float(plan.simplify_mm)}
+    art = compute_dose_indices(plan.rs_ds, plan.dose, plan.targets, plan.rx_gy, plan.rx_source,
+                               plan.level_specs, grid_mm=plan.grid_mm, dose_interp=plan.dose_interp,
+                               volume_model=plan.volume_model, piv_scope=plan.piv_scope,
+                               restrict_z_to=restrict_z, align=plan.align, extra_settings=extra)
+    _say(o["quiet"], f"  Feingitter: {art.grid.shape[2]} x {art.grid.shape[1]} x {art.grid.shape[0]} Voxel "
+         f"({art.grid.n_voxels / 1e6:.2f} M) @ {plan.grid_mm:g} mm, z {art.grid.dz:.2f} mm")
+    art.eclipse_dvh = plan.dvh_map
+    art.eclipse = compare_with_eclipse(art, plan.ecl_ref, o["eclipse_tol_pct"])
+    return art
+
+
+def write_dose_outputs(plan: DoseRunPlan, art: DoseIndexArtifacts) -> dict:
+    """
+    Stufe 3: Isodosen-RTSTRUCT, Validierungsansicht, Report und JSON/TXT/CSV;
+    liefert den Report (auch in ``art.results``).  Fehler beim RS-Export und in
+    der Ansicht werden Warnungen; das RS entsteht als ``.tmp`` und wird erst nach
+    der Pruefung unter seinem Namen abgelegt.
+    """
+    ctx = _runtime.current()
+    o = plan.options
+    quiet, label = o["quiet"], o["label"]
+
+    def say(msg=""):
+        _say(quiet, msg)
+
+    files, case_id, rs_ds, ct_index = plan.files, plan.case_id, plan.rs_ds, plan.ct_index
+    warns = plan.warnings
+    out_dir = Path(o["output"]) / f"{case_id}{label}"
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs = {"rs_path": None, "json_path": str(out_dir / f"{case_id}_indices.json"),
                "txt_path": str(out_dir / "indices.txt"), "csv_path": str(out_dir / "indices.csv"),
-               "append_csv_path": str(append_csv) if append_csv else None,
+               "append_csv_path": str(o["append_csv"]) if o["append_csv"] else None,
                "viz_html_path": None, "viz_png_path": None}
 
     # RS-Export (Fehler duerfen die Indizes nicht verwerfen)
     specs = None
-    if write_rs:
+    if plan.write_rs:
+        ctx.check_cancel()
+        ctx.stage("rs_export", "Isodosen-RTSTRUCT schreiben")
         rs_out = out_dir / f"RS_{case_id}{label}.dcm"
+        rs_tmp = rs_out.with_name(rs_out.name + ".tmp")
         try:
             desc = rw.summary_description(art)
-            specs = rw.build_roi_specs(art, include_target=include_target,
-                                       max_name_len=max_name_len, simplify_mm=simplify_mm,
-                                       iso_contours=iso_contours)
-            rw.write_isodose_rtstruct(rs_ds, ct_index, specs, rs_out, label=label,
-                                      description=desc, transfer_syntax=transfer_syntax,
-                                      max_name_len=max_name_len)
-            problems = rw.verify_rtstruct(rs_out, ct_index)
+            specs = rw.build_roi_specs(art, include_target=o["include_target"],
+                                       max_name_len=o["max_name_len"], simplify_mm=plan.simplify_mm,
+                                       iso_contours=plan.iso_contours)
+            rw.write_isodose_rtstruct(rs_ds, ct_index, specs, rs_tmp, label=label,
+                                      description=desc, transfer_syntax=o["transfer_syntax"],
+                                      max_name_len=o["max_name_len"])
+            problems = rw.verify_rtstruct(rs_tmp, ct_index)
+            os.replace(rs_tmp, rs_out)
             if problems:
                 warns.append("RS-Pruefung meldet Probleme: " + "; ".join(problems))
                 say("  RS-Pruefung: PROBLEME (siehe Warnungen)")
             else:
                 say(f"  RS-Pruefung: OK ({rs_out.name}, {len(specs)} ROIs)")
             outputs["rs_path"] = str(rs_out)
+        except _runtime.JobCancelled:
+            raise
         except Exception as e:  # noqa: BLE001 - Export darf den Lauf nicht abbrechen
             warns.append(f"RS-Export fehlgeschlagen ({type(e).__name__}: {e}).")
             say(f"  ! WARNUNG ! RS-Export fehlgeschlagen: {e}")
+        finally:
+            _remove_quietly(rs_tmp)
 
     # Validierungsansicht (validation.html + dose_overview.png); Fehler hier
     # duerfen die Indexdateien nicht entwerten -> defensiv abgefangen.
-    if not no_viz:
+    if not o["no_viz"]:
+        ctx.check_cancel()
+        ctx.stage("viz", "Validierungsansicht erstellen")
         try:
             from . import dose_viz          # erst hier: laedt plotly/matplotlib
             if specs is None:          # --no-rs oder RS-Export fehlgeschlagen
-                specs = rw.build_roi_specs(art, include_target=include_target,
-                                           max_name_len=max_name_len, simplify_mm=simplify_mm,
-                                           iso_contours=iso_contours)
+                specs = rw.build_roi_specs(art, include_target=o["include_target"],
+                                           max_name_len=o["max_name_len"],
+                                           simplify_mm=plan.simplify_mm,
+                                           iso_contours=plan.iso_contours)
             outputs.update(dose_viz.run_dose_visualization(
-                art, specs, ct_index, out_dir, ct_background=viz_ct,
+                art, specs, ct_index, out_dir, ct_background=o["viz_ct"],
                 case_id=case_id, label=label, verbose=not quiet))
+        except _runtime.JobCancelled:
+            raise
         except Exception as e:  # noqa: BLE001
             warns.append(f"Visualisierung fehlgeschlagen ({type(e).__name__}: {e}); "
                          "Indexdateien bleiben gueltig.")
             say(f"  ! WARNUNG ! Visualisierung fehlgeschlagen: {e}")
 
+    ctx.check_cancel()
+    ctx.stage("reports", "Berichte schreiben")
     art.warnings = warns + art.warnings
+    ecl_ref, rp_ds = plan.ecl_ref, plan.rp_ds
     meta = {
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         "case_id": case_id,
@@ -1538,19 +1755,19 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
         "rs_label": str(rs_ds.get("StructureSetLabel", "")),
         "rs_sop_uid": str(rs_ds.get("SOPInstanceUID", "")),
         "rs_n_rois": len(rs_ds.get("StructureSetROISequence", [])),
-        "rx_detail": rx_detail,
+        "rx_detail": plan.rx_detail,
         "eclipse_reference": {
             "json_path": ecl_ref.meta.get("json_path"), "cli": ecl_ref.meta.get("cli"),
             "dvh_rois": list(ecl_ref.meta.get("dvh_rois", []) or []),
-            "body_roi": ecl_ref.meta.get("body_roi"), "tol_pct": float(eclipse_tol_pct),
+            "body_roi": ecl_ref.meta.get("body_roi"), "tol_pct": float(o["eclipse_tol_pct"]),
             "sources": ecl_ref.sources(), "source": ecl_ref.meta.get("source"),
             "date": ecl_ref.meta.get("date"),
         },
         "rtplan": ({"label": str(rp_ds.get("RTPlanLabel", "")),
                     "sop_instance_uid": str(rp_ds.get("SOPInstanceUID", "")),
                     "fractions": dm.fractions_planned(rp_ds),
-                    "dose_references": rp_refs} if rp_ds is not None else None),
-        "notes": notes,
+                    "dose_references": plan.rp_refs} if rp_ds is not None else None),
+        "notes": plan.notes,
     }
     report = build_report(art, meta, outputs)
     art.results = report
@@ -1562,20 +1779,20 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     write_txt(lines, outputs["txt_path"])
     rows = csv_rows(report)
     write_csv(rows, outputs["csv_path"], append=False)
-    if append_csv:
-        write_csv(rows, Path(append_csv), append=True)
+    if o["append_csv"]:
+        write_csv(rows, Path(o["append_csv"]), append=True)
     say("\nFertig.")
     return report
 
 
 def list_rois(case_dir: Optional[str], rs: Optional[str], rd: Optional[str],
               rp: Optional[str]) -> int:
-    """``--list``: ROI-Tabelle und Verschreibungen, dann Ende."""
-    files = discover_dose_case(case_dir, rs, rd, rp)
+    """``--list``: ROI-Tabelle und Verschreibungen, dann Ende (ohne RTDOSE)."""
+    files = discover_dose_case(case_dir, rs, rd, rp, need_rd=False)
     rs_ds = ana.load_rtstruct(str(files["rs"]))
     print(f"\nROIs in {files['rs'].name}:")
     print(f"  {'Nr':>4}  {'Name':<32}{'Typ':<12}{'Kategorie':<14}{'Konturen':>9}{'Vol cm3':>10}")
-    for num, name, rt, cat in sorted(_roi_table(rs_ds), key=lambda r: r[0]):
+    for num, name, rt, cat in sorted(roi_table(rs_ds), key=lambda r: r[0]):
         cs = dm.closed_planar_contours(rs_ds, num)
         vol = ana.compute_volume(cs) if cs else 0.0
         print(f"  {num:>4}  {name[:31]:<32}{rt[:11]:<12}{cat:<14}{len(cs):>9}{vol:>10.3f}")

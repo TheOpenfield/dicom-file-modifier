@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -283,14 +284,23 @@ def summary_description(art, max_len: int = 200) -> str:
 # 3. RTSTRUCT schreiben
 # ---------------------------------------------------------------------------
 
+_WRITING_VALIDATION_LOCK = threading.RLock()
+
+
 @contextmanager
 def _writing_validation(mode):
-    old = pdconfig.settings.writing_validation_mode
-    pdconfig.settings.writing_validation_mode = mode
-    try:
-        yield
-    finally:
-        pdconfig.settings.writing_validation_mode = old
+    """
+    Setzt ``writing_validation_mode`` fuer die Dauer des Blocks.  Der Schalter
+    gilt prozessweit; das Lock verhindert, dass zwei Threads ihn gleichzeitig
+    umstellen und sich den alten Wert gegenseitig ueberschreiben.
+    """
+    with _WRITING_VALIDATION_LOCK:
+        old = pdconfig.settings.writing_validation_mode
+        pdconfig.settings.writing_validation_mode = mode
+        try:
+            yield
+        finally:
+            pdconfig.settings.writing_validation_mode = old
 
 
 def _now_strings() -> tuple:
@@ -299,7 +309,8 @@ def _now_strings() -> tuple:
 
 
 def _tool_version() -> str:
-    return f"{TOOL_NAME} {TOOL_VERSION}"[:16]
+    # SoftwareVersions hat VR LO (64 Zeichen); bis P0.4 auf 16 gekuerzt
+    return f"{TOOL_NAME} {TOOL_VERSION}"[:64]
 
 
 def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,

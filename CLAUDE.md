@@ -72,11 +72,13 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
 There is no lint config yet; `pyproject.toml` declares ruff as a dependency group and builds the package with hatchling. The automated checks are:
-- `uv run pytest` (`tests/`, restricted via `testpaths`). So far this is `tests/test_import_graph.py`, which checks four things:
-  - no import cycles at module level;
-  - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
-  - every module imports first in a fresh interpreter;
-  - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
+- `uv run pytest` (`tests/`, restricted via `testpaths`):
+  - `tests/test_import_graph.py` checks four things:
+    - no import cycles at module level;
+    - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
+    - every module imports first in a fresh interpreter;
+    - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
+  - `tests/test_dose_indices.py` runs the P0.4 behaviour on the demo case: candidates, fixes, stages, progress and cancel.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -100,7 +102,13 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
   - pixel differences per scenario;
   - runtime and peak memory;
   - stderr warnings that are new or gone.
-- Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change (`expected_changes` in the rules file).
+- Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change.
+- `expected_changes` in the rules file lists the intended diffs of the current PR for `compare --expected`. An entry maps a scenario pattern to one of two forms:
+  - a text: the whole scenario may differ;
+  - `{"reason", "only": [patterns of diff messages]}`: only those diffs are expected, and any other diff stays FAIL.
+
+  The first matching pattern wins. Remove the entries after the re-baseline.
+- In `exact` mode, numbers in the console output that differ are failures, not warnings.
 - The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
 - No goldens are committed. The synthetic snapshots are about 50 MB, and exact parity is only reliable on the same CPU.
 - The local reference is `G3b` (Python 3.14 from `uv.lock`).
@@ -117,6 +125,7 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
   - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
   - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION`, `LEVEL_COLORS`, `HELPER_COLORS`.
 - Both are re-exported at their old locations (`case_modifier`, `modifier`, `dose_indices`).
+- `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to a future worker, without changing core signatures.
 - The remaining lazy imports are not cycles:
   - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The planned GUI process must never import `dose_viz`.
   - `case_modifier` → `visualizer`/`analyzer` and `visualizer` → `modifier` only load what the chosen code path needs.
@@ -141,6 +150,33 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
 
 ### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` / `dose_viz.py` — dose indices
 Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → `build_eclipse_reference` / `compare_with_eclipse` (RTDOSE `DVHSequence` via `dose.read_dvh_sequence`, `eclipse_ref.json`, `--eclipse-values`; precedence cli > json > dvh, gaps filled by `derive_eclipse_values`) → RS export → `dose_viz.run_dose_visualization` (`validation.html` + `dose_overview.png`, wrapped in try/except like the RS export) → report/JSON/TXT/CSV.
+
+**Orchestration (P0.4).** `run_dose_indices` keeps its signature and output and runs three stages:
+- `prepare_dose_run` → `DoseRunPlan`: discovery, loading and checks, selection, Eclipse reference, CT index, `--eclipse-compat`.
+- `compute_dose_run` → `DoseIndexArtifacts`.
+- `write_dose_outputs` → report: RS export, viz, JSON/TXT/CSV.
+
+`run_dose_indices_ex` returns `(report, artifacts)`.
+
+**Candidates without aborting**, for a GUI:
+- `target_candidates` and `rx_candidates` return the automatic choice with a reason. `select_targets` and `resolve_prescription` build on them and keep their messages.
+- `roi_table` is public; `_roi_table` remains as an alias.
+
+**Progress and cancel.** The stages and the loops call `_runtime.current()`:
+- stages: `prepare` / `compute` / `rs_export` / `viz` / `reports`;
+- loops: dose sampling per plane, per isodose level, per target.
+
+Without a context everything is a no-op. `_runtime.use(ctx)` sets a `JobContext`, whose `check_cancel()` may raise `JobCancelled`. RS-export and viz errors become warnings, but `JobCancelled` is re-raised.
+
+**Behaviour since P0.4:**
+- An isodose level on Rx or Rx/2 given in Gy gets the key `"100"` / `"50"`.
+- An `eclipse_ref.json` target that is not evaluated only adds a note; ambiguous names stay errors.
+- Untrusted DVHs are not overlaid: they reference another structure set, so `dvh_map` is `{}`.
+- `--list` needs no RD (`discover_dose_case(need_rd=False)`).
+- With `--no-rs` and no `--eclipse-compat`, an unusable CT folder is a warning (no CT reference, no CT background).
+- The RS is written as `RS_*.dcm.tmp` and moved into place with `os.replace` after `verify_rtstruct`.
+- The pydicom `writing_validation_mode` toggle is locked.
+- `SoftwareVersions` is no longer cut to 16 characters.
 
 Key conventions:
 - All volumes come from the same fine grid; target-derived volumes (TV, TV∩PIV, underdosed) carry the slab weights, isodose-derived ones (PIV, PIV50, spill) do not, so TV∩PIV ≤ min(TV, PIV) always holds. Comparisons are inclusive (`>=`). `D_x` = dose received by x % of the weighted target volume (D98 = 2nd weighted percentile).
