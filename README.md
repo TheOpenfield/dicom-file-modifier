@@ -1,6 +1,4 @@
-<img src="dicom_file_modifier/gui/assets/app.png" width="96" align="right" alt="App-Icon des DICOM-RT-Toolkit">
-
-# DICOM File Modifier
+# <img src="dicom_file_modifier/gui/assets/app.png" width="40" align="absmiddle" alt=""> DICOM File Modifier
 
 A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Structure Set files used in radiotherapy planning. This project provides tools to process target volumes (PTV, CTV, GTV) and organs at risk (OAR) from DICOM files, compute geometric metrics, and generate visualizations.
 
