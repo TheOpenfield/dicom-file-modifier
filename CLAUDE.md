@@ -15,6 +15,13 @@ pip install -e .         # alternative: minimum versions from pyproject.toml (re
 uv run pytest            # test suite in tests/
 ```
 
+One entry point `dfm` (installed by `uv sync` / `pip install -e .`, also `python -m dicom_file_modifier`):
+```bash
+dfm analyze|visualize|ct-transform|case-transform|dose-indices|demo ...   # = python -m dicom_file_modifier.<module> ..., argv unchanged
+dfm selftest              # installation check: all self-tests, case_modifier on a freshly generated demo case
+dfm --version [--json]    # package, tool and library versions
+```
+
 Each module is invoked as `python -m dicom_file_modifier.<module>`:
 
 ```bash

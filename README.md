@@ -85,6 +85,17 @@ pip install -e .                # equivalent: pip install -r requirements.txt
 
 ## Usage
 
+### One command for all tools
+
+After installation, the `dfm` command, or `python -m dicom_file_modifier`, runs every tool. The arguments are passed on unchanged, so all options below work the same way:
+
+```bash
+dfm analyze data/<case-id>/RS.dcm --output output/         # = python -m dicom_file_modifier.analyzer ...
+dfm visualize | ct-transform | case-transform | dose-indices | demo ...
+dfm selftest              # installation check: all self-tests (case modifier on a freshly generated demo case)
+dfm --version --json      # versions of the package, the tools and the libraries
+```
+
 ### Analyzer
 
 Analyse RTSTRUCT files and compute geometric metrics:

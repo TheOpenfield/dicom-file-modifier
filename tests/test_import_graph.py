@@ -21,8 +21,10 @@ import pytest
 
 PKG_DIR = Path(__file__).resolve().parents[1] / "dicom_file_modifier"
 PKG = PKG_DIR.name
-MODULES = sorted(p.stem for p in PKG_DIR.glob("*.py") if p.stem != "__init__")
+MODULES = sorted(p.stem for p in PKG_DIR.glob("*.py") if p.stem not in ("__init__", "__main__"))
 ORCHESTRATORS = {"case_modifier", "dose_indices"}
+# Einstiegspunkte duerfen die Orchestratoren aufrufen (Unterpakete wie api/ werden nicht gescannt)
+ENTRY_POINTS = {"cli"}
 
 
 def _package_imports(node: ast.AST) -> set:
@@ -78,7 +80,8 @@ def test_no_cycles_at_module_level():
 
 def test_no_module_imports_an_orchestrator():
     offenders = {m: sorted((eager | lazy) & ORCHESTRATORS)
-                 for m, (eager, lazy) in GRAPH.items() if m not in ORCHESTRATORS and (eager | lazy) & ORCHESTRATORS}
+                 for m, (eager, lazy) in GRAPH.items()
+                 if m not in ORCHESTRATORS | ENTRY_POINTS and (eager | lazy) & ORCHESTRATORS}
     assert not offenders, f"Module importieren CLI-Orchestratoren: {offenders}"
 
 
