@@ -10,7 +10,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 - [CT Rigid Body Transformer](#ct-rigid-body-transformer-documentation) — rigid transform of a CT series
 - [Case Modifier](#case-modifier-documentation) — lockstep transform of a CT + its RTSTRUCT
 - [RTSTRUCT Visualizer](#rtstruct-visualizer-documentation) — plots and statistics
-- [Dose Indices](#dose-index-documentation) — Paddick CI, GI, ICRU 83 HI and isodose contours from RTSTRUCT + RTDOSE
+- [Dose Indices](#dose-index-documentation) — Paddick CI, GI, ICRU 83 HI and isodose contours from RTSTRUCT + RTDOSE, comparison with the TPS values, validation view
 - [References](#references)
 
 ## Features
@@ -19,7 +19,7 @@ A comprehensive toolkit for analyzing, modifying, and visualizing DICOM RT Struc
 - **Modifier**: Rigid body transformation of CT DICOM series (translation + rotation), either resampled onto the original axial grid or HU-exact by rewriting only the geometry tags, with 3D visualisation
 - **Case Modifier**: Lockstep rigid body transformation of a CT series **and** its companion RTSTRUCT in a single pass — contour points are transformed alongside the pixel data, UID references are rewritten so the new RS links to the new CT, and an optional `Drehpunkt` POINT marker is inserted at the rotation centre for easy identification in the TPS
 - **Visualizer**: Generate plots and statistics from analysis results
-- **Dose Indices**: Compute Paddick conformity index, gradient index, ICRU 83 homogeneity index and DVH statistics for each target from an RTSTRUCT + RTDOSE pair (prescription from the RTPLAN), and write a separate RTSTRUCT with the isodose ROIs and the intersection / underdosed / spill helper contours for verification in the TPS; an Eclipse-compatibility mode reproduces the TPS raster conventions
+- **Dose Indices**: Compute Paddick conformity index, gradient index, ICRU 83 homogeneity index and DVH statistics for each target from an RTSTRUCT + RTDOSE pair (prescription from the RTPLAN), and write a separate RTSTRUCT with the isodose ROIs and the intersection / underdosed / spill helper contours for verification in the TPS; an Eclipse-compatibility mode reproduces the TPS raster conventions, the Eclipse DVHs stored in the RTDOSE and user-supplied TPS values are compared component by component, and an offline `validation.html` (3D surfaces, axial slice browser with CT and dose wash, DVH) plus a tri-planar PNG show what the numbers were computed from
 
 ## Project Structure
 
@@ -39,7 +39,8 @@ dicom-file-modifier/
 │   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
 │   ├── visualizer.py        # Visualisation module
 │   ├── dose.py              # Dose-grid numerics library (RTDOSE, fine grid, sampling, DVH statistics)
-│   ├── dose_indices.py      # Dose index computation (CI/GI/HI) + reports
+│   ├── dose_indices.py      # Dose index computation (CI/GI/HI), Eclipse comparison + reports
+│   ├── dose_viz.py          # Dose-index validation view (validation.html, dose_overview.png)
 │   └── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
 ├── requirements.txt         # Python dependencies
 └── README.md                # This file
@@ -186,6 +187,14 @@ python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high 
 # Explicit files, prescription and isodose levels
 python -m dicom_file_modifier.dose_indices --rs RS.dcm --rd RD.dcm --rx 20 --isodose 100,80,50,12Gy --no-rs
 
+# Compare with the TPS: the Eclipse DVHs in the RTDOSE are read automatically; the remaining components
+# come from data/<case-id>/eclipse_ref.json or the command line (V20Gy / V10Gy are resolved via the prescription)
+python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high --eclipse-values "PIV=1.45,V10Gy=6.1"
+
+# Skip the validation view, or draw it without the CT background
+python -m dicom_file_modifier.dose_indices data/<case-id> --no-viz
+python -m dicom_file_modifier.dose_indices data/<case-id> --no-viz-ct
+
 # ROI table + prescriptions / analytic phantom self-test / writer self-test (exit 0 = pass)
 python -m dicom_file_modifier.dose_indices data/<case-id> --list
 python -m dicom_file_modifier.dose_indices --self-test
@@ -194,8 +203,9 @@ python -m dicom_file_modifier.rtstruct_writer --self-test
 
 This produces `output/<case-id>_IDX/`:
 - `RS_<case-id>_IDX.dcm` — separate RTSTRUCT with `ISO_100%_20.0Gy`, `ISO_50%_10.0Gy` and, per target, `<Target>_x_ISO100` (intersection), `<Target>_minus_ISO100` (underdosed) and `ISO100_minus_<Target>` (spill); `--include-target` adds a verbatim copy of the target
-- `<case-id>_indices.json` — all components, indices, DVH statistics and settings
-- `indices.txt` — the console report; `indices.csv` — one row per target (`--append-csv PATH` appends the rows to a cross-case collection table)
+- `<case-id>_indices.json` — all components, indices, DVH statistics, settings and the Eclipse comparison (`targets[<name>].eclipse`, sources in `meta.eclipse_reference`)
+- `indices.txt` — the console report; `indices.csv` — one row per target including the `ecl_*` / `d_*_pct` comparison columns (`--append-csv PATH` appends the rows to a cross-case collection table)
+- `validation.html` — offline validation page (3D isodose/target surfaces, axial slice browser with CT, dose wash and the exported contours, DVH with the Eclipse DVH overlaid, index table); `dose_overview.png` — static axial/coronal/sagittal planes + DVH
 
 **All CLI options:**
 
@@ -216,7 +226,12 @@ This produces `output/<case-id>_IDX/`:
 | `--simplify-mm` | `0.1` | Douglas–Peucker tolerance of the exported contours (keep below half the grid resolution) |
 | `--transfer-syntax` | `explicit` | Transfer syntax of the exported RTSTRUCT (`explicit` or `implicit` VR little endian) |
 | `--max-name-len` | `64` | Maximum ROI name length (DICOM LO limit) |
-| `--append-csv` | off | Append the result rows to a collection CSV (header written once) |
+| `--append-csv` | off | Append the result rows to a collection CSV (header written once; a file with an older header is refused) |
+| `--eclipse-ref` | `<case>/eclipse_ref.json` | JSON with the TPS values per target (see [Comparison with Eclipse](#comparison-with-eclipse)) |
+| `--eclipse-values` | off | TPS values on the command line: `TV=1.20,VRX=1.17,PIV=1.45,V50=6.1` (aliases `V20Gy`/`V10Gy`, `CI`, `GI`, `HI`, `D98`, …; several targets: `NAME:KEY=VALUE`) |
+| `--eclipse-tol-pct` | `5` | Relative tolerance of the comparison in %; larger deviations are marked `!` and listed as warnings |
+| `--no-eclipse-dvh` | off | Ignore the Eclipse DVHs stored in the RTDOSE |
+| `--no-viz` / `--no-viz-ct` | off | Skip the validation view (`validation.html`, `dose_overview.png`) / draw it without the CT background |
 | `--list` / `--self-test` | off | ROI table + prescriptions; analytic phantom self-test |
 | `--output` | `output` | Base output directory |
 
@@ -230,7 +245,7 @@ See [Dose Index Documentation](#dose-index-documentation) for the definitions, t
 - shapely: 2D geometry operations
 - matplotlib: Plotting and visualisation
 - scikit-image: Marching cubes surface extraction (analyzer sphericity surface; modifier & case_modifier CT surfaces)
-- plotly: Interactive 3D visualisation (modifier, case_modifier)
+- plotly: Interactive 3D visualisation (modifier, case_modifier) and the dose-index validation page (dose_viz; plotly.js embedded, works offline)
 
 ---
 
@@ -1052,11 +1067,42 @@ Inspecting contours exported by Eclipse reveals how the TPS stores its structure
 | dose interpolation | linear | linear |
 | isodose contours | isolines of the sampled dose field, no simplification | same |
 
-On a clinical SRS case this mode reproduced Eclipse's DVH statistics of the target (coverage, $D_{98}$ / $D_{50}$ / $D_2$, HI, target volume) to within about 1 %. The Paddick index, however, came out several hundredths above the TPS value; the difference lay entirely in the prescription isodose volume, i.e. in how the TPS samples the isodose, not in the target statistics. The report prints every component so the comparison can be completed once the TPS values are known.
+On a clinical SRS case this mode reproduced Eclipse's DVH statistics of the target (coverage, $D_{98}$ / $D_{50}$ / $D_2$, HI, target volume) to within about 1 %. The Paddick index, however, came out several hundredths above the TPS value; the difference lay entirely in the prescription isodose volume, i.e. in how the TPS samples the isodose, not in the target statistics. The comparison block of the report (next section) makes such a gap explicit: entering the CI of the TPS derives the PIV it must have used.
+
+## Comparison with Eclipse
+
+The report compares every component the indices are built from against the values of the TPS, from two sources:
+
+- **Eclipse DVHs in the RTDOSE.** Eclipse exports the cumulative DVHs of the structures it evaluated into the RTDOSE `DVHSequence` (`DVHType` `CUMULATIVE`, `DoseUnits` `GY`, `DVHVolumeUnits` `CM3`; `DVHData` is a flat list of bin-width / cumulative-volume pairs and `DVHDoseScaling` scales the widths). The tool reads them automatically (`--no-eclipse-dvh` disables it). For every evaluated target with a DVH this yields the TPS target volume, the target volume inside the prescription isodose ($V_{D_{\mathrm{Rx}}}$ of the target, i.e. $\mathrm{TV}_{\mathrm{PIV}}$), $D_{98}$ / $D_{50}$ / $D_2$ and $D_{\min}$ / $D_{\max}$ / $D_{\mathrm{mean}}$; a DVH of the body (`EXTERNAL`) yields the TPS prescription isodose volume ($V_{D_{\mathrm{Rx}}}$ of the body $= \mathrm{PIV}$) and $V_{D_{\mathrm{Rx}}/2} = \mathrm{PIV}_{50}$. The bin volumes are read at the **left bin edge**: bin 0 at 0 Gy carries the total volume and the last non-empty bin then sits exactly at `DVHMaximumDose`; with the usual 0.01 Gy bins the other convention would shift $V_{D_{\mathrm{Rx}}}$ by 0.0003 cm³. Items that are differential, relative, combined over several ROIs or marked `EXCLUDED` are skipped with a note, and the DVHs are only used when the RTDOSE references the evaluated RTSTRUCT.
+- **TPS values supplied by the user.** A file `eclipse_ref.json` in the case folder (or `--eclipse-ref PATH`) and/or `--eclipse-values KEY=VALUE,…` on the command line. Keys are case-insensitive aliases of the canonical names (`TV`/`tv_cm3`, `VRX`/`tv_piv_cm3`, `PIV`/`piv_cm3`, `V50`/`piv50_cm3`, `CI`, `GI`, `HI`, `D98`, `D50`, `D2`, `Dmean`, `Dmin`, `Dmax`); `V20Gy` / `V10Gy` are resolved through the prescription (a dose equal to $D_{\mathrm{Rx}}$ means $\mathrm{TV}_{\mathrm{PIV}}$, half of it $\mathrm{PIV}_{50}$, anything else is an error). Targets are addressed by exact name, case-insensitive name or unique prefix; `"*"` (JSON) or a bare `KEY=VALUE` (CLI) is accepted only when a single target is evaluated, otherwise use `NAME:KEY=VALUE`.
+
+```json
+{"_meta": {"source": "TPS plan evaluation, values copied by hand", "date": "YYYY-MM-DD"},
+ "PTV_1": {"tv_cm3": 1.20, "V20Gy": 1.17, "piv_cm3": 1.45, "V10Gy": 6.1,
+           "ci_paddick": 0.79, "d98_gy": 20.2, "d50_gy": 23.0, "d2_gy": 24.7}}
+```
+
+Precedence is `--eclipse-values` > JSON > DVH. Missing values are then derived from the given ones and tagged `derived`: the TPS prescription isodose volume from a TPS Paddick index ($\mathrm{PIV} = \mathrm{TV}_{\mathrm{PIV}}^{\,2} / (\mathrm{TV} \cdot \mathrm{CI})$), the Paddick index from the components, $\mathrm{GI} = \mathrm{PIV}_{50} / \mathrm{PIV}$ and the ICRU 83 index from $D_2$, $D_{98}$ and $D_{50}$; when both a CI and a PIV are given and disagree by more than 1 % a note is printed.
+
+The block `Abgleich Eclipse` of each target then lists, for the 13 quantities, the tool value, the TPS value, the absolute and the relative difference and the source (`dvh`, `json`, `cli`, `derived`). The tool's PIV and PIV₅₀ in this table are always the **global** isodose volumes, because the TPS reports the whole isodose; with `--piv-scope component` the table says so. Rows whose relative difference exceeds `--eclipse-tol-pct` (default 5 %) are marked with `!` and repeated under the target's warnings; the exit code is not affected. The same rows appear in the JSON (`targets[<name>].eclipse`, with `meta.eclipse_reference` naming the sources) and as `ecl_*` / `d_*_pct` columns at the end of the CSV. Because the CSV header grew, appending to a collection CSV written by an older version stops with a clear error before anything is computed; rename the old file or give a new `--append-csv` path.
+
+When the RTDOSE holds only the target's DVH (Eclipse exports the DVHs of the structures that were evaluated in the plan), TV, $\mathrm{TV}_{\mathrm{PIV}}$ and the D-values are compared automatically while PIV and PIV₅₀ wait for the TPS values (`n/a (kein Body-DVH; manuell angeben)`). Entering the CI the TPS reports (`--eclipse-values CI=0.79`) makes the tool derive the PIV the TPS must have used and compare it with its own, which localises a CI gap either in the isodose volume or in the target statistics.
 
 ## RTSTRUCT Export
 
 The exported file is built from scratch (not a modified copy): patient, study and frame-of-reference attributes are copied from the original RTSTRUCT so the file imports next to the original CT series, everything else — UIDs, series number (+1000), `StructureSetLabel` (original label plus suffix, cut to 16 characters), dates, a summary of the indices in `StructureSetDescription` — is new. Each ROI is written as `CLOSED_PLANAR` contours, one per ring, on the CT slice planes with a `ContourImageSequence` reference to that slice; holes are separate rings with negative signed area, which is the convention Eclipse itself uses. The isodose ROIs carry the `RTROIInterpretedType` `CONTROL` like Eclipse's own dose structures. The file is written as explicit VR little endian with a complete file-meta header under pydicom's strict validation mode and immediately re-read and checked (`verify_rtstruct`: UID consistency, VR lengths, unique names, planar contours, slice references). Contours are extracted from the masks by marching squares at the 0.5 level, so their vertices lie on the voxel boundaries; the Douglas–Peucker simplification (`--simplify-mm`, default 0.1 mm) stays below half a voxel so that re-rasterising the contours reproduces the mask exactly (the self-test checks Dice = 1.0). With `--iso-contours field` the isodose contours are instead the isolines of the sampled dose field, which gives sub-voxel accuracy and the Eclipse vertex convention.
+
+## Validation View
+
+Unless `--no-viz` is given, every run also writes two files that show *what* the numbers were computed from:
+
+- **`validation.html`** — a self-contained page (plotly.js is embedded once, about 4.9 MB, so it opens offline) with three independent figures and the index table:
+  1. *3D*: the prescription and the 50 % isodose as surfaces (marching cubes on the sampled dose field at the level), the target as the surface of its voxel mask, the original target contours and the exported isodose / helper contours as polylines. Every layer is a legend entry and can be switched on and off; the 50 % surface and the helper contours start hidden.
+  2. *Axial slice browser*: one slider step per evaluation plane, each showing the CT slice (soft-tissue window W 400 / L 40), the dose wash (transparent below 10 % of $D_{\mathrm{Rx}}$, colours by percent of the prescription) and the contours of that plane — the exported isodose and helper ROIs exactly as written to the RTSTRUCT, and the original target contour dashed. Hovering shows the coordinates, so the vertex convention of the field isolines can be checked directly. The CT is read only for the slices inside the evaluation grid (a few dozen slices, well under a second); `--no-viz-ct` skips it, and without a `CT/` folder the browser shows the dose alone.
+  3. *DVH*: the cumulative DVH of each target from the same weighted samples as the statistics ($D_{98}$, $D_{50}$ and $D_2$ marked, the prescription as a dotted line) with the Eclipse DVH from the RTDOSE dashed on top when it exists.
+- **`dose_overview.png`** — a static 1 × 4 figure: axial, coronal and sagittal planes through the centroid of the first target with CT, dose wash, isodose lines and the target outline, plus the DVH panel.
+
+The page respects a data budget so it stays a few megabytes: the dose wash and the CT are strided to at most 128 samples per axis (genuine samples, no averaging), the surfaces to at most 96 samples in-plane and the DVH to 2000 points; the contours are never thinned. Isodose surfaces are drawn from the dose field rather than from the voxel mask, so they are smooth and match the exported field isolines; in the default mode the staircase of the mask-based contours against the smooth surface shows the discretisation the volumes are counted with. Plotly's slider resets the visibility of all traces, so a layer hidden through the legend reappears on the next slice. A static export from Plotly would need `kaleido`, therefore the PNG is drawn with matplotlib.
 
 ## Resolution and Convergence
 
@@ -1079,12 +1125,12 @@ At 1 mm in-plane the voxel discretisation alone moves the individual volumes by 
 
 ## Validation
 
-`python -m dicom_file_modifier.dose_indices --self-test` builds an analytic phantom in memory — a spherical target of radius 10 mm contoured on 1 mm planes and a smooth radial dose field $D(r) = D_{\max} / (1 + (r/r_0)^6)$ around a centre offset by 2 mm — for which TV, PIV, their intersection (a stack of circle–circle lenses), the DVH and hence every index have closed-form values. The 23 checks cover the RTDOSE loader (relative and absolute GFOV), the sampler (a linear field must be reproduced to 1e-6 Gy by both interpolation orders; points outside the grid give NaN), all volumes and indices at 0.25 mm (within 0.5 % / ±0.005) and 1.0 mm, both volume models, the sampling from a native 0.5 mm grid, a ring-shaped target with holes, the component scoping with two separate hot spots, and the mask → contour → mask round trip. `python -m dicom_file_modifier.rtstruct_writer --self-test` writes synthetic masks (sphere, annulus, islands, border-touching block, single voxel) to a temporary RTSTRUCT and verifies orientation, volumes, name uniqueness and the file-meta consistency.
+`python -m dicom_file_modifier.dose_indices --self-test` builds an analytic phantom in memory — a spherical target of radius 10 mm contoured on 1 mm planes and a smooth radial dose field $D(r) = D_{\max} / (1 + (r/r_0)^6)$ around a centre offset by 2 mm — for which TV, PIV, their intersection (a stack of circle–circle lenses), the DVH and hence every index have closed-form values. The 33 checks cover the RTDOSE loader (relative and absolute GFOV), the sampler (a linear field must be reproduced to 1e-6 Gy by both interpolation orders; points outside the grid give NaN), all volumes and indices at 0.25 mm (within 0.5 % / ±0.005) and 1.0 mm, both volume models, the sampling from a native 0.5 mm grid, a ring-shaped target with holes, the component scoping with two separate hot spots, the mask → contour → mask round trip, the Eclipse DVH reader (a synthetic `DVHSequence` with scaled bins and differential / relative decoys must reproduce the closed-form target volume, $V_{D_{\mathrm{Rx}}}$ and $D_2$ / $D_{50}$ / $D_{98}$ / $D_{\mathrm{mean}}$), the comparison (an identical reference gives zero difference and no flag, a 30 % larger PIV flags PIV, CI and GI with derived values, the PIV implied by a CI is recovered exactly, alias parsing and the CSV header check) and the validation view (identical DVH percentiles, and `validation.html` / `dose_overview.png` rendered for the phantom). `python -m dicom_file_modifier.rtstruct_writer --self-test` writes synthetic masks (sphere, annulus, islands, border-touching block, single voxel) to a temporary RTSTRUCT and verifies orientation, volumes, name uniqueness and the file-meta consistency.
 
 ## Limitations
 
 - **The dose grid is the limit.** A 1 mm dose grid cannot locate an isodose surface better than its interpolation model allows; the fine evaluation grid removes the discretisation error of the volumes, not the uncertainty of the dose itself. Cubic interpolation is offered as a second model, not as the truth.
-- **TPS agreement is empirical.** The volume model and the Eclipse-compatibility mode were tuned to reproduce the target statistics of one TPS (Eclipse) on clinical data; the prescription isodose volume of the TPS could not be reproduced from the exported data (see above). Index values should be compared with the TPS on each installation before they are used to judge plans.
+- **TPS agreement is empirical.** The volume model and the Eclipse-compatibility mode were tuned to reproduce the target statistics of one TPS (Eclipse) on clinical data; the prescription isodose volume of the TPS is not part of the exported data unless a body DVH was exported, so it has to be entered by hand for the comparison (see *Comparison with Eclipse*). Index values should be compared with the TPS on each installation before they are used to judge plans.
 - **Contour planes must coincide with dose planes** (up to an integer refinement); non-uniform GFOVs, relative dose units and tilted dose grids are rejected.
 - **$D_{\min}$ / $D_{\max}$ are sample extremes** on the evaluation grid and therefore resolution dependent; the percentile values are robust.
 - **Component scoping is a heuristic** for multi-target plans; targets that share one isodose component get the same PIV and are flagged.
