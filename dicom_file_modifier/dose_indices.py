@@ -11,13 +11,23 @@ Berechnet je Zielvolumen:
 und schreibt eine separate RTSTRUCT mit Isodosen-ROIs (100 %, 50 %, ...) und
 den fuer den Index benutzten Hilfskonturen (Schnitt, Unterdosierung, Spill).
 
+Abgleich Eclipse: die ``DVHSequence`` der RTDOSE (Eclipse-DVHs) wird immer
+gelesen (TV, V_Rx, D98/D50/D2 der Ziele; PIV/PIV50 nur bei einem Body-DVH);
+weitere Eclipse-Komponentenwerte kommen aus ``<case>/eclipse_ref.json``
+(``--eclipse-ref``) oder ``--eclipse-values TV=..,VRX=..,PIV=..,V50=..``.
+Abweichungen ueber ``--eclipse-tol-pct`` (Default 5 %) werden markiert.
+
+Validierungsansicht (``dose_viz``): validation.html (3D, Schichtbrowser, DVH,
+Indextabelle; offline) und dose_overview.png; ``--no-viz`` / ``--no-viz-ct``.
+
 Verwendung:
   python -m dicom_file_modifier.dose_indices data/<case-id> [Optionen]
   python -m dicom_file_modifier.dose_indices --rs RS.dcm --rd RD.dcm [--rp RP.dcm] [Optionen]
   python -m dicom_file_modifier.dose_indices --self-test
 
 Ausgaben in output/<case-id><label>/:
-  RS_<case-id><label>.dcm, <case-id>_indices.json, indices.txt, indices.csv
+  RS_<case-id><label>.dcm, <case-id>_indices.json, indices.txt, indices.csv,
+  validation.html, dose_overview.png
 
 Alle Volumina in cm3, Dosen in Gy, LPS-Koordinaten in mm.  Konsolenausgabe
 ist ASCII (Windows-Konsole), Dateien sind UTF-8.
@@ -30,6 +40,7 @@ import csv
 import datetime as _dt
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +53,7 @@ from . import analyzer as ana
 from . import dose as dm
 
 TOOL_NAME = "dose_indices"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 DEFAULT_ISODOSE = "100,50"
 GRID_CHOICES = (1.0, 0.5, 0.25, 0.1)
 INTERP_ORDER = {"linear": 1, "cubic": 3}
@@ -53,6 +64,11 @@ CSV_COLUMNS = [
     "coverage", "dice", "gi", "gm_cm", "hi_icru83", "d2_gy", "d50_gy", "d98_gy", "dmin_gy",
     "dmax_gy", "dmean_gy", "d95_gy", "v95_pct", "v100_pct", "rs_file", "rd_sop_uid",
     "run_timestamp",
+    # Abgleich Eclipse (leer ohne Referenz)
+    "ecl_source", "ecl_tv_cm3", "ecl_tv_piv_cm3", "ecl_piv_cm3", "ecl_piv50_cm3",
+    "ecl_ci_paddick", "ecl_gi", "ecl_hi_icru83", "ecl_d98_gy", "ecl_d50_gy", "ecl_d2_gy",
+    "d_tv_pct", "d_tv_piv_pct", "d_piv_pct", "d_ci_paddick_pct", "d_gi_pct",
+    "d_hi_icru83_pct", "d_d98_pct", "ecl_tol_pct", "ecl_n_flagged",
 ]
 
 # Farbvorschlaege (RGB) fuer Isodosen-ROIs nach Prozent-Level
@@ -69,12 +85,15 @@ HELPER_COLORS = {"inter": (0, 255, 0), "under": (255, 255, 0), "spill": (255, 0,
 
 def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = None,
                        rd_override: Optional[str] = None,
-                       rp_override: Optional[str] = None) -> dict:
+                       rp_override: Optional[str] = None,
+                       eclipse_ref_override: Optional[str] = None) -> dict:
     """
-    ``{'case_id', 'case_dir', 'rs', 'rd', 'rp'|None, 'ct_dir'|None}``.
+    ``{'case_id', 'case_dir', 'rs', 'rd', 'rp'|None, 'ct_dir'|None, 'eclipse_ref'|None}``.
     Sucht ``RS*.dcm``/``RD*.dcm``/``RP*.dcm`` im Case-Ordner; Overrides haben
     Vorrang.  Bei mehreren RD-Kandidaten wird die PLAN-Summendosis bevorzugt,
     die den RP referenziert; bleibt es mehrdeutig -> ``ValueError``.
+    ``eclipse_ref`` = ``--eclipse-ref`` (muss existieren) oder
+    ``<case>/eclipse_ref.json``, falls vorhanden.
     """
     def _pick(kind: str, override: Optional[str], required: bool):
         if override is not None:
@@ -120,11 +139,19 @@ def discover_dose_case(case_dir: Optional[str], rs_override: Optional[str] = Non
     rp = _pick("RP", rp_override, False)
     base = Path(case_dir) if case_dir is not None else rd.parent
     ct_dir = base / "CT"
+    if eclipse_ref_override is not None:
+        eclipse_ref = Path(eclipse_ref_override)
+        if not eclipse_ref.is_file():
+            raise FileNotFoundError(f"Eclipse-Referenzdatei nicht gefunden: {eclipse_ref_override!r}")
+    else:
+        cand = base / "eclipse_ref.json"
+        eclipse_ref = cand if cand.is_file() else None
     return {
         "case_id": base.resolve().name,
         "case_dir": base,
         "rs": rs, "rd": rd, "rp": rp,
         "ct_dir": ct_dir if ct_dir.is_dir() else None,
+        "eclipse_ref": eclipse_ref,
     }
 
 
@@ -313,6 +340,365 @@ def homogeneity_index(d2: float, d98: float, d50: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Eclipse-Referenzwerte (DVHSequence, eclipse_ref.json, --eclipse-values)
+# ---------------------------------------------------------------------------
+
+ECLIPSE_KEYS = ("tv_cm3", "tv_piv_cm3", "piv_cm3", "piv50_cm3", "ci_paddick", "gi", "hi_icru83",
+                "d98_gy", "d50_gy", "d2_gy", "dmean_gy", "dmin_gy", "dmax_gy")
+ECLIPSE_ALIASES = {
+    "tv_cm3": ("tv", "volume", "volume_cm3"),
+    "tv_piv_cm3": ("vrx", "v_rx", "v_rx_cm3", "tv_piv", "tvpiv"),
+    "piv_cm3": ("piv", "piv100"),
+    "piv50_cm3": ("v50", "piv50", "v_half_rx", "v_half_rx_cm3"),
+    "ci_paddick": ("ci", "paddick"),
+    "gi": ("gradient_index",),
+    "hi_icru83": ("hi", "hi_icru"),
+    "d98_gy": ("d98",), "d50_gy": ("d50",), "d2_gy": ("d2",),
+    "dmean_gy": ("dmean", "mean"), "dmin_gy": ("dmin", "min"), "dmax_gy": ("dmax", "max"),
+}
+ECLIPSE_LABELS = {
+    "tv_cm3": "TV [cm3]", "tv_piv_cm3": "TV&PIV [cm3]", "piv_cm3": "PIV [cm3]",
+    "piv50_cm3": "PIV50 [cm3]", "ci_paddick": "CI Paddick", "gi": "GI", "hi_icru83": "HI ICRU83",
+    "d98_gy": "D98 [Gy]", "d50_gy": "D50 [Gy]", "d2_gy": "D2 [Gy]", "dmean_gy": "Dmean [Gy]",
+    "dmin_gy": "Dmin [Gy]", "dmax_gy": "Dmax [Gy]",
+}
+_VGY_RE = re.compile(r"^v([0-9]+(?:[.,][0-9]+)?)gy$")
+
+
+def normalize_eclipse_key(key: str, rx_gy: Optional[float] = None) -> str:
+    """
+    Alias -> kanonischer Schluessel (case-insensitiv).  ``V<n>Gy`` wird ueber
+    den Wert aufgeloest: n == Rx -> ``tv_piv_cm3``, n == Rx/2 -> ``piv50_cm3``,
+    sonst ``ValueError``.  Unbekannte Schluessel -> ``ValueError`` mit Liste.
+    """
+    k = str(key).strip().lower().replace(" ", "").replace("-", "_")
+    if k in ECLIPSE_KEYS:
+        return k
+    for canon, aliases in ECLIPSE_ALIASES.items():
+        if k in aliases:
+            return canon
+    m = _VGY_RE.match(k)
+    if m:
+        gy = float(m.group(1).replace(",", "."))
+        if rx_gy is None:
+            raise ValueError(f"Eclipse-Wert {key!r}: V<n>Gy braucht die Verschreibung (Rx unbekannt).")
+        if abs(gy - rx_gy) < 1e-3:
+            return "tv_piv_cm3"
+        if abs(gy - 0.5 * rx_gy) < 1e-3:
+            return "piv50_cm3"
+        raise ValueError(f"Eclipse-Wert {key!r} passt weder zu Rx {rx_gy:.2f} Gy noch zu "
+                         f"Rx/2 {0.5 * rx_gy:.2f} Gy.")
+    known = ", ".join(f"{c} ({'/'.join(a)})" for c, a in ECLIPSE_ALIASES.items())
+    raise ValueError(f"Unbekannter Eclipse-Schluessel {key!r}. Bekannt: {known}, V<Rx>Gy, V<Rx/2>Gy.")
+
+
+@dataclass
+class EclipseReference:
+    """Eclipse-Referenzwerte je Ziel: ``values[ziel][key] = {'value', 'source'}``."""
+    values: dict = field(default_factory=dict)
+    meta: dict = field(default_factory=dict)
+    notes: list = field(default_factory=list)
+
+    def get(self, target: str, key: str) -> Optional[dict]:
+        return self.values.get(target, {}).get(key)
+
+    def value(self, target: str, key: str) -> Optional[float]:
+        e = self.get(target, key)
+        return e["value"] if e else None
+
+    def set(self, target: str, key: str, value: float, source: str) -> None:
+        self.values.setdefault(target, {})[key] = {"value": float(value), "source": source}
+
+    def merge(self, other: "EclipseReference") -> None:
+        """``other`` gewinnt bei gleichem Ziel/Schluessel."""
+        for t, vals in other.values.items():
+            for k, v in vals.items():
+                self.values.setdefault(t, {})[k] = dict(v)
+        self.meta.update(other.meta)
+        self.notes.extend(other.notes)
+
+    def is_empty(self) -> bool:
+        return not any(self.values.values())
+
+    def sources(self) -> list:
+        return sorted({v["source"] for vals in self.values.values() for v in vals.values()})
+
+
+def match_target_name(token: str, target_names: list) -> str:
+    """exakt -> case-insensitiv -> eindeutiger Praefix; ``*``/leer nur bei genau einem Ziel."""
+    tok = (token or "").strip()
+    if tok in ("", "*"):
+        if len(target_names) == 1:
+            return target_names[0]
+        raise ValueError(
+            "Eclipse-Referenz: ohne Zielname ('*') nur bei genau einem Ziel erlaubt; bei mehreren "
+            "Zielen NAME:KEY=WERT (--eclipse-values) bzw. den Zielnamen als JSON-Schluessel verwenden."
+        )
+    if tok in target_names:
+        return tok
+    ci = [n for n in target_names if n.lower() == tok.lower()]
+    if len(ci) == 1:
+        return ci[0]
+    pre = [n for n in target_names if n.lower().startswith(tok.lower())]
+    if len(pre) == 1:
+        return pre[0]
+    cands = ", ".join(repr(n) for n in (pre or target_names)) or "keine"
+    raise ValueError(f"Eclipse-Referenz: Ziel {token!r} nicht eindeutig (Kandidaten: {cands}).")
+
+
+def _to_float(v, where: str) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip().replace(",", ".")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"Eclipse-Referenz: Wert {v!r} fuer {where} ist nicht numerisch.")
+    return None if math.isnan(f) else f
+
+
+def eclipse_reference_from_dict(d: dict, target_names: list, rx_gy: Optional[float],
+                                source: str) -> EclipseReference:
+    """
+    ``{"<Ziel>": {alias: wert, ...}, "_meta": {...}}`` -> ``EclipseReference``.
+    ``"*"`` als Zielschluessel bei genau einem Ziel; ``null`` wird uebersprungen.
+    """
+    ref = EclipseReference()
+    if not isinstance(d, dict):
+        raise ValueError("Eclipse-Referenz: erwartet ein JSON-Objekt {Ziel: {Schluessel: Wert}}.")
+    for tkey, vals in d.items():
+        if tkey == "_meta":
+            if isinstance(vals, dict):
+                ref.meta.update(vals)
+            continue
+        if not isinstance(vals, dict):
+            raise ValueError(f"Eclipse-Referenz: Eintrag {tkey!r} muss ein Objekt mit Schluessel/Wert-Paaren sein.")
+        target = match_target_name(tkey, target_names)
+        for k, v in vals.items():
+            fv = _to_float(v, f"{tkey}/{k}")
+            if fv is None:
+                continue
+            ref.set(target, normalize_eclipse_key(k, rx_gy), fv, source)
+    return ref
+
+
+def load_eclipse_reference_json(path, target_names: list, rx_gy: Optional[float]) -> EclipseReference:
+    """``eclipse_ref.json`` (UTF-8) lesen; Quelle ``json``."""
+    p = Path(path)
+    with open(p, encoding="utf-8") as fh:
+        try:
+            d = json.load(fh)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Eclipse-Referenz {p}: ungueltiges JSON ({e}).")
+    ref = eclipse_reference_from_dict(d, target_names, rx_gy, "json")
+    ref.meta["json_path"] = str(p)
+    return ref
+
+
+def parse_eclipse_values(spec: str, target_names: list, rx_gy: Optional[float]) -> EclipseReference:
+    """``--eclipse-values "[ZIEL:]KEY=WERT,..."`` (Dezimalpunkt) -> Quelle ``cli``."""
+    ref = EclipseReference()
+    for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
+        if "=" not in tok:
+            raise ValueError(f"--eclipse-values: {tok!r} hat kein '=' (Form [ZIEL:]SCHLUESSEL=WERT).")
+        left, val = tok.split("=", 1)
+        tname, key = left.rsplit(":", 1) if ":" in left else ("*", left)
+        target = match_target_name(tname, target_names)
+        fv = _to_float(val, key.strip())
+        if fv is None:
+            raise ValueError(f"--eclipse-values: Wert fuer {key.strip()!r} fehlt.")
+        ref.set(target, normalize_eclipse_key(key, rx_gy), fv, "cli")
+    ref.meta["cli"] = spec
+    return ref
+
+
+def eclipse_reference_from_dvh(dvh_map: dict, rs_ds: Optional[pydicom.Dataset],
+                               targets: list, rx_gy: float) -> EclipseReference:
+    """
+    Eclipse-DVHs -> Referenz: je Ziel mit DVH ``tv_cm3``, ``tv_piv_cm3`` (V(Rx)),
+    D98/D50/D2/Dmean/Dmin/Dmax; ein DVH der EXTERNAL-ROI (Body) liefert fuer
+    alle Ziele ``piv_cm3`` = V(Rx) und ``piv50_cm3`` = V(Rx/2).  Quelle ``dvh``.
+    """
+    ref = EclipseReference()
+    if not dvh_map:
+        return ref
+    names = {int(n): nm for n, nm in targets}
+    body = None
+    if rs_ds is not None:
+        for num, name, _rt, cat in _roi_table(rs_ds):
+            if cat == ana.CAT_EXTERNAL and num in dvh_map:
+                body = (num, name)
+                break
+    used = []
+    for roi, name in names.items():
+        dvh = dvh_map.get(roi)
+        if dvh is None:
+            continue
+        st = dm.dvh_statistics(dvh, rx_gy)
+        ref.set(name, "tv_cm3", st["total_cm3"], "dvh")
+        ref.set(name, "tv_piv_cm3", st["v_rx_cm3"], "dvh")
+        for k in ("d98_gy", "d50_gy", "d2_gy", "dmean_gy", "dmin_gy", "dmax_gy"):
+            if st[k] is not None:
+                ref.set(name, k, st[k], "dvh")
+        used.append(roi)
+    if body is not None:
+        st = dm.dvh_statistics(dvh_map[body[0]], rx_gy)
+        for name in names.values():
+            ref.set(name, "piv_cm3", st["v_rx_cm3"], "dvh")
+            ref.set(name, "piv50_cm3", st["v_half_rx_cm3"], "dvh")
+        used.append(body[0])
+    ref.meta["dvh_rois"] = sorted(set(used))
+    ref.meta["body_roi"] = body[0] if body else None
+    missing = [nm for roi, nm in names.items() if roi not in dvh_map]
+    if missing:
+        ref.notes.append("Kein Eclipse-DVH in der RTDOSE fuer: " + ", ".join(repr(m) for m in missing) + ".")
+    if body is None:
+        ref.notes.append("Kein Body-DVH in der RTDOSE; Eclipse-PIV/PIV50 manuell angeben "
+                         "(--eclipse-values PIV=..,V50=.. oder eclipse_ref.json).")
+    return ref
+
+
+def derive_eclipse_values(ref: EclipseReference, target: str) -> None:
+    """
+    Fuellt nur Luecken (Quelle ``derived``): PIV aus CI, CI aus den
+    Komponenten, GI = PIV50/PIV, HI = (D2-D98)/D50.  Sind CI und PIV beide
+    gegeben und > 1 % inkonsistent, gibt es einen Hinweis.
+    """
+    v = lambda k: ref.value(target, k)  # noqa: E731
+    tv, tvp, piv, piv50, ci = v("tv_cm3"), v("tv_piv_cm3"), v("piv_cm3"), v("piv50_cm3"), v("ci_paddick")
+    if piv is None and ci and tv and tvp is not None:
+        piv = tvp * tvp / (tv * ci)
+        ref.set(target, "piv_cm3", piv, "derived")
+        ref.notes.append(f"{target}: Eclipse-PIV {piv:.3f} cm3 aus CI {ci:.3f} abgeleitet "
+                         "(PIV = (TV&PIV)^2 / (TV*CI)).")
+    if tv and piv and tvp is not None:
+        ci_c = tvp * tvp / (tv * piv)
+        if ci is None:
+            ref.set(target, "ci_paddick", ci_c, "derived")
+        elif ref.get(target, "piv_cm3")["source"] != "derived" and abs(ci_c - ci) > 0.01 * abs(ci):
+            ref.notes.append(f"{target}: Eclipse-CI {ci:.3f} vs. aus Komponenten {ci_c:.3f}: "
+                             "inkonsistent (> 1 %).")
+    if v("gi") is None and piv and piv50 is not None:
+        ref.set(target, "gi", piv50 / piv, "derived")
+    d2, d98, d50 = v("d2_gy"), v("d98_gy"), v("d50_gy")
+    if v("hi_icru83") is None and None not in (d2, d98, d50) and d50:
+        ref.set(target, "hi_icru83", (d2 - d98) / d50, "derived")
+
+
+def build_eclipse_reference(rd_ds: Optional[pydicom.Dataset], rs_ds: Optional[pydicom.Dataset],
+                            targets: list, rx_gy: float, json_path=None,
+                            cli_string: Optional[str] = None, use_dvh: bool = True,
+                            dose: Optional[dm.DoseGrid] = None) -> tuple:
+    """
+    Alle Quellen zusammenfuehren (Vorrang ``cli > json > dvh``), dann Luecken
+    ableiten.  Liefert ``(EclipseReference, dvh_map, hinweise)``.
+    """
+    ref = EclipseReference()
+    dvh_map = {}
+    names = [n for _, n in targets]
+    if use_dvh and rd_ds is not None:
+        dvh_map, d_notes = dm.read_dvh_sequence(rd_ds)
+        ref.notes.extend(d_notes)
+        trusted = True
+        if dose is not None and rs_ds is not None:
+            rs_uid = str(rs_ds.get("SOPInstanceUID", ""))
+            if dose.referenced_rtstruct_uid and rs_uid and dose.referenced_rtstruct_uid != rs_uid:
+                trusted = False
+                ref.notes.append("RTDOSE-DVHs referenzieren ein anderes Structure Set; ROI-Nummern "
+                                 "nicht uebertragbar, DVH-Quelle uebersprungen.")
+        if dvh_map and trusted:
+            ref.merge(eclipse_reference_from_dvh(dvh_map, rs_ds, targets, rx_gy))
+        elif not dvh_map:
+            ref.notes.append("Keine DVHSequence in der RTDOSE (kein automatischer Eclipse-DVH-Abgleich).")
+    if json_path:
+        ref.merge(load_eclipse_reference_json(json_path, names, rx_gy))
+    if cli_string:
+        ref.merge(parse_eclipse_values(cli_string, names, rx_gy))
+    for name in names:
+        derive_eclipse_values(ref, name)
+    return ref, dvh_map, list(ref.notes)
+
+
+def _isnan(v) -> bool:
+    try:
+        return v is None or math.isnan(float(v))
+    except (TypeError, ValueError):
+        return True
+
+
+def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
+                         tol_pct: float = 5.0) -> dict:
+    """
+    Je Ziel mit Referenzwerten: Zeilen ``{key, label, tool, tool_key, eclipse,
+    diff_abs, diff_pct, source, within_tol, note}`` in ``ECLIPSE_KEYS``-
+    Reihenfolge (``diff = tool - eclipse``).  PIV/PIV50 werden immer gegen die
+    globalen Isodosenvolumina verglichen (Eclipse-PIV = ganze Isodose).
+    Zeilen ausserhalb der Toleranz werden in ``result['warnings']`` des Ziels
+    eingetragen (Exit-Code bleibt unveraendert).
+    """
+    out = {}
+    for name, tm in art.targets.items():
+        vals = ref.values.get(name, {})
+        if not vals:
+            continue
+        r = tm.result
+        c, ix, dv = r["components"], r["indices"], r["dvh_stats"]
+        tool = {
+            "tv_cm3": ("components.tv_cm3", c["tv_cm3"]),
+            "tv_piv_cm3": ("components.tv_piv_cm3", c["tv_piv_cm3"]),
+            "piv_cm3": ("components.piv_global_cm3", c["piv_global_cm3"]),
+            "piv50_cm3": ("components.piv50_global_cm3", c["piv50_global_cm3"]),
+            "ci_paddick": ("indices.ci_paddick", ix["ci_paddick"]),
+            "gi": ("indices.gi", ix["gi"]),
+            "hi_icru83": ("indices.hi_icru83", ix["hi_icru83"]),
+            "d98_gy": ("dvh_stats.d98_gy", dv["d98_gy"]),
+            "d50_gy": ("dvh_stats.d50_gy", dv["d50_gy"]),
+            "d2_gy": ("dvh_stats.d2_gy", dv["d2_gy"]),
+            "dmean_gy": ("dvh_stats.dmean_gy", dv["dmean_gy"]),
+            "dmin_gy": ("dvh_stats.dmin_gy", dv["dmin_gy"]),
+            "dmax_gy": ("dvh_stats.dmax_gy", dv["dmax_gy"]),
+        }
+        rows, flagged = [], []
+        for key in ECLIPSE_KEYS:
+            tool_key, tool_v = tool[key]
+            e = vals.get(key)
+            ev = e["value"] if e else None
+            src = e["source"] if e else None
+            note = ""
+            if ev is None and key in ("piv_cm3", "piv50_cm3"):
+                note = "kein Body-DVH; manuell angeben"
+            diff = diff_pct = within = None
+            if ev is not None and not _isnan(tool_v):
+                diff = float(tool_v) - ev
+                if ev != 0:
+                    diff_pct = 100.0 * diff / ev
+                    within = bool(abs(diff_pct) <= tol_pct)
+            rows.append({"key": key, "label": ECLIPSE_LABELS[key], "tool": None if _isnan(tool_v) else float(tool_v),
+                         "tool_key": tool_key, "eclipse": ev, "diff_abs": diff, "diff_pct": diff_pct,
+                         "source": src, "within_tol": within, "note": note})
+            if within is False:
+                flagged.append(key)
+                nd = 2 if key.endswith("_gy") else 3
+                r["warnings"].append(
+                    f"Abgleich Eclipse: {ECLIPSE_LABELS[key]} {_fmt(tool_v, nd)} vs {_fmt(ev, nd)} "
+                    f"({diff_pct:+.1f} %, Toleranz {tol_pct:g} %)"
+                )
+        scope_note = None
+        if r["piv"].get("scope") == "component" and abs(c["piv_cm3"] - c["piv_global_cm3"]) > 1e-9:
+            scope_note = ("Tool-CI/GI mit PIV-Scope component (PIV-Zeile zeigt das globale PIV); "
+                          "fuer den Abgleich --piv-scope global oder --eclipse-compat")
+        out[name] = {
+            "rows": rows, "tol_pct": float(tol_pct),
+            "n_compared": sum(1 for rw in rows if rw["diff_abs"] is not None),
+            "n_flagged": len(flagged), "flagged": flagged,
+            "sources": sorted({rw["source"] for rw in rows if rw["source"]}),
+            "piv_scope_note": scope_note,
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 3. Ergebnisobjekte und Auswertung auf dem Feingitter
 # ---------------------------------------------------------------------------
 
@@ -365,6 +751,8 @@ class DoseIndexArtifacts:
     settings: dict
     warnings: list
     results: dict = field(default_factory=dict)
+    eclipse_dvh: dict = field(default_factory=dict)   # roi_number -> dm.EclipseDVH
+    eclipse: dict = field(default_factory=dict)       # name -> compare_with_eclipse-Block
 
 
 def _roi_color(rs_ds: pydicom.Dataset, roi_number: int) -> tuple:
@@ -680,6 +1068,7 @@ def build_report(art: DoseIndexArtifacts, meta: dict, outputs: dict) -> dict:
             "frame_of_reference_uid": dose.frame_of_reference_uid,
             "rtplan": meta.get("rtplan"),
             "notes": list(meta.get("notes", [])),
+            "eclipse_reference": meta.get("eclipse_reference"),
             "settings": dict(art.settings),
             "fine_grid": {"shape": list(grid.shape), "res_xy_mm": grid.res_xy, "dz_mm": grid.dz,
                           "bbox_mm": [[round(float(v), 3) for v in lo], [round(float(v), 3) for v in hi]],
@@ -709,6 +1098,7 @@ def build_report(art: DoseIndexArtifacts, meta: dict, outputs: dict) -> dict:
                    "volume_cm3": block["helper_rois"][kind]["volume_cm3"]}
             for kind in ("intersection", "underdosed", "spill")
         }
+        block["eclipse"] = _round_block(art.eclipse[name]) if name in art.eclipse else None
         report["targets"][name] = block
     if art.global_result is not None:
         report["global"] = _round_block(art.global_result)
@@ -803,6 +1193,7 @@ def format_report(report: dict) -> list:
                  f"Unterdos. {_fmt(h['underdosed']['volume_cm3'])}"
                  f" ({h['underdosed'].get('roi_name') or '-'}) | "
                  f"Spill {_fmt(h['spill']['volume_cm3'])} ({h['spill'].get('roi_name') or '-'})")
+        L.extend(_format_eclipse_block(t.get("eclipse"), m.get("eclipse_reference") or {}))
         if t.get("warnings"):
             for w in t["warnings"]:
                 L.append(f"  ! WARNUNG !        {w}")
@@ -835,6 +1226,42 @@ def format_report(report: dict) -> list:
     L.append(f"  TXT      : {o.get('txt_path') or '-'}")
     L.append(f"  CSV      : {o.get('csv_path') or '-'}"
              f"{'  (+ ' + o['append_csv_path'] + ')' if o.get('append_csv_path') else ''}")
+    L.append(f"  HTML     : {o.get('viz_html_path') or '-'}")
+    L.append(f"  PNG      : {o.get('viz_png_path') or '-'}")
+    return L
+
+
+def _format_eclipse_block(ec: Optional[dict], er: dict) -> list:
+    """Zeilen des Blocks 'Abgleich Eclipse' eines Ziels (ASCII)."""
+    if not ec:
+        return ["  Abgleich Eclipse   - (keine Referenz: kein DVH dieses Ziels in der RTDOSE, "
+                "kein eclipse_ref.json, keine --eclipse-values)"]
+    src = []
+    if "dvh" in ec["sources"]:
+        rois = ", ".join(str(r) for r in er.get("dvh_rois", []) or [])
+        src.append(f"dvh = RTDOSE-DVHSequence (ROI {rois or '?'})")
+    if "json" in ec["sources"]:
+        src.append(f"json = {Path(er['json_path']).name if er.get('json_path') else 'eclipse_ref.json'}")
+    if "cli" in ec["sources"]:
+        src.append("cli = --eclipse-values")
+    if "derived" in ec["sources"]:
+        src.append("derived = aus Eclipse-Werten abgeleitet")
+    L = [f"  Abgleich Eclipse   Toleranz {ec['tol_pct']:g} % | Quellen: {'; '.join(src) or '-'}",
+         f"    {'Komponente':<18}{'Tool':>9}{'Eclipse':>9}{'Diff':>9}{'Diff %':>9}  Quelle"]
+    for rw in ec["rows"]:
+        nd = 2 if rw["key"].endswith("_gy") else 3
+        mark = "  !" if rw.get("within_tol") is False else ""
+        note = f"  ({rw['note']})" if rw.get("note") else ""
+        L.append(f"    {rw['label']:<18}{_fmt(rw['tool'], nd, 9)}{_fmt(rw['eclipse'], nd, 9)}"
+                 f"{_fmt(rw['diff_abs'], nd, 9)}{_fmt(rw['diff_pct'], 1, 9)}  "
+                 f"{(rw['source'] or '-'):<8}{mark}{note}")
+    if ec["n_flagged"]:
+        names = ", ".join(ECLIPSE_LABELS[k].split(" [")[0] for k in ec["flagged"])
+        L.append(f"    {ec['n_flagged']} von {ec['n_compared']} Werten ausserhalb der Toleranz: {names}")
+    else:
+        L.append(f"    {ec['n_compared']} Werte innerhalb der Toleranz")
+    if ec.get("piv_scope_note"):
+        L.append(f"    Hinweis: {ec['piv_scope_note']}")
     return L
 
 
@@ -859,12 +1286,52 @@ def csv_rows(report: dict) -> list:
             "rd_sop_uid": report["dose_grid"]["sop_instance_uid"],
             "run_timestamp": m.get("timestamp"),
         })
+        ec = t.get("eclipse") or {}
+        by = {rw["key"]: rw for rw in ec.get("rows", [])}
+        e = lambda k: by.get(k, {}).get("eclipse")     # noqa: E731
+        d = lambda k: by.get(k, {}).get("diff_pct")    # noqa: E731
+        rows[-1].update({
+            "ecl_source": "+".join(ec.get("sources", [])),
+            "ecl_tv_cm3": e("tv_cm3"), "ecl_tv_piv_cm3": e("tv_piv_cm3"), "ecl_piv_cm3": e("piv_cm3"),
+            "ecl_piv50_cm3": e("piv50_cm3"), "ecl_ci_paddick": e("ci_paddick"), "ecl_gi": e("gi"),
+            "ecl_hi_icru83": e("hi_icru83"), "ecl_d98_gy": e("d98_gy"), "ecl_d50_gy": e("d50_gy"),
+            "ecl_d2_gy": e("d2_gy"),
+            "d_tv_pct": d("tv_cm3"), "d_tv_piv_pct": d("tv_piv_cm3"), "d_piv_pct": d("piv_cm3"),
+            "d_ci_paddick_pct": d("ci_paddick"), "d_gi_pct": d("gi"), "d_hi_icru83_pct": d("hi_icru83"),
+            "d_d98_pct": d("d98_gy"),
+            "ecl_tol_pct": ec.get("tol_pct"), "ecl_n_flagged": ec.get("n_flagged"),
+        })
     return rows
+
+
+def _csv_header_mismatch(found: list, expected: list) -> Optional[str]:
+    """Meldung, wenn der vorhandene Spaltenkopf nicht ``expected`` ist, sonst None."""
+    if list(found) == list(expected):
+        return None
+    return (f"Spaltenkopf weicht ab ({len(found)} Spalten, erwartet {len(expected)}; "
+            "vermutlich aeltere Tool-Version).")
+
+
+def _check_csv_header(path) -> None:
+    """``ValueError`` bei Append auf eine Sammel-CSV mit anderem Spaltenkopf."""
+    if path is None:
+        return
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return
+    with open(p, newline="", encoding="utf-8-sig") as fh:
+        found = next(csv.reader(fh), [])
+    msg = _csv_header_mismatch(found, CSV_COLUMNS)
+    if msg:
+        raise ValueError(f"Sammel-CSV {p}: {msg} Neue Datei angeben (z.B. {p.stem}_v2{p.suffix}) "
+                         "oder die alte umbenennen.")
 
 
 def write_csv(rows: list, path: Path, append: bool = False) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if append:
+        _check_csv_header(path)
     need_header = not append or not path.exists() or path.stat().st_size == 0
     with open(path, "a" if append else "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
@@ -914,9 +1381,13 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
                      include_target: bool = False, simplify_mm: float = 0.1,
                      transfer_syntax: str = "explicit", max_name_len: int = 64,
                      append_csv: Optional[str] = None, eclipse_compat: Optional[str] = None,
-                     iso_contours: str = "mask", quiet: bool = False) -> dict:
+                     iso_contours: str = "mask", quiet: bool = False,
+                     eclipse_ref: Optional[str] = None, eclipse_values: Optional[str] = None,
+                     eclipse_tol_pct: float = 5.0, no_eclipse_dvh: bool = False,
+                     no_viz: bool = False, viz_ct: bool = True) -> dict:
     """
-    Kompletter Lauf: Discovery -> Berechnung -> RS-Export -> Report/JSON/TXT/CSV.
+    Kompletter Lauf: Discovery -> Berechnung -> Eclipse-Abgleich -> RS-Export
+    -> Validierungsansicht -> Report/JSON/TXT/CSV.
 
     ``eclipse_compat`` ("high" | "default") setzt alle Parameter auf die Eclipse-
     Konventionen: Feingitter exakt auf dem CT-Pixelraster (High = 1 Pixel auf den
@@ -928,13 +1399,15 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
         if not quiet:
             print(msg)
 
-    files = discover_dose_case(case_dir, rs, rd, rp)
+    files = discover_dose_case(case_dir, rs, rd, rp, eclipse_ref)
+    _check_csv_header(append_csv)                    # fail fast, bevor gerechnet wird
     case_id = files["case_id"]
     say(f"\nDosisindex-Berechnung fuer Case '{case_id}'")
     say(f"  RS: {files['rs'].name}\n  RD: {files['rd'].name}\n  RP: {files['rp'].name if files['rp'] else '-'}")
 
     rs_ds = ana.load_rtstruct(str(files["rs"]))
-    dose = dm.dose_grid_from_dataset(dm.load_rtdose(str(files["rd"])), str(files["rd"]))
+    rd_ds = dm.load_rtdose(str(files["rd"]))
+    dose = dm.dose_grid_from_dataset(rd_ds, str(files["rd"]))
     rp_ds = dm.load_rtplan(str(files["rp"])) if files["rp"] else None
     warns = list(dose.warnings)                      # echte Warnungen (! WARNUNG !)
     warns += dm.validate_dose_against_rtstruct(dose, rs_ds, rp_ds)
@@ -952,6 +1425,20 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     notes += l_notes
     say(f"  Ziel(e): {', '.join(repr(n) for _, n in targets)}")
     say(f"  Rx: {rx_gy:.2f} Gy ({rx_source}: {rx_detail})")
+
+    # Eclipse-Referenz: DVHSequence (auto) + eclipse_ref.json + --eclipse-values
+    ecl_ref, dvh_map, e_notes = build_eclipse_reference(
+        rd_ds, rs_ds, targets, rx_gy, json_path=files.get("eclipse_ref"),
+        cli_string=eclipse_values, use_dvh=not no_eclipse_dvh, dose=dose)
+    notes += e_notes
+    src_bits = []
+    if ecl_ref.meta.get("dvh_rois"):
+        src_bits.append(f"DVHSequence ROI {', '.join(str(r) for r in ecl_ref.meta['dvh_rois'])}")
+    if files.get("eclipse_ref"):
+        src_bits.append(str(files["eclipse_ref"].name))
+    if eclipse_values:
+        src_bits.append("--eclipse-values")
+    say(f"  Eclipse-Referenz: {'; '.join(src_bits) if src_bits else 'keine'}")
 
     # CT-Schichtindex (fuer RS-Export, z-Beschraenkung und Eclipse-Raster)
     ct_index = None
@@ -995,14 +1482,18 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
                                restrict_z_to=restrict_z, align=align, extra_settings=extra)
     say(f"  Feingitter: {art.grid.shape[2]} x {art.grid.shape[1]} x {art.grid.shape[0]} Voxel "
         f"({art.grid.n_voxels / 1e6:.2f} M) @ {grid_mm:g} mm, z {art.grid.dz:.2f} mm")
+    art.eclipse_dvh = dvh_map
+    art.eclipse = compare_with_eclipse(art, ecl_ref, eclipse_tol_pct)
 
     out_dir = Path(output) / f"{case_id}{label}"
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs = {"rs_path": None, "json_path": str(out_dir / f"{case_id}_indices.json"),
                "txt_path": str(out_dir / "indices.txt"), "csv_path": str(out_dir / "indices.csv"),
-               "append_csv_path": str(append_csv) if append_csv else None}
+               "append_csv_path": str(append_csv) if append_csv else None,
+               "viz_html_path": None, "viz_png_path": None}
 
     # RS-Export (Fehler duerfen die Indizes nicht verwerfen)
+    specs = None
     if write_rs:
         from . import rtstruct_writer as rw
         rs_out = out_dir / f"RS_{case_id}{label}.dcm"
@@ -1025,6 +1516,24 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
             warns.append(f"RS-Export fehlgeschlagen ({type(e).__name__}: {e}).")
             say(f"  ! WARNUNG ! RS-Export fehlgeschlagen: {e}")
 
+    # Validierungsansicht (validation.html + dose_overview.png); Fehler hier
+    # duerfen die Indexdateien nicht entwerten -> defensiv abgefangen.
+    if not no_viz:
+        try:
+            from . import dose_viz
+            from . import rtstruct_writer as rw
+            if specs is None:          # --no-rs oder RS-Export fehlgeschlagen
+                specs = rw.build_roi_specs(art, include_target=include_target,
+                                           max_name_len=max_name_len, simplify_mm=simplify_mm,
+                                           iso_contours=iso_contours)
+            outputs.update(dose_viz.run_dose_visualization(
+                art, specs, ct_index, out_dir, ct_background=viz_ct,
+                case_id=case_id, label=label, verbose=not quiet))
+        except Exception as e:  # noqa: BLE001
+            warns.append(f"Visualisierung fehlgeschlagen ({type(e).__name__}: {e}); "
+                         "Indexdateien bleiben gueltig.")
+            say(f"  ! WARNUNG ! Visualisierung fehlgeschlagen: {e}")
+
     art.warnings = warns + art.warnings
     meta = {
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -1035,6 +1544,13 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
         "rs_sop_uid": str(rs_ds.get("SOPInstanceUID", "")),
         "rs_n_rois": len(rs_ds.get("StructureSetROISequence", [])),
         "rx_detail": rx_detail,
+        "eclipse_reference": {
+            "json_path": ecl_ref.meta.get("json_path"), "cli": ecl_ref.meta.get("cli"),
+            "dvh_rois": list(ecl_ref.meta.get("dvh_rois", []) or []),
+            "body_roi": ecl_ref.meta.get("body_roi"), "tol_pct": float(eclipse_tol_pct),
+            "sources": ecl_ref.sources(), "source": ecl_ref.meta.get("source"),
+            "date": ecl_ref.meta.get("date"),
+        },
         "rtplan": ({"label": str(rp_ds.get("RTPlanLabel", "")),
                     "sop_instance_uid": str(rp_ds.get("SOPInstanceUID", "")),
                     "fractions": dm.fractions_planned(rp_ds),
@@ -1156,32 +1672,44 @@ class _Phantom:
             w[0] = w[-1] = 0.5
         return w
 
-    def expected(self, model: str = "slab", n_polygon: int = 360) -> dict:
+    @staticmethod
+    def _poly_f(n_polygon: int) -> float:
         # Polygonflaeche eines regelmaessigen n-Ecks = pi r^2 * (n/(2 pi)) sin(2 pi / n)
-        poly_f = n_polygon / (2 * math.pi) * math.sin(2 * math.pi / n_polygon)
-        w = self._weights(model)
+        return n_polygon / (2 * math.pi) * math.sin(2 * math.pi / n_polygon)
+
+    def target_volume(self, model: str = "slab", n_polygon: int = 360) -> float:
+        poly_f, w = self._poly_f(n_polygon), self._weights(model)
+        return sum(wk * math.pi * self._disc_radius(z) ** 2 * poly_f
+                   for wk, z in zip(w, self.contour_z)) * self.DZ / 1000.0
+
+    def isodose_volume(self, level: float) -> float:
+        rl = self.level_radius(level)
+        zs = np.arange(-31.5, 32.0, self.DZ)
+        return sum(math.pi * max(rl * rl - z * z, 0.0) for z in zs) * self.DZ / 1000.0
+
+    def cumulative_volume(self, level: float, model: str = "slab", n_polygon: int = 360) -> float:
+        """V(D >= level) des Ziels in cm3 (Scheibenstapel aus Kreis-Kreis-Linsen)."""
+        if level <= 0:
+            return self.target_volume(model, n_polygon)
+        poly_f, w = self._poly_f(n_polygon), self._weights(model)
         d = float(np.linalg.norm(self.CD))
+        rl = self.level_radius(level)
+        tot = 0.0
+        for wk, z in zip(w, self.contour_z):
+            a = self._disc_radius(z) * math.sqrt(poly_f)
+            b = math.sqrt(max(rl * rl - z * z, 0.0))
+            tot += wk * _lens_area(a, b, d)
+        return tot * self.DZ / 1000.0
 
-        def tv():
-            return sum(wk * math.pi * self._disc_radius(z) ** 2 * poly_f
-                       for wk, z in zip(w, self.contour_z)) * self.DZ / 1000.0
+    def cumulative_dvh(self, levels, model: str = "slab") -> np.ndarray:
+        """Kumulatives DVH V(D >= L) fuer alle ``levels`` (cm3)."""
+        return np.array([self.cumulative_volume(float(L), model) for L in levels])
 
-        def piv(level):
-            rl = self.level_radius(level)
-            zs = np.arange(-31.5, 32.0, self.DZ)
-            return sum(math.pi * max(rl * rl - z * z, 0.0) for z in zs) * self.DZ / 1000.0
-
-        def inter(level):
-            rl = self.level_radius(level)
-            tot = 0.0
-            for wk, z in zip(w, self.contour_z):
-                a = self._disc_radius(z) * math.sqrt(poly_f)
-                b = math.sqrt(max(rl * rl - z * z, 0.0))
-                tot += wk * _lens_area(a, b, d)
-            return tot * self.DZ / 1000.0
-
-        TV, PIV, I = tv(), piv(self.RX), inter(self.RX)
-        PIV50 = piv(0.5 * self.RX)
+    def expected(self, model: str = "slab", n_polygon: int = 360) -> dict:
+        TV = self.target_volume(model, n_polygon)
+        PIV, PIV50 = self.isodose_volume(self.RX), self.isodose_volume(0.5 * self.RX)
+        I = self.cumulative_volume(self.RX, model, n_polygon)
+        inter = lambda level: self.cumulative_volume(level, model, n_polygon)  # noqa: E731
 
         def d_at(frac):   # Dosis, die frac des Volumens erhaelt (bisection auf inter(L)/TV)
             lo, hi = 0.01, self.DMAX
@@ -1391,6 +1919,121 @@ def _run_self_test() -> int:
     check("Roundtrip mask_to_contours -> rasterize: Dice > 0.99 (Isodose) / > 0.995 (Ziel)",
           d_iso > 0.99 and d_tv > 0.995, f"Dice iso={d_iso:.4f}, Ziel={d_tv:.4f}")
 
+    # 9) Eclipse-Abgleich: DVHSequence-Leser, Referenzmodell, Vergleich, CSV-Kopf
+    from pydicom.dataset import Dataset as _DS
+    from pydicom.sequence import Sequence as _Seq
+    exp_s = ph.expected("slab")
+    ds_dvh = _synthetic_rtdose_dataset(native)
+    width, scaling = 0.1, 0.5                 # DVHData-Breite 0.2 * DVHDoseScaling 0.5 = 0.1 Gy
+    n_bins = int(round(ph.DMAX / width)) + 2
+    edges = np.arange(n_bins) * width
+    vols = ph.cumulative_dvh(edges, "slab")
+
+    def _dvh_item(roi, dvh_type="CUMULATIVE", units="GY"):
+        it = _DS()
+        it.DVHType, it.DoseUnits, it.DoseType = dvh_type, units, "PHYSICAL"
+        it.DVHDoseScaling, it.DVHVolumeUnits, it.DVHNumberOfBins = scaling, "CM3", n_bins
+        it.DVHData = [v for pair in zip([width / scaling] * n_bins, vols.tolist()) for v in pair]
+        r_ = _DS()
+        r_.ReferencedROINumber, r_.DVHROIContributionType = roi, "INCLUDED"
+        it.DVHReferencedROISequence = _Seq([r_])
+        return it
+
+    ds_dvh.DVHSequence = _Seq([_dvh_item(1), _dvh_item(2, dvh_type="DIFFERENTIAL"),
+                               _dvh_item(3, units="RELATIVE")])
+    dvh_map, dvh_notes = dm.read_dvh_sequence(ds_dvh)
+    check("Eclipse-DVH: Leser nimmt das kumulative GY/CM3-DVH, ueberspringt DIFFERENTIAL/RELATIVE mit Hinweis",
+          set(dvh_map) == {1} and len(dvh_notes) == 2, f"ROIs {sorted(dvh_map)}, {len(dvh_notes)} Hinweise")
+    dvh1 = dvh_map[1]
+    st_e = dm.dvh_statistics(dvh1, ph.RX)
+    check("Eclipse-DVH: Gesamtvolumen = TV (1e-6), V(Rx) = TV&PIV (0.5 %), Bin 0.1 Gy (Skalierung angewendet)",
+          rel(dvh1.total_volume_cm3, exp_s["tv"]) < 1e-6 and rel(st_e["v_rx_cm3"], exp_s["tv_piv"]) < 0.005
+          and abs(dvh1.bin_width_gy - width) < 1e-9,
+          f"V {dvh1.total_volume_cm3:.5f}/{exp_s['tv']:.5f}, V(Rx) {st_e['v_rx_cm3']:.5f}/{exp_s['tv_piv']:.5f}, "
+          f"dbin {dvh1.bin_width_gy:.3f}")
+    check("Eclipse-DVH: D2/D50/D98/Dmean aus der Kurve innerhalb 0.1 Gy, V(0) = TV, V(30 Gy) = 0",
+          abs(st_e["d2_gy"] - exp_s["d2"]) < 0.1 and abs(st_e["d50_gy"] - exp_s["d50"]) < 0.1
+          and abs(st_e["d98_gy"] - exp_s["d98"]) < 0.1 and abs(st_e["dmean_gy"] - exp_s["dmean"]) < 0.1
+          and rel(dvh1.v_at(0.0), exp_s["tv"]) < 1e-9 and dvh1.v_at(30.0) == 0.0,
+          f"D2 {st_e['d2_gy']:.2f}/{exp_s['d2']:.2f}, D50 {st_e['d50_gy']:.2f}/{exp_s['d50']:.2f}, "
+          f"D98 {st_e['d98_gy']:.2f}/{exp_s['d98']:.2f}, Dmean {st_e['dmean_gy']:.2f}/{exp_s['dmean']:.2f}")
+
+    r_ref = art_ref.targets["Kugel"].result
+    c0, ix0, dv0 = r_ref["components"], r_ref["indices"], r_ref["dvh_stats"]
+    good = {"*": {"TV": c0["tv_cm3"], "V20Gy": c0["tv_piv_cm3"], "PIV": c0["piv_global_cm3"],
+                  "V10Gy": c0["piv50_global_cm3"], "CI": ix0["ci_paddick"], "GI": ix0["gi"],
+                  "HI": ix0["hi_icru83"], "D98": dv0["d98_gy"], "D50": dv0["d50_gy"], "D2": dv0["d2_gy"],
+                  "Dmean": dv0["dmean_gy"], "Dmin": dv0["dmin_gy"], "Dmax": dv0["dmax_gy"]},
+            "_meta": {"source": "Self-Test"}}
+    ref_ok = eclipse_reference_from_dict(good, ["Kugel"], ph.RX, "json")
+    n_warn0 = len(r_ref["warnings"])
+    cmp_ok = compare_with_eclipse(art_ref, ref_ok, 5.0)["Kugel"]
+    check("Eclipse-Abgleich: identische Referenz -> 13 Werte verglichen, Diff 0, nichts markiert, keine Warnung",
+          cmp_ok["n_compared"] == 13 and max(abs(rw["diff_abs"]) for rw in cmp_ok["rows"]) < 1e-9
+          and cmp_ok["n_flagged"] == 0 and len(r_ref["warnings"]) == n_warn0
+          and ref_ok.meta.get("source") == "Self-Test",
+          f"n={cmp_ok['n_compared']}, markiert={cmp_ok['n_flagged']}")
+    bad = {"*": {k: v for k, v in good["*"].items() if k not in ("CI", "GI")}}
+    bad["*"]["PIV"] = good["*"]["PIV"] * 1.3
+    ref_bad = eclipse_reference_from_dict(bad, ["Kugel"], ph.RX, "json")
+    derive_eclipse_values(ref_bad, "Kugel")
+    cmp_bad = compare_with_eclipse(art_ref, ref_bad, 5.0)["Kugel"]
+    by = {rw["key"]: rw for rw in cmp_bad["rows"]}
+    check("Eclipse-Abgleich: PIV +30 % -> PIV/CI/GI markiert (CI, GI abgeleitet), TV innerhalb, Warnung im Zielblock",
+          set(cmp_bad["flagged"]) == {"piv_cm3", "ci_paddick", "gi"} and by["ci_paddick"]["source"] == "derived"
+          and by["gi"]["source"] == "derived" and by["tv_cm3"]["within_tol"] is True
+          and any(w.startswith("Abgleich Eclipse: PIV") for w in r_ref["warnings"]),
+          f"markiert={cmp_bad['flagged']}, CI {by['ci_paddick']['diff_pct']:+.1f} %")
+    ref_ci = eclipse_reference_from_dict(
+        {"*": {"tv_cm3": c0["tv_cm3"], "vrx": c0["tv_piv_cm3"], "ci": ix0["ci_paddick"]}}, ["Kugel"], ph.RX, "json")
+    derive_eclipse_values(ref_ci, "Kugel")
+    e_piv = ref_ci.get("Kugel", "piv_cm3")
+    check("Eclipse-Abgleich: PIV aus CI abgeleitet = (TV&PIV)^2 / (TV*CI) = PIV des Tools (1e-9)",
+          e_piv is not None and e_piv["source"] == "derived" and rel(e_piv["value"], c0["piv_global_cm3"]) < 1e-9,
+          f"{e_piv['value'] if e_piv else 'n/a'} vs {c0['piv_global_cm3']:.5f}")
+    ref_cli = parse_eclipse_values("TV=1.20, v20gy=1.17,PIV=1.45,V50=6.1", ["Kugel"], 20.0)
+    n_err = 0
+    for spec_bad, names in (("Foo:CI=1", ["Kugel"]), ("V15Gy=1", ["Kugel"]), ("CI=1", ["A", "B"]),
+                            ("TV", ["Kugel"])):
+        try:
+            parse_eclipse_values(spec_bad, names, 20.0)
+        except ValueError:
+            n_err += 1
+    check("Eclipse-Werte (CLI): Aliase TV/V20Gy/PIV/V50 -> kanonisch, Quelle cli; 4 ungueltige Angaben -> ValueError",
+          set(ref_cli.values.get("Kugel", {})) == {"tv_cm3", "tv_piv_cm3", "piv_cm3", "piv50_cm3"}
+          and all(v["source"] == "cli" for v in ref_cli.values["Kugel"].values()) and n_err == 4,
+          f"{sorted(ref_cli.values.get('Kugel', {}))}, {n_err} Fehler")
+    check("Sammel-CSV: abweichender Spaltenkopf wird erkannt, identischer nicht",
+          _csv_header_mismatch(CSV_COLUMNS[:31], CSV_COLUMNS) is not None
+          and _csv_header_mismatch(list(CSV_COLUMNS), CSV_COLUMNS) is None)
+
+    # 10) Visualisierung: DVH-Kurve gegen weighted_dose_statistics + Smoke-Test ohne CT
+    import tempfile
+    from types import SimpleNamespace
+    from . import dose_viz
+    from . import rtstruct_writer as rw
+    tm_ref = art_ref.targets["Kugel"]
+    curve = dose_viz.build_dvh_curve(tm_ref.dose_samples, tm_ref.sample_weights, art_ref.grid.voxel_volume_mm3)
+    st_w = dm.weighted_dose_statistics(tm_ref.dose_samples, tm_ref.sample_weights, ph.RX)
+    check("DVH-Kurve: D98/D50/D2 identisch mit weighted_dose_statistics (1e-9), Gesamtvolumen = TV (1e-6)",
+          abs(curve.d98_gy - st_w["d98"]) < 1e-9 and abs(curve.d50_gy - st_w["d50"]) < 1e-9
+          and abs(curve.d2_gy - st_w["d2"]) < 1e-9 and rel(curve.total_cm3, c0["tv_cm3"]) < 1e-6
+          and len(curve.dose_gy) <= dose_viz.VIZ_DVH_MAX_PTS + 1,
+          f"D98 {curve.d98_gy:.4f}, V {curve.total_cm3:.5f}, {len(curve.dose_gy)} Punkte")
+    art_ref.eclipse_dvh = {1: SimpleNamespace(dose_gy=edges, volume_cm3=vols)}
+    art_ref.eclipse = compare_with_eclipse(art_ref, ref_ok, 5.0)
+    specs_v = rw.build_roi_specs(art_ref)
+    with tempfile.TemporaryDirectory(prefix="dose_viz_selftest_") as tmp:
+        paths = dose_viz.run_dose_visualization(art_ref, specs_v, None, Path(tmp), case_id="Phantom",
+                                                label="_IDX", verbose=False)
+        h = Path(paths["viz_html_path"]) if paths.get("viz_html_path") else None
+        p = Path(paths["viz_png_path"]) if paths.get("viz_png_path") else None
+        ok_v = (h is not None and h.is_file() and h.stat().st_size > 100_000
+                and p is not None and p.is_file() and p.stat().st_size > 10_000)
+        detail = (f"html {h.stat().st_size / 1e6:.1f} MB, png {p.stat().st_size / 1e3:.0f} kB" if ok_v
+                  else f"html={paths.get('viz_html_path')}, png={paths.get('viz_png_path')}")
+    check("Visualisierung: validation.html (> 100 kB) und dose_overview.png (> 10 kB) geschrieben", ok_v, detail)
+
     n_fail = results.count(False)
     print("-" * 70)
     print(f"Gesamt: {'PASS' if n_fail == 0 else 'FAIL'}  "
@@ -1454,7 +2097,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(high = 1 Pixel auf den Pixelzentren, default = 2 Pixel mit Halbpixel-Versatz), "
                         "Volumenmodell eclipse, PIV global, linear, Feld-Isolinien ohne Vereinfachung")
     p.add_argument("--append-csv", default=None, help="Ergebniszeilen zusaetzlich an diese Sammel-CSV anhaengen")
-    p.add_argument("--no-viz", action="store_true", help="(reserviert) Visualisierung ueberspringen")
+    p.add_argument("--eclipse-ref", default=None,
+                   help="JSON mit Eclipse-Referenzwerten je Ziel (Default: <case>/eclipse_ref.json, falls vorhanden)")
+    p.add_argument("--eclipse-values", default=None,
+                   help="Eclipse-Werte direkt: TV=1.20,VRX=1.17,PIV=1.45,V50=6.1 (auch V20Gy/V10Gy, CI, GI, "
+                        "D98, ...; Dezimalpunkt; mehrere Ziele: NAME:KEY=WERT)")
+    p.add_argument("--eclipse-tol-pct", type=float, default=5.0,
+                   help="Toleranz des Eclipse-Abgleichs in %% (Default 5); Abweichungen darueber werden markiert")
+    p.add_argument("--no-eclipse-dvh", action="store_true",
+                   help="DVHSequence der RTDOSE nicht als Eclipse-Referenz benutzen")
+    p.add_argument("--no-viz", action="store_true",
+                   help="Keine Validierungsansicht (validation.html, dose_overview.png) schreiben")
+    p.add_argument("--no-viz-ct", action="store_true",
+                   help="Kein CT-Hintergrund in der Validierungsansicht (CT-Pixel werden nicht geladen)")
     p.add_argument("--self-test", action="store_true", help="Analytischer Phantomtest; Exit 0 = pass")
     return p
 
@@ -1469,8 +2124,6 @@ def main(argv: Optional[list] = None) -> int:
         if args.case_dir is None and (args.rs is None or args.rd is None):
             print("Fehler: Case-Ordner oder --rs und --rd angeben (siehe --help).", file=sys.stderr)
             return 2
-        if args.no_viz:
-            print("  Hinweis: --no-viz ist reserviert (Visualisierung folgt als eigenes Arbeitspaket).")
         run_dose_indices(
             args.case_dir, rs=args.rs, rd=args.rd, rp=args.rp, target=args.target, rx=args.rx,
             rx_pct_of_max=args.rx_pct_of_max, isodose=args.isodose, grid_mm=args.grid,
@@ -1479,7 +2132,9 @@ def main(argv: Optional[list] = None) -> int:
             include_target=args.include_target, simplify_mm=args.simplify_mm,
             transfer_syntax=args.transfer_syntax, max_name_len=args.max_name_len,
             append_csv=args.append_csv, eclipse_compat=args.eclipse_compat,
-            iso_contours=args.iso_contours,
+            iso_contours=args.iso_contours, eclipse_ref=args.eclipse_ref,
+            eclipse_values=args.eclipse_values, eclipse_tol_pct=args.eclipse_tol_pct,
+            no_eclipse_dvh=args.no_eclipse_dvh, no_viz=args.no_viz, viz_ct=not args.no_viz_ct,
         )
     except (FileNotFoundError, ValueError, KeyError) as e:
         print(f"\nFehler: {e}", file=sys.stderr)

@@ -262,6 +262,151 @@ def fractions_planned(rp_ds: pydicom.Dataset) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Eclipse-DVH (DVHSequence der RTDOSE)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EclipseDVH:
+    """
+    Kumulatives DVH einer ROI aus der RTDOSE-``DVHSequence`` (Eclipse-Export).
+
+    ``dose_gy[i]`` ist die LINKE Kante von Bin i (Bin 0 bei 0 Gy),
+    ``volume_cm3[i]`` das Volumen mit D >= ``dose_gy[i]``.  Linke Kante,
+    weil Bin 0 das Gesamtvolumen traegt (V(D >= 0) = TV) und der letzte Bin
+    mit Volumen dann exakt bei ``DVHMaximumDose`` liegt; bei den ueblichen
+    0.01-Gy-Bins wuerde die rechte Kante V(Rx) um ~0.0003 cm3 verschieben.
+    """
+    roi_number: int
+    dose_gy: np.ndarray
+    volume_cm3: np.ndarray
+    total_volume_cm3: float
+    dvh_type: str
+    dose_units: str
+    volume_units: str
+    dmin_gy: Optional[float]
+    dmax_gy: Optional[float]
+    dmean_gy: Optional[float]
+    n_bins: int
+    bin_width_gy: float
+
+    def v_at(self, dose_gy: float) -> float:
+        """Volumen (cm3) mit D >= ``dose_gy`` (linear zwischen den Bins)."""
+        return float(np.interp(float(dose_gy), self.dose_gy, self.volume_cm3,
+                               left=self.total_volume_cm3, right=0.0))
+
+    def d_at(self, volume_pct: float) -> float:
+        """
+        D_x: Dosis, die mindestens ``volume_pct`` % des Volumens erhaelt
+        (Plateau-Konvention wie ``dose_at_volume_fraction``: letzter Bin, der
+        das Volumen noch erreicht, dann linear zum naechsten Bin).
+        """
+        vol, dose = self.volume_cm3, self.dose_gy
+        if len(vol) == 0:
+            return float("nan")
+        v = volume_pct / 100.0 * self.total_volume_cm3
+        if v <= 0:
+            nz = np.nonzero(vol > 0)[0]
+            return float(dose[nz[-1]]) if len(nz) else float(dose[0])
+        idx = np.nonzero(vol >= v)[0]
+        if len(idx) == 0:
+            return float(dose[0])
+        i = int(idx[-1])
+        if i + 1 >= len(dose) or vol[i] <= v:
+            return float(dose[i])
+        v0, v1, d0, d1 = vol[i], vol[i + 1], dose[i], dose[i + 1]
+        if v0 == v1:
+            return float(d0)
+        return float(d0 + (v0 - v) / (v0 - v1) * (d1 - d0))
+
+
+def read_dvh_sequence(rd_ds: pydicom.Dataset) -> tuple:
+    """
+    ``DVHSequence`` der RTDOSE -> ``({roi_number: EclipseDVH}, hinweise)``.
+    Tolerant: keine Sequenz -> ``({}, [])``; Items, die nicht CUMULATIVE/GY/CM3
+    sind, mehrere ROIs kombinieren (``DVHReferencedROISequence`` != 1 Eintrag),
+    ``EXCLUDED`` beitragen oder leere/ungerade ``DVHData`` haben, werden mit
+    Hinweis uebersprungen.  ``DVHDoseScaling`` wird auf die Bin-Breiten
+    angewendet; ``DVHMinimumDose``/``DVHMaximumDose``/``DVHMeanDose`` werden
+    unveraendert uebernommen (None, wenn nicht vorhanden).
+    """
+    out, notes = {}, []
+    seq = rd_ds.get("DVHSequence", None)
+    if not seq:
+        return out, notes
+    for n, item in enumerate(seq, start=1):
+        refs = item.get("DVHReferencedROISequence", []) or []
+        if len(refs) != 1:
+            notes.append(f"DVH #{n}: {len(refs)} referenzierte ROIs (nur genau eine wird "
+                         "unterstuetzt); uebersprungen.")
+            continue
+        ref = refs[0]
+        roi = int(ref.get("ReferencedROINumber", 0) or 0)
+        contrib = str(ref.get("DVHROIContributionType", "INCLUDED") or "INCLUDED").upper()
+        dvh_type = str(item.get("DVHType", "") or "").upper()
+        units = str(item.get("DoseUnits", "") or "").upper()
+        vunits = str(item.get("DVHVolumeUnits", "") or "").upper()
+        if contrib != "INCLUDED":
+            notes.append(f"DVH #{n} (ROI {roi}): Beitragstyp {contrib}; uebersprungen.")
+            continue
+        if dvh_type != "CUMULATIVE":
+            notes.append(f"DVH #{n} (ROI {roi}): Typ {dvh_type or '?'} statt CUMULATIVE; uebersprungen.")
+            continue
+        if units != "GY":
+            notes.append(f"DVH #{n} (ROI {roi}): DoseUnits {units or '?'} statt GY; uebersprungen.")
+            continue
+        if vunits != "CM3":
+            notes.append(f"DVH #{n} (ROI {roi}): Volumeneinheit {vunits or '?'} statt CM3; uebersprungen.")
+            continue
+        data = np.asarray(item.get("DVHData", []) or [], dtype=float).reshape(-1)
+        if data.size == 0 or data.size % 2:
+            notes.append(f"DVH #{n} (ROI {roi}): DVHData leer oder ungerade ({data.size} Werte); uebersprungen.")
+            continue
+        if roi in out:
+            notes.append(f"DVH #{n}: zweites DVH fuer ROI {roi} ignoriert.")
+            continue
+        scaling = float(item.get("DVHDoseScaling", 1.0) or 1.0)
+        pairs = data.reshape(-1, 2)
+        widths = pairs[:, 0] * scaling
+        volumes = pairs[:, 1].astype(float)
+        dose = np.concatenate([[0.0], np.cumsum(widths)[:-1]])
+
+        def _opt(tag):
+            v = item.get(tag)
+            return float(v) if v is not None else None
+
+        out[roi] = EclipseDVH(
+            roi_number=roi, dose_gy=dose, volume_cm3=volumes,
+            total_volume_cm3=float(volumes[0]), dvh_type=dvh_type, dose_units=units,
+            volume_units=vunits, dmin_gy=_opt("DVHMinimumDose"), dmax_gy=_opt("DVHMaximumDose"),
+            dmean_gy=_opt("DVHMeanDose"), n_bins=int(len(widths)),
+            bin_width_gy=float(np.median(widths)) if len(widths) else 0.0,
+        )
+    return out, notes
+
+
+def dvh_statistics(dvh: EclipseDVH, rx_gy: float) -> dict:
+    """
+    Kennwerte eines Eclipse-DVH: ``total_cm3, v_rx_cm3, v_half_rx_cm3, d2_gy,
+    d50_gy, d95_gy, d98_gy, dmin_gy, dmax_gy, dmean_gy``.  Dmin/Dmax/Dmean
+    kommen aus den DICOM-Attributen, sonst aus der Kurve (D100, D0, Trapez).
+    """
+    tot = dvh.total_volume_cm3
+    dmean = dvh.dmean_gy
+    if dmean is None and tot > 0 and len(dvh.dose_gy) > 1:
+        dmean = float(np.trapz(dvh.volume_cm3, dvh.dose_gy) / tot)
+    return {
+        "total_cm3": tot,
+        "v_rx_cm3": dvh.v_at(rx_gy),
+        "v_half_rx_cm3": dvh.v_at(0.5 * rx_gy),
+        "d2_gy": dvh.d_at(2.0), "d50_gy": dvh.d_at(50.0),
+        "d95_gy": dvh.d_at(95.0), "d98_gy": dvh.d_at(98.0),
+        "dmin_gy": dvh.dmin_gy if dvh.dmin_gy is not None else dvh.d_at(100.0),
+        "dmax_gy": dvh.dmax_gy if dvh.dmax_gy is not None else dvh.d_at(0.0),
+        "dmean_gy": dmean,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 2. Feingitter
 # ---------------------------------------------------------------------------
 

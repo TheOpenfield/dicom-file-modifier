@@ -71,7 +71,9 @@ def build_ct_slice_index(ct_dir: str) -> dict:
     """
     Liest die CT-Header (ohne Pixel) und liefert
     ``{'series_uid', 'study_uid', 'for_uid', 'sop_class_uid', 'z_values',
-    'z_to_sop', 'sops', 'pixel_spacing', 'ipp_xy', 'n_slices'}``.
+    'z_to_sop', 'sops', 'pixel_spacing', 'ipp_xy', 'n_slices', 'z_to_path',
+    'paths'}`` (``z_to_path``/``paths``: Dateipfade je Schicht, damit
+    ``dose_viz`` nur die Schichten im Bereich des Feingitters mit Pixeln laedt).
     """
     import glob
     import os
@@ -96,6 +98,8 @@ def build_ct_slice_index(ct_dir: str) -> dict:
         raise ValueError("CT-Schichten haben unterschiedliche FrameOfReferenceUIDs.")
     z_values = np.array([float(s.ImagePositionPatient[2]) for s in slices])
     z_to_sop = {round(float(z), 3): str(s.SOPInstanceUID) for z, s in zip(z_values, slices)}
+    z_to_path = {round(float(z), 3): str(getattr(s, "filename", "") or "")
+                 for z, s in zip(z_values, slices)}
     s0 = slices[0]
     return {
         "series_uid": series.pop(),
@@ -108,6 +112,8 @@ def build_ct_slice_index(ct_dir: str) -> dict:
         "pixel_spacing": (float(s0.PixelSpacing[0]), float(s0.PixelSpacing[1])),
         "ipp_xy": (float(s0.ImagePositionPatient[0]), float(s0.ImagePositionPatient[1])),
         "n_slices": len(slices),
+        "z_to_path": z_to_path,
+        "paths": [z_to_path[round(float(z), 3)] for z in z_values],
     }
 
 
