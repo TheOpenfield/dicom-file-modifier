@@ -81,7 +81,6 @@ class DemoSpec:
     explicit_vr: bool = False          # Explicit statt Implicit VR Little Endian
     compress_ct: Optional[str] = None  # None | "rle"
     eclipse_ref: Optional[str] = None  # None | "ptv1" | "both" (eclipse_ref.json im Fallordner)
-    empty_roi: bool = True             # ROI ohne Konturen
     size: str = "small"                # small (128^2 x 2 mm) | medium (256^2 x 1 mm)
     seed: Optional[str] = "dfm-demo"   # None -> zufaellige UIDs
 
@@ -201,7 +200,7 @@ def _fields() -> tuple:
     return f1, f2
 
 
-def _build_rois(planes: np.ndarray, empty_roi: bool) -> list:
+def _build_rois(planes: np.ndarray) -> list:
     sph = ph.sphere_contours
     ptv1 = sph(PTV1_C, PTV1_R, planes, N_POLY)
     ptv2 = sph(PTV2_C, PTV2_R, planes, N_POLY)
@@ -231,8 +230,7 @@ def _build_rois(planes: np.ndarray, empty_roi: bool) -> list:
         _Roi(12, "HS1", "MARKER", (255, 0, 255), [np.asarray([HS1_POS], float)], point=True),
         _Roi(13, "Iso", "ISOCENTER", (255, 255, 255), [np.asarray([ISO_POS], float)], point=True),
     ]
-    if empty_roi:
-        rois.append(_Roi(14, "Leer", "ORGAN", (100, 100, 100), []))
+    rois.append(_Roi(14, "Leer", "ORGAN", (100, 100, 100), []))      # ROI ohne Konturen
     return rois
 
 
@@ -583,7 +581,7 @@ def make_demo_case(out_dir, spec: Optional[DemoSpec] = None) -> DemoCase:
     for ds in _ct_slices(ctx, spec):
         ct_files.append(_write(ds, ct_dir / f"CT.{ds.SOPInstanceUID}.dcm"))
 
-    rois = _build_rois(planes, spec.empty_roi)
+    rois = _build_rois(planes)
     rs_path = _write(_rtstruct(ctx, rois), root / f"RS.{ctx['rs_sop']}.dcm")
     rp_path = _write(_rtplan(ctx, with_beams=(spec.rd_set == "plan+2beams")),
                      root / f"RP.{ctx['rp_sop']}.dcm")
@@ -655,7 +653,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rle", action="store_true", help="CT-Schichten RLE-komprimiert")
     p.add_argument("--eclipse-ref", choices=("ptv1", "both"), default=None,
                    help="eclipse_ref.json mit PTV_1 (ptv1) oder PTV_1 + PTV_2 (both) anlegen")
-    p.add_argument("--no-empty-roi", action="store_true", help="Keine leere ROI anlegen")
     p.add_argument("--size", choices=tuple(SIZES), default="small",
                    help="small: 128x128 bei 2 mm (Default); medium: 256x256 bei 1 mm")
     p.add_argument("--seed", default="dfm-demo", help="Seed fuer deterministische UIDs (Default dfm-demo)")
@@ -667,7 +664,7 @@ def main(argv: Optional[list] = None) -> int:
     args = _build_parser().parse_args(argv)
     spec = DemoSpec(layout=args.layout, rd_set=args.rd_set, dvh=not args.no_dvh,
                     explicit_vr=args.explicit_vr, compress_ct="rle" if args.rle else None,
-                    eclipse_ref=args.eclipse_ref, empty_roi=not args.no_empty_roi, size=args.size,
+                    eclipse_ref=args.eclipse_ref, size=args.size,
                     seed=None if args.random_uids else args.seed)
     try:
         case = make_demo_case(args.out_dir, spec)

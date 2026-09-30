@@ -50,7 +50,6 @@ from typing import Optional
 import numpy as np
 import pydicom
 from pydicom.valuerep import format_number_as_ds
-from scipy.integrate import trapezoid
 
 from . import _runtime
 from . import analyzer as ana
@@ -1957,142 +1956,23 @@ def list_rois(case_dir: Optional[str], rs: Optional[str], rd: Optional[str],
 # 6. Self-Test (analytisches Phantom, keine Dateien)
 # ---------------------------------------------------------------------------
 
-def _lens_area(a: float, b: float, d: float) -> float:
-    """Schnittflaeche zweier Kreise (Radien a, b, Mittelpunktsabstand d)."""
-    if a <= 0 or b <= 0 or d >= a + b:
-        return 0.0
-    if d <= abs(a - b):
-        return math.pi * min(a, b) ** 2
-    t1 = a * a * math.acos((d * d + a * a - b * b) / (2 * d * a))
-    t2 = b * b * math.acos((d * d + b * b - a * a) / (2 * d * b))
-    t3 = 0.5 * math.sqrt((-d + a + b) * (d + a - b) * (d - a + b) * (d + a + b))
-    return t1 + t2 - t3
-
-
-class _Phantom:
-    """
-    Kugel-Ziel (Radius R bei 0) + glattes radiales Dosisfeld um CD mit
-    geschlossener Form fuer alle Erwartungswerte:
-      D(r) = Dmax / (1 + (r / r0)^p)   (Hill-Profil, C-unendlich),
-      r(L) = r0 * (Dmax / L - 1)^(1/p);  r(Rx) = R100 = 10.5 mm, GI ~ 2.4.
-    Ein Profil mit Knick am Rx-Level (z.B. quadratisch/exponentiell) wuerde
-    die lineare Interpolation systematisch verzerren und den Sampler-Test
-    unbrauchbar machen.
-    """
-    R = 10.0            # Zielradius
-    DMAX, RX = 25.0, 20.0
-    R100, P = 10.5, 6.0
-    R0 = 10.5 / (25.0 / 20.0 - 1.0) ** (1.0 / 6.0)
-    CD = np.array([2.0, 0.0, 0.0])   # Dosiszentrum (Ziel bei 0)
-    DZ = 1.0
-
-    def __init__(self):
-        self.contour_z = np.arange(-9.5, 9.5 + 1e-9, self.DZ)
-
-    def contours(self, center=(0.0, 0.0, 0.0), n: int = 360) -> list:
-        cx, cy, cz = center
-        return [ana._synthetic_circle(cz + z, math.sqrt(self.R ** 2 - z * z), cx, cy, n)
-                for z in self.contour_z]
-
-    def dose_at(self, pts: np.ndarray, center=None) -> np.ndarray:
-        c = self.CD if center is None else np.asarray(center, float)
-        r = np.linalg.norm(np.asarray(pts, float) - c, axis=1)
-        return self.DMAX / (1.0 + (r / self.R0) ** self.P)
-
-    def level_radius(self, level: float) -> float:
-        if level >= self.DMAX:
-            return 0.0
-        return self.R0 * (self.DMAX / level - 1.0) ** (1.0 / self.P)
-
-    def native_grid(self, extent: float = 32.0, res_xy: float = 0.5) -> dm.DoseGrid:
-        zs = np.arange(-extent + 0.5, extent, self.DZ)
-        xs = np.arange(-extent + res_xy / 2, extent, res_xy)
-        Z, Y, X = np.meshgrid(zs, xs, xs, indexing="ij")
-        pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-        arr = self.dose_at(pts).reshape(Z.shape).astype(np.float32)
-        A = np.zeros((4, 4))
-        A[3, 3] = 1.0
-        A[2, 0] = self.DZ          # k -> z
-        A[1, 1] = res_xy           # j -> y
-        A[0, 2] = res_xy           # i -> x
-        A[:3, 3] = [xs[0], xs[0], zs[0]]
-        return dm.DoseGrid(array=arr, affine=A, spacing=(self.DZ, res_xy, res_xy),
-                           origin=A[:3, 3].copy(), units="GY", dose_type="PHYSICAL",
-                           summation_type="PLAN", dmax=float(arr.max()),
-                           frame_of_reference_uid="1.2.3", sop_instance_uid="1.2.3.4")
-
-    # --- Erwartungswerte als Scheibenstapel (exakt fuer das Slab-Modell) ---
-    def _disc_radius(self, z: float) -> float:
-        return math.sqrt(max(self.R ** 2 - z * z, 0.0))
-
-    def _weights(self, model: str) -> np.ndarray:
-        w = np.ones(len(self.contour_z))
-        if model == "eclipse":
-            w[0] = w[-1] = 0.5
-        return w
-
-    @staticmethod
-    def _poly_f(n_polygon: int) -> float:
-        # Polygonflaeche eines regelmaessigen n-Ecks = pi r^2 * (n/(2 pi)) sin(2 pi / n)
-        return n_polygon / (2 * math.pi) * math.sin(2 * math.pi / n_polygon)
-
-    def target_volume(self, model: str = "slab", n_polygon: int = 360) -> float:
-        poly_f, w = self._poly_f(n_polygon), self._weights(model)
-        return sum(wk * math.pi * self._disc_radius(z) ** 2 * poly_f
-                   for wk, z in zip(w, self.contour_z)) * self.DZ / 1000.0
-
-    def isodose_volume(self, level: float) -> float:
-        rl = self.level_radius(level)
-        zs = np.arange(-31.5, 32.0, self.DZ)
-        return sum(math.pi * max(rl * rl - z * z, 0.0) for z in zs) * self.DZ / 1000.0
-
-    def cumulative_volume(self, level: float, model: str = "slab", n_polygon: int = 360) -> float:
-        """V(D >= level) des Ziels in cm3 (Scheibenstapel aus Kreis-Kreis-Linsen)."""
-        if level <= 0:
-            return self.target_volume(model, n_polygon)
-        poly_f, w = self._poly_f(n_polygon), self._weights(model)
-        d = float(np.linalg.norm(self.CD))
-        rl = self.level_radius(level)
-        tot = 0.0
-        for wk, z in zip(w, self.contour_z):
-            a = self._disc_radius(z) * math.sqrt(poly_f)
-            b = math.sqrt(max(rl * rl - z * z, 0.0))
-            tot += wk * _lens_area(a, b, d)
-        return tot * self.DZ / 1000.0
-
-    def cumulative_dvh(self, levels, model: str = "slab") -> np.ndarray:
-        """Kumulatives DVH V(D >= L) fuer alle ``levels`` (cm3)."""
-        return np.array([self.cumulative_volume(float(L), model) for L in levels])
-
-    def expected(self, model: str = "slab", n_polygon: int = 360) -> dict:
-        TV = self.target_volume(model, n_polygon)
-        PIV, PIV50 = self.isodose_volume(self.RX), self.isodose_volume(0.5 * self.RX)
-        I = self.cumulative_volume(self.RX, model, n_polygon)
-        inter = lambda level: self.cumulative_volume(level, model, n_polygon)  # noqa: E731
-
-        def d_at(frac):   # Dosis, die frac des Volumens erhaelt (bisection auf inter(L)/TV)
-            lo, hi = 0.01, self.DMAX
-            for _ in range(80):
-                mid = 0.5 * (lo + hi)
-                if inter(mid) / TV >= frac:
-                    lo = mid
-                else:
-                    hi = mid
-            return 0.5 * (lo + hi)
-
-        levels = np.linspace(0.0, self.DMAX, 801)
-        vcum = np.array([inter(L) if L > 0 else TV for L in levels])
-        dmean = float(trapezoid(vcum, levels) / TV)
-        d2, d50, d98, d95 = d_at(0.02), d_at(0.50), d_at(0.98), d_at(0.95)
-        return {
-            "tv": TV, "piv": PIV, "tv_piv": I, "piv50": PIV50,
-            "ci_paddick": I * I / (TV * PIV), "coverage": I / TV, "selectivity": I / PIV,
-            "ci_rtog": PIV / TV, "dice": 2 * I / (TV + PIV), "gi": PIV50 / PIV,
-            "gm_cm": gradient_measure_cm(PIV50, PIV),
-            "d2": d2, "d50": d50, "d98": d98, "d95": d95, "dmean": dmean,
-            "hi": (d2 - d98) / d50,
-            "v100_pct": 100.0 * I / TV, "v95_pct": 100.0 * inter(0.95 * self.RX) / TV,
-        }
+def _field_grid(field, extent: float = 32.0, res_xy: float = 0.5, dz: float = 1.0) -> dm.DoseGrid:
+    """Natives Dosisgitter (wie ein TPS-Export) aus einem analytischen ``phantom.HillField``."""
+    zs = np.arange(-extent + 0.5, extent, dz)
+    xs = np.arange(-extent + res_xy / 2, extent, res_xy)
+    Z, Y, X = np.meshgrid(zs, xs, xs, indexing="ij")
+    pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    arr = field.dose_at(pts).reshape(Z.shape).astype(np.float32)
+    A = np.zeros((4, 4))
+    A[3, 3] = 1.0
+    A[2, 0] = dz               # k -> z
+    A[1, 1] = res_xy           # j -> y
+    A[0, 2] = res_xy           # i -> x
+    A[:3, 3] = [xs[0], xs[0], zs[0]]
+    return dm.DoseGrid(array=arr, affine=A, spacing=(dz, res_xy, res_xy),
+                       origin=A[:3, 3].copy(), units="GY", dose_type="PHYSICAL",
+                       summation_type="PLAN", dmax=float(arr.max()),
+                       frame_of_reference_uid="1.2.3", sop_instance_uid="1.2.3.4")
 
 
 def _synthetic_rtdose_dataset(dose: dm.DoseGrid, absolute_gfov: bool = False) -> pydicom.Dataset:
@@ -2139,8 +2019,28 @@ def _run_self_test() -> int:
 
     print("\nDosisindex Self-Test (analytisches Kugelphantom)")
     print("-" * 70)
-    ph = _Phantom()
-    native = ph.native_grid()
+    # Kugelziel (R = 10 mm um den Ursprung, Konturen auf 1-mm-Ebenen) in einem
+    # Hill-Feld um (2, 0, 0) mit Dmax = 25 Gy und Rx-Isodose bei 10.5 mm; alle
+    # Erwartungswerte kommen in geschlossener Form aus ``phantom``.
+    from . import phantom
+    R, RX, DZ = 10.0, 20.0, 1.0
+    contour_z = np.arange(-9.5, 9.5 + 1e-9, DZ)
+    field = phantom.HillField.for_target((0.0, 0.0, 0.0), R, RX)
+    target = phantom.SphereTarget("Kugel", np.zeros(3), R, RX, field, contour_z, DZ)
+    dose_planes = np.arange(-31.5, 32.0, DZ)          # Ebenen des nativen Gitters
+    native = _field_grid(field, extent=32.0, res_xy=0.5)
+
+    def sphere(center=(0.0, 0.0, 0.0)) -> list:
+        return phantom.sphere_contours(center, R, contour_z, 360)
+
+    def expected(model: str) -> dict:
+        e = target.expected(dose_planes, model=model)
+        return {"tv": e["tv_cm3"], "piv": e["piv_component_cm3"], "tv_piv": e["tv_piv_cm3"],
+                "piv50": e["piv50_component_cm3"], "ci_paddick": e["ci_paddick_component"],
+                "coverage": e["coverage"], "dice": 2 * e["tv_piv_cm3"] / (e["tv_cm3"] + e["piv_component_cm3"]),
+                "gi": e["gi_component"], "gm_cm": e["gm_cm_component"], "hi": e["hi_icru83"],
+                "d2": e["d2_gy"], "d50": e["d50_gy"], "d98": e["d98_gy"], "d95": e["d95_gy"],
+                "dmean": e["dmean_gy"]}
 
     # 1) Loader mit synthetischem RTDOSE (relativer + absoluter GFOV)
     for absolute in (False, True):
@@ -2174,21 +2074,21 @@ def _run_self_test() -> int:
     check("Sampler: Punkt ausserhalb -> NaN", bool(np.isnan(outside[0])))
 
     # 3) Kern-Mathematik mit analytischem Feld auf dem Feingitter
-    levels, _ = parse_isodose_levels("100,50", ph.RX)
-    contours = ph.contours()
-    cz = ph.contour_z
+    levels, _ = parse_isodose_levels("100,50", RX)
+    contours = sphere()
+    cz = contour_z
     for res, tol_v, tol_ci, tol_gi, tol_hi, tol_d in ((0.25, 0.005, 0.005, 0.01, 0.01, 0.1),
                                                     (1.0, 0.02, 0.02, 0.03, 0.03, 0.3)):
         lo, hi = dm.contours_bbox([contours])
-        lb = dm.native_level_bbox(native, 0.5 * ph.RX)
+        lb = dm.native_level_bbox(native, 0.5 * RX)
         grid = dm.build_fine_grid(native, np.minimum(lo, lb[0]), np.maximum(hi, lb[1]), res, contour_z=cz)
-        analytic = np.stack([ph.dose_at(grid.plane_points(k)).reshape(len(grid.gy), len(grid.gx))
+        analytic = np.stack([field.dose_at(grid.plane_points(k)).reshape(len(grid.gy), len(grid.gx))
                              for k in range(len(grid.gz))]).astype(np.float32)
         for model in ("slab", "eclipse"):
-            exp = ph.expected(model)
+            exp = expected(model)
             art = evaluate_on_grid(grid, analytic, native, None,
                                    [{"name": "Kugel", "roi_number": 1, "contours": contours}],
-                                   ph.RX, "cli", levels, model, "global")
+                                   RX, "cli", levels, model, "global")
             r = art.targets["Kugel"].result
             c, ix, dv = r["components"], r["indices"], r["dvh_stats"]
             ok_v = (rel(c["tv_cm3"], exp["tv"]) < tol_v and rel(c["piv_cm3"], exp["piv"]) < tol_v
@@ -2212,13 +2112,13 @@ def _run_self_test() -> int:
                 art_ref = art
         # 4) volle Pipeline (Sampling vom nativen 0.5/1.0-mm-Gitter), nur slab, 0.25 mm
         if res == 0.25:
-            exp = ph.expected("slab")
+            exp = expected("slab")
             art_s = compute_dose_indices.__wrapped__(grid, native, contours, levels) \
                 if hasattr(compute_dose_indices, "__wrapped__") else None
             df = dm.sample_dose_on_grid(native, grid, 1)
             art_s = evaluate_on_grid(grid, df, native, None,
                                      [{"name": "Kugel", "roi_number": 1, "contours": contours}],
-                                     ph.RX, "cli", levels, "slab", "global")
+                                     RX, "cli", levels, "slab", "global")
             r = art_s.targets["Kugel"].result
             c, ix = r["components"], r["indices"]
             check("Pipeline 0.25 mm (Sampling linear vom nativen Gitter): Volumina innerhalb 1.5 %, CI +-0.015",
@@ -2227,7 +2127,7 @@ def _run_self_test() -> int:
                   f"PIV {c['piv_cm3']:.4f}/{exp['piv']:.4f}, CI {ix['ci_paddick']:.4f}/{exp['ci_paddick']:.4f}")
 
     # 5) Volumenmodelle: TV_slab - TV_eclipse = 0.5*(A_erste + A_letzte)*dz
-    e_s, e_e = ph.expected("slab"), ph.expected("eclipse")
+    e_s, e_e = expected("slab"), expected("eclipse")
     r = art_ref.targets["Kugel"].result
     diff = r["volume_models"]["slab"]["tv_cm3"] - r["volume_models"]["eclipse"]["tv_cm3"]
     check("Volumenmodell: TV_slab - TV_eclipse = halbe Endschichten (2 %)", rel(diff, e_s["tv"] - e_e["tv"]) < 0.02,
@@ -2247,26 +2147,27 @@ def _run_self_test() -> int:
 
     # 7) Komponenten-Scope: zweiter Hotspot bei (32,0,0) mit eigenem Ziel bei (30,0,0)
     #    (groesseres natives Gitter, damit beide Isodosen vollstaendig enthalten sind)
-    wide = ph.native_grid(extent=48.0, res_xy=1.0)
+    wide = _field_grid(field, extent=48.0, res_xy=1.0)
     nk2, nj2, ni2 = wide.shape
     K, J, I = np.meshgrid(np.arange(nk2), np.arange(nj2), np.arange(ni2), indexing="ij")
     P = wide.index_to_patient(np.column_stack([K.ravel(), J.ravel(), I.ravel()]))
-    two = np.maximum(wide.array, ph.dose_at(P, center=[32.0, 0.0, 0.0]).reshape(wide.shape).astype(np.float32))
+    field_b = phantom.HillField.for_target((30.0, 0.0, 0.0), R, RX)      # zweites Feld um (32, 0, 0)
+    two = np.maximum(wide.array, field_b.dose_at(P).reshape(wide.shape).astype(np.float32))
     dose2 = dm.DoseGrid(array=two, affine=wide.affine.copy(), spacing=wide.spacing,
                         origin=wide.origin.copy(), units="GY", dose_type="PHYSICAL",
                         summation_type="PLAN", dmax=float(two.max()), frame_of_reference_uid="1",
                         sop_instance_uid="2")
-    c1, c2 = ph.contours(), ph.contours(center=(30.0, 0.0, 0.0))
+    c1, c2 = sphere(), sphere(center=(30.0, 0.0, 0.0))
     lo, hi = dm.contours_bbox([c1, c2])
-    lb = dm.native_level_bbox(dose2, 0.5 * ph.RX)
+    lb = dm.native_level_bbox(dose2, 0.5 * RX)
     grid2 = dm.build_fine_grid(dose2, np.minimum(lo, lb[0]), np.maximum(hi, lb[1]), 0.5, contour_z=cz)
     df2 = dm.sample_dose_on_grid(dose2, grid2, 1)
     specs2 = [{"name": "A", "roi_number": 1, "contours": c1}, {"name": "B", "roi_number": 2, "contours": c2}]
-    art_g = evaluate_on_grid(grid2, df2, dose2, None, specs2, ph.RX, "cli", levels, "slab", "global")
-    art_c = evaluate_on_grid(grid2, df2, dose2, None, specs2, ph.RX, "cli", levels, "slab", "component")
+    art_g = evaluate_on_grid(grid2, df2, dose2, None, specs2, RX, "cli", levels, "slab", "global")
+    art_c = evaluate_on_grid(grid2, df2, dose2, None, specs2, RX, "cli", levels, "slab", "component")
     piv_g = art_g.targets["A"].result["components"]["piv_cm3"]
     piv_c = art_c.targets["A"].result["components"]["piv_cm3"]
-    exp = ph.expected("slab")
+    exp = expected("slab")
     check("Komponenten-Scope: global PIV = 2 Hotspots, component PIV = 1 Hotspot",
           rel(piv_g, 2 * exp["piv"]) < 0.03 and rel(piv_c, exp["piv"]) < 0.03
           and art_c.levels["100"].n_components == 2 and art_g.global_result is not None,
@@ -2282,12 +2183,12 @@ def _run_self_test() -> int:
     # 9) Eclipse-Abgleich: DVHSequence-Leser, Referenzmodell, Vergleich, CSV-Kopf
     from pydicom.dataset import Dataset as _DS
     from pydicom.sequence import Sequence as _Seq
-    exp_s = ph.expected("slab")
+    exp_s = expected("slab")
     ds_dvh = _synthetic_rtdose_dataset(native)
     width, scaling = 0.1, 0.5                 # DVHData-Breite 0.2 * DVHDoseScaling 0.5 = 0.1 Gy
-    n_bins = int(round(ph.DMAX / width)) + 2
+    n_bins = int(round(field.dmax / width)) + 2
     edges = np.arange(n_bins) * width
-    vols = ph.cumulative_dvh(edges, "slab")
+    vols = np.array([target.cumulative_volume(float(L), "slab") for L in edges])
 
     def _dvh_item(roi, dvh_type="CUMULATIVE", units="GY"):
         it = _DS()
@@ -2306,7 +2207,7 @@ def _run_self_test() -> int:
     check("Eclipse-DVH: Leser nimmt das kumulative GY/CM3-DVH, ueberspringt DIFFERENTIAL/RELATIVE mit Hinweis",
           set(dvh_map) == {1} and len(dvh_notes) == 2, f"ROIs {sorted(dvh_map)}, {len(dvh_notes)} Hinweise")
     dvh1 = dvh_map[1]
-    st_e = dm.dvh_statistics(dvh1, ph.RX)
+    st_e = dm.dvh_statistics(dvh1, RX)
     check("Eclipse-DVH: Gesamtvolumen = TV (1e-6), V(Rx) = TV&PIV (0.5 %), Bin 0.1 Gy (Skalierung angewendet)",
           rel(dvh1.total_volume_cm3, exp_s["tv"]) < 1e-6 and rel(st_e["v_rx_cm3"], exp_s["tv_piv"]) < 0.005
           and abs(dvh1.bin_width_gy - width) < 1e-9,
@@ -2326,7 +2227,7 @@ def _run_self_test() -> int:
                   "HI": ix0["hi_icru83"], "D98": dv0["d98_gy"], "D50": dv0["d50_gy"], "D2": dv0["d2_gy"],
                   "Dmean": dv0["dmean_gy"], "Dmin": dv0["dmin_gy"], "Dmax": dv0["dmax_gy"]},
             "_meta": {"source": "Self-Test"}}
-    ref_ok = eclipse_reference_from_dict(good, ["Kugel"], ph.RX, "json")
+    ref_ok = eclipse_reference_from_dict(good, ["Kugel"], RX, "json")
     n_warn0 = len(r_ref["warnings"])
     cmp_ok = compare_with_eclipse(art_ref, ref_ok, 5.0)["Kugel"]
     check("Eclipse-Abgleich: identische Referenz -> 13 Werte verglichen, Diff 0, nichts markiert, keine Warnung",
@@ -2336,7 +2237,7 @@ def _run_self_test() -> int:
           f"n={cmp_ok['n_compared']}, markiert={cmp_ok['n_flagged']}")
     bad = {"*": {k: v for k, v in good["*"].items() if k not in ("CI", "GI")}}
     bad["*"]["PIV"] = good["*"]["PIV"] * 1.3
-    ref_bad = eclipse_reference_from_dict(bad, ["Kugel"], ph.RX, "json")
+    ref_bad = eclipse_reference_from_dict(bad, ["Kugel"], RX, "json")
     derive_eclipse_values(ref_bad, "Kugel")
     cmp_bad = compare_with_eclipse(art_ref, ref_bad, 5.0)["Kugel"]
     by = {row["key"]: row for row in cmp_bad["rows"]}
@@ -2346,7 +2247,7 @@ def _run_self_test() -> int:
           and any(w.startswith("Abgleich Eclipse: PIV") for w in r_ref["warnings"]),
           f"markiert={cmp_bad['flagged']}, CI {by['ci_paddick']['diff_pct']:+.1f} %")
     ref_ci = eclipse_reference_from_dict(
-        {"*": {"tv_cm3": c0["tv_cm3"], "vrx": c0["tv_piv_cm3"], "ci": ix0["ci_paddick"]}}, ["Kugel"], ph.RX, "json")
+        {"*": {"tv_cm3": c0["tv_cm3"], "vrx": c0["tv_piv_cm3"], "ci": ix0["ci_paddick"]}}, ["Kugel"], RX, "json")
     derive_eclipse_values(ref_ci, "Kugel")
     e_piv = ref_ci.get("Kugel", "piv_cm3")
     check("Eclipse-Abgleich: PIV aus CI abgeleitet = (TV&PIV)^2 / (TV*CI) = PIV des Tools (1e-9)",
@@ -2374,7 +2275,7 @@ def _run_self_test() -> int:
     from . import dose_viz
     tm_ref = art_ref.targets["Kugel"]
     curve = dose_viz.build_dvh_curve(tm_ref.dose_samples, tm_ref.sample_weights, art_ref.grid.voxel_volume_mm3)
-    st_w = dm.weighted_dose_statistics(tm_ref.dose_samples, tm_ref.sample_weights, ph.RX)
+    st_w = dm.weighted_dose_statistics(tm_ref.dose_samples, tm_ref.sample_weights, RX)
     check("DVH-Kurve: D98/D50/D2 identisch mit weighted_dose_statistics (1e-9), Gesamtvolumen = TV (1e-6)",
           abs(curve.d98_gy - st_w["d98"]) < 1e-9 and abs(curve.d50_gy - st_w["d50"]) < 1e-9
           and abs(curve.d2_gy - st_w["d2"]) < 1e-9 and rel(curve.total_cm3, c0["tv_cm3"]) < 1e-6

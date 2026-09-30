@@ -66,7 +66,7 @@ python -m dicom_file_modifier.rtstruct_writer --self-test
 
 # Synthetic demo case (CT + RS + RP + RD, no patient data; deterministic UIDs, demo_expected.json)
 python -m dicom_file_modifier.demo output/demo [--layout flat] [--rd-set plan+2beams|2plans] \
-    [--no-dvh] [--explicit-vr] [--rle] [--eclipse-ref ptv1|both] [--no-empty-roi] [--size medium]
+    [--no-dvh] [--explicit-vr] [--rle] [--eclipse-ref ptv1|both] [--size medium]
 # Golden-output harness (CLI parity); work dir %USERPROFILE%\dfm-golden (outside the repo)
 python tools/golden.py make-inputs
 python tools/golden.py run --label G0 [--only PATTERN] [--real data/<case-id> ...]
