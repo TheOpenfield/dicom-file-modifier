@@ -9,7 +9,7 @@ cli.py - Einstiegspunkt ``dfm`` fuer alle Werkzeuge des Pakets (Plan P0.8).
   dfm demo OUT [...]                ... demo (synthetischer Demo-Fall)
   dfm selftest                      alle Self-Tests; case_modifier auf einem frischen Demo-Fall
   dfm worker --job JOB.json         einen Job der Desktop-App ausfuehren (JSON-Lines)
-  dfm gui [FALL]                    Desktop-App starten (Extra [gui])
+  dfm gui [DATENSATZ]               Desktop-App starten (Extra [gui])
   dfm --version [--json]
 
 Die Werkzeug-Befehle leiten ihre Argumente unveraendert an ``main(argv)`` des

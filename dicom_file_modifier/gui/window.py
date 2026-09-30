@@ -1,4 +1,4 @@
-"""Hauptfenster: Fallzeile, Seitenleiste mit Seiten, Fortschritt mit Abbrechen, Protokoll."""
+"""Hauptfenster: Datensatzzeile, Seitenleiste mit Seiten, Fortschritt mit Abbrechen, Protokoll."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget,
                                QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSizePolicy, QStackedWidget, QToolBar, QWidget)
+                               QPushButton, QSizePolicy, QStackedWidget, QStyle, QToolBar,
+                               QWidget)
 
 from .config import APP_NAME, AppConfig
 from .jobs import JobRunner
@@ -26,7 +27,7 @@ ABOUT_HTML = (
 
 @dataclass
 class Case:
-    """Geoeffneter Fallordner; Dateien nach der Namenskonvention der CLI (``RS*``/``RD*``/``RP*``, ``CT/``)."""
+    """Geoeffneter Datensatz-Ordner; Dateien nach der Namenskonvention der CLI (``RS*``/``RD*``/``RP*``, ``CT/``)."""
 
     folder: Path
     rs: list = field(default_factory=list)
@@ -65,11 +66,14 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.resize(1320, 860)
 
-        bar = QToolBar("Fall", self)
+        bar = QToolBar("Datensatz", self)
         bar.setMovable(False)
         self.addToolBar(bar)
-        bar.addAction("Fall öffnen …", self.choose_case)
-        self.case_label = QLabel("  Kein Fall geöffnet: Ordner wählen oder hierher ziehen")
+        self.open_case_button = QPushButton(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon), "Datensatz öffnen …")
+        self.open_case_button.clicked.connect(self.choose_case)
+        bar.addWidget(self.open_case_button)
+        self.case_label = QLabel("  Kein Datensatz geöffnet: Ordner wählen oder hierher ziehen")
         bar.addWidget(self.case_label)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -118,14 +122,14 @@ class MainWindow(QMainWindow):
         self.runner.finished.connect(self._on_finished)
         self._update_root_tooltip()
 
-    # -- Fall ----------------------------------------------------------------------------
+    # -- Datensatz ----------------------------------------------------------------------------
     def show_about(self) -> None:
         from .. import __version__
         QMessageBox.about(self, f"Über {APP_NAME}", ABOUT_HTML.format(app=APP_NAME, version=__version__))
 
     def choose_case(self) -> None:
         start = str(self.case.folder.parent) if self.case else ""
-        folder = QFileDialog.getExistingDirectory(self, "Fallordner wählen", start)
+        folder = QFileDialog.getExistingDirectory(self, "Datensatz-Ordner wählen", start)
         if folder:
             self.open_case(folder)
 

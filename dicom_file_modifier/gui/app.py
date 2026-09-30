@@ -1,4 +1,4 @@
-"""Einstieg der Desktop-App: ``dfm gui [FALL]`` bzw. ``dicom-rt-toolkit [FALL]``."""
+"""Einstieg der Desktop-App: ``dfm gui [DATENSATZ]`` bzw. ``dicom-rt-toolkit [DATENSATZ]``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Optional
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="dfm gui", description="Desktop-App starten.")
-    parser.add_argument("case", nargs="?", help="Fallordner direkt öffnen")
+    parser.add_argument("case", nargs="?", metavar="DATENSATZ", help="Datensatz-Ordner direkt öffnen")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -34,9 +34,9 @@ def main(argv: Optional[list] = None) -> int:
 
 def _smoke_test(app, case) -> int:
     """
-    Pruefung einer Installation (auch der gefrorenen App): Fall oeffnen und die
+    Pruefung einer Installation (auch der gefrorenen App): Datensatz oeffnen und die
     Strukturanalyse ueber den Worker rechnen, Ergebnisse in einem Temp-Ordner.
-    Exit 0 ok, 1 Lauf fehlgeschlagen, 2 kein Fall, 3 Pruefung nicht bestanden, 4 Zeitueberschreitung.
+    Exit 0 ok, 1 Lauf fehlgeschlagen, 2 kein Datensatz, 3 Pruefung nicht bestanden, 4 Zeitueberschreitung.
     """
     import shutil
     import tempfile

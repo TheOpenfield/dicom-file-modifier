@@ -65,7 +65,7 @@ class StructuresPage(QWidget):
         settings_box = QGroupBox("Einstellungen")
         QVBoxLayout(settings_box).addWidget(self.form)
 
-        self.preview_label = QLabel("Kein Fall geöffnet.")
+        self.preview_label = QLabel("Kein Datensatz geöffnet.")
         self.preview_label.setWordWrap(True)
         self.out_label = QLabel()
         self.out_label.setWordWrap(True)
@@ -121,7 +121,7 @@ class StructuresPage(QWidget):
         outer.setSizes([560, 760])
         QVBoxLayout(self).addWidget(outer)
 
-    # -- Fall und Inspektion ---------------------------------------------------------
+    # -- Datensatz und Inspektion ---------------------------------------------------------
     def set_case(self, case) -> None:
         self.case = case
         self.rs_combo.blockSignals(True)
@@ -138,7 +138,7 @@ class StructuresPage(QWidget):
         self.rs_label.clear()
         rs = self.rs_combo.currentData()
         if not rs:
-            self._show_check("Kein RTSTRUCT im Fallordner (RS*.dcm).", [], False)
+            self._show_check("Kein RTSTRUCT im Datensatz-Ordner (RS*.dcm).", [], False)
             return
         self._show_check("RTSTRUCT wird gelesen …", [], False)
         case_id = self.case.folder.name
@@ -198,7 +198,7 @@ class StructuresPage(QWidget):
 
     def _update_start(self) -> None:
         self.start_button.setEnabled(self._ok and not self._running)
-        self.start_button.setToolTip("" if self._ok else "Erst einen Fall mit RTSTRUCT öffnen "
+        self.start_button.setToolTip("" if self._ok else "Erst einen Datensatz mit RTSTRUCT öffnen "
                                                           "und die Prüfung bestehen.")
 
     def refresh(self) -> None:
