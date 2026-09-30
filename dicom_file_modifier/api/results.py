@@ -9,6 +9,7 @@ Ergebnis: Status, Exit-Code, Ausgaben relativ zum Ergebnisordner, Manifest.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,21 @@ from .. import _runtime
 from .issues import Issue, exit_code_for, issue_from_exception
 
 STATUSES = ("ok", "ok_warnings", "failed", "cancelled")
+
+
+def jsonable(obj):
+    """Fuer strenges JSON: NaN/Inf -> ``None``, Tupel -> Listen, Pfade -> ``str`` (rekursiv)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {str(k): jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [jsonable(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if hasattr(obj, "item") and callable(obj.item):        # numpy-Skalar
+        return jsonable(obj.item())
+    return obj
 
 
 @dataclass
@@ -84,13 +100,17 @@ class StageTimer(_runtime.JobContext):
         return {"total_s": round(time.perf_counter() - self._t0, 3), "stages": list(self.stages)}
 
 
+RUN_JSON, RUN_LOG = "run.json", "run.log"      # Job-Protokoll im Ergebnisordner (kein Ergebnis)
+
+
 def build_manifest(out_dir) -> list:
-    """Alle Dateien unter ``out_dir`` mit Groesse, Pfade relativ (``/``), sortiert."""
+    """Ergebnisdateien unter ``out_dir`` mit Groesse, relativ (``/``), sortiert; ohne run.json/run.log."""
     root = Path(out_dir)
     if not root.is_dir():
         return []
-    return [{"path": p.relative_to(root).as_posix(), "bytes": p.stat().st_size}
-            for p in sorted(root.rglob("*")) if p.is_file()]
+    return [{"path": rel, "bytes": p.stat().st_size}
+            for p in sorted(root.rglob("*")) if p.is_file()
+            for rel in [p.relative_to(root).as_posix()] if rel not in (RUN_JSON, RUN_LOG)]
 
 
 def relative_outputs(outputs: dict, out_dir) -> dict:

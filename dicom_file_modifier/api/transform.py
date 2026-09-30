@@ -302,6 +302,33 @@ def command_gaps(selection: CaseSelection) -> list:
     return [] if got == want else [f"CT-Schichten (die CLI erwartet sie {where})"]
 
 
+def planned_stages(settings: TransformSettings, selection: CaseSelection) -> list:
+    """Stufen-Schluessel des Laufs in Reihenfolge (fuer ``stage i/n`` im Worker)."""
+    if selection.rs:
+        return (["preflight", "plan", "ct_transform", "rs_write"]
+                + (["verify"] if settings.verify else []) + (["viz"] if settings.viz else []))
+    return ["load", "transform"] + (["viz"] if settings.viz else [])
+
+
+def job_checks(settings: TransformSettings, selection: CaseSelection) -> list:
+    """Vor dem Lauf im Worker: reicht der freie Arbeitsspeicher (nur Header gelesen)?"""
+    avail = available_memory_bytes()
+    if avail is None or not selection.ct_files:
+        return []
+    try:
+        shape = mod.extract_geometry(mod.load_ct_headers(selection.ct_files))["shape"]
+    except Exception:  # noqa: BLE001 - der Lauf meldet den Fehler selbst
+        return []
+    need = estimate_memory_bytes(shape, settings.method, settings.order,
+                                 settings.viz and settings.viz_ct_surface and bool(selection.rs))
+    if need <= avail:
+        return []
+    return [Issue("warning", "SYSTEM.MEMORY_LOW",
+                  f"Geschaetzter Speicherbedarf {format_bytes(need)}, frei {format_bytes(avail)}.",
+                  hint_de="Andere Programme schliessen oder die Methode 'metadata' waehlen.",
+                  field="method")]
+
+
 def run(settings: TransformSettings, selection: CaseSelection, out_dir) -> JobResult:
     """Transformation nach ``out_dir`` (``CT/`` und ggf. ``RS<label>.dcm``, Ansichten)."""
     out_dir = Path(out_dir)

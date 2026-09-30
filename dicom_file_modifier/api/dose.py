@@ -508,6 +508,38 @@ def _summary(report: dict) -> dict:
     return out
 
 
+def planned_stages(settings: DoseIndexSettings, selection: CaseSelection) -> list:
+    """Stufen-Schluessel des Laufs in Reihenfolge (fuer ``stage i/n`` im Worker)."""
+    return (["prepare", "compute"] + (["rs_export"] if settings.write_rs else [])
+            + (["viz"] if settings.viz else []) + ["reports"])
+
+
+def job_hooks(settings: DoseIndexSettings) -> tuple:
+    """
+    Fuer Jobs: ``(settings fuer den Lauf, Befunde vorab, Nachtrag nach dem Commit)``.
+    Die Sammel-CSV wird erst geschrieben, wenn der Ergebnisordner steht; ihre
+    Kopfzeile wird vorher geprueft.  Die angehaengten Zeilen sind die der
+    ``indices.csv`` im Ergebnisordner (dieselben, die die CLI anhaengt).
+    """
+    if not settings.append_csv:
+        return settings, [], None
+    issues = []
+    try:
+        di._check_csv_header(settings.append_csv)
+    except Exception as exc:  # noqa: BLE001 - z.B. gesperrt oder alte Kopfzeile
+        issues.append(issue_from_exception(exc, field="append_csv"))
+    target = Path(settings.append_csv)
+
+    def after_commit(result_dir: Path) -> dict:
+        import csv
+        with open(Path(result_dir) / "indices.csv", newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        di.write_csv(rows, target, append=True)
+        return {"append_csv": str(target.resolve())}
+
+    return settings.replace(append_csv=None), issues, after_commit
+
+
 def run(settings: DoseIndexSettings, selection: CaseSelection, out_dir) -> JobResult:
     """Kompletter Lauf nach ``out_dir`` (Konsolentext wie die CLI; im Worker: Protokoll)."""
     out_dir = Path(out_dir)

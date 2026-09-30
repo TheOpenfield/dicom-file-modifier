@@ -124,6 +124,11 @@ def command(settings: StructureSettings, selection: CaseSelection, out_dir) -> l
     return cmds
 
 
+def planned_stages(settings: StructureSettings, selection: CaseSelection) -> list:
+    """Stufen-Schluessel des Laufs in Reihenfolge (fuer ``stage i/n`` im Worker)."""
+    return ["analysis"] + (["plots"] if settings.plots else [])
+
+
 def run(settings: StructureSettings, selection: CaseSelection, out_dir) -> JobResult:
     """Analyse (und Plots) nach ``out_dir``; Konsolentext wie die CLI (im Worker: Protokoll)."""
     out_dir = Path(out_dir)

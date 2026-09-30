@@ -100,6 +100,7 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - preview = run: ROI names and the Eclipse-mode values;
       - error classes and exit codes;
       - the inputs stay unchanged.
+    - `tests/test_worker.py` (P0.8c): JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -213,6 +214,18 @@ The layer sits above the core; the core never imports it (only `cli` does), and 
   - dose: effective values and locked fields (`resolve_effective`, `ECLIPSE_LOCKED`), targets, Rx, levels, ROI names (`rtstruct_writer.planned_roi_names`), fine grid with a memory estimate (`DOSE.GRID_TOO_LARGE` above `dose.MAX_FINE_VOXELS`, `SYSTEM.MEMORY_LOW` against free RAM) and the Eclipse sources. Errors carry the field they belong to (`target`, `rx`, `isodose`, `eclipse_values`, `append_csv`, `grid_mm`).
   - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`).
 - **Result layout:** the CT-only transform writes `<out>/CT/` plus `visualization_3d.html`, so every transform result is again a case folder.
+- **Jobs (`api/jobs.py`, P0.8c):** a `Job` is a JSON file (workflow, settings, selection, output). `execute_job` works in four steps:
+  1. validate, writing nothing on errors (exit 2);
+  2. run in `<root>/.stg<job_id>` with `run.log` and `run.json`;
+  3. commit with `os.replace`, retrying on locked files; `overwrite` swaps the old folder out via `.old*`;
+  4. run the workflow's `after_commit` hook, e.g. the collection CSV rows.
+
+  `cleanup_staging` removes orphaned `.stg*`/`.old*` folders; `run_job_inprocess` runs a job without a worker.
+- **Worker (`api/worker.py`, `dfm worker --job JOB.json`):** one job per process.
+  - Events are JSON lines on a duplicate of fd 1: hello, stage, progress, log, issue, artifact, heartbeat, result. fd 1 then points to stderr, so `print` in the core becomes `log`.
+  - Exit codes are 0/2/3/1.
+  - Cancel works through the file `<job>.cancel` (`cancel_file`), polled in `check_cancel`. A hard kill is also safe: the app deletes the staging folder.
+  - **Never read stdin in the worker.** On Windows, a thread blocked reading a stdin pipe makes every `GetFileType(stdin)` wait. DLLs call that while loading (numpy/OpenBLAS), under the loader lock, so the worker hangs at the first import and even `os._exit` hangs. QProcess always gives the child a stdin pipe.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
