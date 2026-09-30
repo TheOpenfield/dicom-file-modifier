@@ -598,10 +598,10 @@ def _assemble_html(title: str, header: str, table: str, figs: list, out_path: Pa
 
 def _render_png(art, specs: list, ct: Optional[CtWindow], curves: dict, target_rings: dict,
                 kji: tuple, title: str, out_path: Path) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    # OO-API statt pyplot (Plan P0.7): kein globaler Zustand, kein Backend-Wechsel
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
 
     grid, rx = art.grid, float(art.rx_gy)
@@ -639,7 +639,9 @@ def _render_png(art, specs: list, ct: Optional[CtWindow], curves: dict, target_r
         ylo, yhi = min(ylo, ct.y[0] - ct.dy / 2), max(yhi, ct.y[-1] + ct.dy / 2)
         zlo, zhi = min(zlo, ct.z[0] - ct.dz / 2), max(zhi, ct.z[-1] + ct.dz / 2)
 
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6.5), gridspec_kw={"width_ratios": [1, 1, 1, 1.15]})
+    fig = Figure(figsize=(24, 6.5))
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(1, 4, gridspec_kw={"width_ratios": [1, 1, 1, 1.15]})
 
     # --- Axial (x-y bei z = gz[k0]) ---
     ax = axes[0]
@@ -748,7 +750,6 @@ def _render_png(art, specs: list, ct: Optional[CtWindow], curves: dict, target_r
     fig.suptitle(title, fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0.07, 1, 0.95))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

@@ -1038,7 +1038,7 @@ The heatmap and lollipop layouts are chosen to stay readable at ~40 structures a
 
 ### Matplotlib Backend
 
-`matplotlib.use("Agg")` is set at module level so the visualizer can run on headless servers (e.g., CI pipelines, remote compute nodes) without an X display. All output is written to files; no interactive window is opened.
+The plots use matplotlib's object-oriented API: every figure is a `matplotlib.figure.Figure` with its own Agg canvas, and pyplot is never imported. Importing the visualizer therefore does not switch the global matplotlib backend, and there is no global figure state. The plots run on headless machines (CI, remote nodes, a background worker) and in several threads. All output is written to files; no window is opened. `run_visualization` returns which plots were written and which were skipped, and why.
 
 ---
 

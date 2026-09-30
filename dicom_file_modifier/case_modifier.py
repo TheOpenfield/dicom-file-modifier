@@ -61,7 +61,8 @@ from . import modifier as mod
 # Seit P0.6 in modifier; hier weiter importierbar (alte Importpfade)
 from .modifier import load_ct_headers, validate_ct_geometry
 # Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
-from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references
+from .dicom_utils import (_label_with_suffix, _truncate, find_point_markers,
+                          get_rs_frame_of_references)
 from .issues import Issue, UserInputError
 
 VERIFY_THRESHOLD_MM = 1e-3      # --verify: max. Centroid-Abweichung fuer PASS
@@ -554,34 +555,6 @@ def transform_rtstruct(
 # ---------------------------------------------------------------------------
 # Marker / Rotationszentrum (Stage 3)
 # ---------------------------------------------------------------------------
-
-def find_point_markers(rs_ds: pydicom.Dataset) -> list[tuple[str, np.ndarray]]:
-    """
-    Liefert ``[(roi_name, position_lps), ...]`` fuer alle ROIs, deren
-    ``ROIContourSequence`` mindestens eine POINT-Type-Kontur enthaelt.
-    Reihenfolge entspricht der ``StructureSetROISequence``.
-    """
-    if not hasattr(rs_ds, "StructureSetROISequence"):
-        return []
-    name_map = {int(r.ROINumber): str(r.ROIName) for r in rs_ds.StructureSetROISequence}
-
-    markers: list[tuple[str, np.ndarray]] = []
-    if not hasattr(rs_ds, "ROIContourSequence"):
-        return markers
-    for rc in rs_ds.ROIContourSequence:
-        if not hasattr(rc, "ContourSequence"):
-            continue
-        for c in rc.ContourSequence:
-            if str(getattr(c, "ContourGeometricType", "")) != "POINT":
-                continue
-            pts = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
-            if pts.shape[0] == 0:
-                continue
-            roi_num = int(getattr(rc, "ReferencedROINumber", -1))
-            markers.append((name_map.get(roi_num, f"ROI#{roi_num}"), pts[0].copy()))
-            break  # erster POINT je ROI reicht
-    return markers
-
 
 def print_marker_table(markers: list[tuple[str, np.ndarray]]) -> None:
     """Druckt eine kompakte Tabelle aller POINT-Marker."""

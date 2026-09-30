@@ -26,6 +26,8 @@ Benötigte Packages:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import json
 import re
 import sys
@@ -41,9 +43,51 @@ from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 
+from .dicom_utils import find_point_markers, get_rs_frame_of_references
+from .issues import Issue
+
 # Fester Zufallsgenerator: Distanz-/Subsample-Operationen sollen reproduzierbar
 # sein (vorher unverseedetes np.random.choice -> nicht-deterministische QA-Werte).
-_RNG = np.random.default_rng(0)
+# ``analyze_rtstruct`` setzt je Lauf einen frischen Generator (Seed 0): ein
+# langlebiger Prozess (Worker/GUI) liefert dann dieselben Zahlen wie ein
+# frischer CLI-Aufruf.  Ausserhalb eines Laufs gilt ein Generator je Kontext.
+_RNG_VAR: contextvars.ContextVar = contextvars.ContextVar("analyzer_rng", default=None)
+# Waehrend ``analyze_rtstruct``: Sammelliste fuer Befunde und die aktuelle ROI
+_ISSUES_VAR: contextvars.ContextVar = contextvars.ContextVar("analyzer_issues", default=None)
+_ROI_VAR: contextvars.ContextVar = contextvars.ContextVar("analyzer_roi", default="")
+
+
+def _rng() -> np.random.Generator:
+    rng = _RNG_VAR.get()
+    if rng is None:
+        rng = np.random.default_rng(0)
+        _RNG_VAR.set(rng)
+    return rng
+
+
+def _note(level: str, code: str, message: str, exc: Optional[BaseException] = None) -> None:
+    """Befund des laufenden ``analyze_rtstruct`` sammeln (ausserhalb: verworfen)."""
+    sink = _ISSUES_VAR.get()
+    if sink is None:
+        return
+    roi = _ROI_VAR.get()
+    sink.append(Issue(level, code, f"{roi}: {message}" if roi else message,
+                      detail=f"{type(exc).__name__}: {exc}" if exc is not None else ""))
+
+
+@contextlib.contextmanager
+def _roi_context(name: str):
+    token = _ROI_VAR.set(name)
+    try:
+        yield
+    finally:
+        _ROI_VAR.reset(token)
+
+
+def parse_name_list(spec: Optional[str]) -> Optional[list]:
+    """``"PTV, GTV"`` -> ``["PTV", "GTV"]`` (getrimmt, leere Eintraege entfallen); leer -> None."""
+    names = [t.strip() for t in (spec or "").split(",") if t.strip()]
+    return names or None
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +264,15 @@ def _contour_polygon(pts: np.ndarray):
         if not poly.is_valid:
             try:
                 poly = _polygonal(make_valid(poly))
-            except Exception:
+            except Exception as e:
+                _note("info", "ANA.CONTOUR_REPAIR_FALLBACK",
+                      "ungueltige Kontur mit buffer(0) statt make_valid repariert", e)
                 poly = poly.buffer(0)
         if poly.is_empty or poly.area <= 0:
             return None
         return poly
-    except Exception:
+    except Exception as e:
+        _note("warning", "ANA.CONTOUR_DROPPED", "Kontur nicht auswertbar und uebergangen", e)
         return None
 
 
@@ -300,7 +347,9 @@ def _slice_geometries(contours: list[np.ndarray]) -> list[tuple[float, object]]:
             continue
         try:
             geom = _slice_geometry(polys)
-        except Exception:
+        except Exception as e:
+            _note("warning", "ANA.SLICE_SKIPPED",
+                  f"Schicht z={z:.2f} mm nicht kombinierbar (XOR) und uebergangen", e)
             continue
         if geom.is_empty or geom.area <= 0:      # z.B. Selbst-XOR -> leer
             continue
@@ -407,7 +456,8 @@ def rasterize_contours(contours: list[np.ndarray], xc: np.ndarray,
         try:
             inside = MplPath(pts[:, :2]).contains_points(
                 np.column_stack([gx.ravel(), gy.ravel()]))
-        except Exception:
+        except Exception as e:
+            _note("warning", "ANA.RASTER_CONTOUR_SKIPPED", f"Kontur bei z={z:.2f} mm beim Rastern uebergangen", e)
             continue
         mask[k, j0:j1, i0:i1] ^= inside.reshape(j1 - j0, i1 - i0)
     return mask
@@ -428,7 +478,9 @@ def _rasterize_structure(contours: list[np.ndarray],
     """
     try:
         import matplotlib.path  # noqa: F401  (nur Verfügbarkeit prüfen)
-    except Exception:
+    except Exception as e:
+        _note("warning", "ANA.RASTER_UNAVAILABLE",
+              "matplotlib.path fehlt; Formmetriken nur aus der konvexen Huelle", e)
         return None
 
     all_pts = contours_to_points(contours)
@@ -495,7 +547,8 @@ def _voxel_shape_metrics(contours: list[np.ndarray],
     try:
         from scipy import ndimage
         out["n_components"] = int(ndimage.label(mask)[1])
-    except Exception:
+    except Exception as e:
+        _note("warning", "ANA.COMPONENTS_FAILED", "Zusammenhangskomponenten nicht bestimmbar (als 1 gezaehlt)", e)
         out["n_components"] = 1
 
     # Oberfläche via Marching Cubes (gleiche Maske wie V) -> Sphärizität ≤ 1
@@ -508,7 +561,8 @@ def _voxel_shape_metrics(contours: list[np.ndarray],
         area = float(skmeasure.mesh_surface_area(verts, faces))
         if area > 0:
             sph = (np.pi ** (1 / 3) * (6 * v_mask) ** (2 / 3)) / area
-    except Exception:
+    except Exception as e:
+        _note("warning", "ANA.SURFACE_FAILED", "Oberflaeche (Marching Cubes) nicht bestimmbar; keine Sphaerizitaet", e)
         sph = None
     if sph is not None:
         out["sphericity"] = round(float(min(sph, 1.0)), 4)
@@ -522,8 +576,8 @@ def _voxel_shape_metrics(contours: list[np.ndarray],
         v_hull = float(ConvexHull(all_pts).volume)
         if v_hull > 0:
             out["solidity"] = round(float(min(v_mask / v_hull, 1.0)), 4)
-    except Exception:
-        pass
+    except Exception as e:
+        _note("warning", "ANA.HULL_FAILED", "konvexe Huelle nicht bestimmbar; keine Soliditaet", e)
 
     return out
 
@@ -570,8 +624,8 @@ def compute_shape_metrics(contours: list[np.ndarray], volume_cm3: float) -> dict
         hull = ConvexHull(all_pts)
         hv = all_pts[hull.vertices]
         metrics["max_diameter_mm"] = round(float(pdist(hv).max()), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        _note("warning", "ANA.HULL_FAILED", "konvexe Huelle nicht bestimmbar; kein max. Durchmesser", e)
 
     # Beschränkte Sphärizität/Solidität + #Komponenten aus konsistenter Voxelmaske
     voxel = _voxel_shape_metrics(contours, all_pts)
@@ -593,8 +647,8 @@ def compute_shape_metrics(contours: list[np.ndarray], volume_cm3: float) -> dict
             if hull.volume > 0:
                 metrics["solidity"] = round(float(min(volume_mm3 / hull.volume, 1.0)), 4)
             metrics["n_components"] = 1
-        except Exception:
-            pass
+        except Exception as e:
+            _note("warning", "ANA.HULL_FAILED", "konvexe Huelle nicht bestimmbar; keine Ersatz-Formmetriken", e)
 
     # Elongation via PCA (Verhältnis größte/kleinste Hauptachse)
     try:
@@ -605,8 +659,8 @@ def compute_shape_metrics(contours: list[np.ndarray], volume_cm3: float) -> dict
             metrics["elongation"] = round(
                 np.sqrt(eigenvalues[0] / eigenvalues[-1]), 4
             )
-    except Exception:
-        pass
+    except Exception as e:
+        _note("warning", "ANA.ELONGATION_FAILED", "Elongation (Hauptachsen) nicht bestimmbar", e)
 
     return metrics
 
@@ -626,7 +680,9 @@ def _cap_points(pts: np.ndarray, cap: int) -> np.ndarray:
     exakt; nur bei > cap Punkten wird mit festem Seed ausgedünnt.
     """
     if len(pts) > cap:
-        idx = _RNG.choice(len(pts), cap, replace=False)
+        _note("info", "ANA.POINTS_CAPPED",
+              f"Punktwolke fuer Abstaende von {len(pts)} auf {cap} Punkte ausgeduennt (angenaehert)")
+        idx = _rng().choice(len(pts), cap, replace=False)
         return pts[idx]
     return pts
 
@@ -748,12 +804,145 @@ def analyze_structure(ds: pydicom.Dataset, roi_number: int, roi_name: str,
     }
 
 
+def _load(source) -> pydicom.Dataset:
+    return source if isinstance(source, pydicom.Dataset) else load_rtstruct(str(source))
+
+
+def analyze_rtstruct(source, target_names: Optional[list[str]] = None,
+                     oar_names: Optional[list[str]] = None) -> tuple:
+    """
+    Stiller Kern von ``run_analysis`` (druckt nichts).
+
+    ``source`` ist ein Pfad oder ein geladenes RTSTRUCT.  Rueckgabe
+    ``(results, info)``: ``results`` genau wie ``run_analysis`` (Grundlage des
+    JSON), ``info`` mit ``names``, ``types``, ``categories``, den gewaehlten
+    ROI-Nummern (``target_nums``, ``oar_nums``, ``helper_nums``), der
+    Analysereihenfolge ``analyzed`` (``[(abschnitt, ergebnis), ...]``, auch bei
+    doppelten ROI-Namen vollstaendig) und ``issues``: still behandelte
+    Geometriefehler und ausgeduennte Punktwolken als ``Issue``; die Werte
+    selbst aendern sich dadurch nicht.  Die Zufallszahlen starten je Aufruf
+    neu (Seed 0), wie in einem frischen Prozess.
+    """
+    ds = _load(source)
+    names = get_structure_names(ds)
+    types = get_structure_type(ds)
+    issues: list = []
+    tokens = (_RNG_VAR.set(np.random.default_rng(0)), _ISSUES_VAR.set(issues))
+    try:
+        # Strukturen klassifizieren (kategoriebasiert; Name-Override per --targets/--oars)
+        geom_types = get_structure_geom_types(ds)
+        categories = {
+            num: classify_structure(nm, types.get(num, ""), geom_types.get(num, set()))
+            for num, nm in names.items()
+        }
+
+        def _name_matches(nm, patterns):
+            return any(p.lower() in nm.lower() for p in patterns)
+
+        if target_names:
+            target_nums = {n for n, nm in names.items()
+                           if _name_matches(nm, target_names)
+                           and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
+        else:
+            target_nums = {n for n, c in categories.items() if c == CAT_TARGET}
+
+        if oar_names:
+            oar_nums = {n for n, nm in names.items()
+                        if _name_matches(nm, oar_names)
+                        and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
+        else:
+            oar_nums = {n for n, c in categories.items()
+                        if c in (CAT_OAR_SERIAL, CAT_OAR_PARALLEL)}
+
+        helper_nums = {n for n, c in categories.items()
+                       if c == CAT_HELPER and n not in target_nums and n not in oar_nums}
+
+        def _subtype(num):
+            c = categories[num]
+            return "serial" if c == CAT_OAR_SERIAL else ("parallel" if c == CAT_OAR_PARALLEL else None)
+
+        results = {"targets": {}, "oars": {}, "helpers": {}, "distances": [], "meta": {}}
+        analyzed = []
+        for section, nums in (("targets", target_nums), ("oars", oar_nums), ("helpers", helper_nums)):
+            for roi_num in sorted(nums):
+                roi_name = names[roi_num]
+                with _roi_context(roi_name):
+                    if section == "oars":
+                        r = analyze_structure(ds, roi_num, roi_name, category=categories[roi_num],
+                                              oar_subtype=_subtype(roi_num))
+                    else:
+                        r = analyze_structure(ds, roi_num, roi_name,
+                                              category=categories[roi_num] if section == "targets"
+                                              else CAT_HELPER)
+                results[section][roi_name] = r
+                analyzed.append((section, r))
+
+        # Meta-Informationen (Kategorie-Zählungen, Marker/External nur vermerken)
+        from collections import Counter
+        results["meta"] = {
+            "category_counts": dict(Counter(categories.values())),
+            "external_names": [names[n] for n, c in categories.items() if c == CAT_EXTERNAL],
+            "marker_count": sum(1 for c in categories.values() if c == CAT_MARKER),
+        }
+
+        # --------------------------------------------------------------
+        # Abstände: klinisch relevante Paare (Target↔OAR + GTV↔PTV derselben
+        # Läsion) statt aller C(n,2)-Kombinationen inkl. Containment-Artefakte.
+        # --------------------------------------------------------------
+        target_items = list(results["targets"].items())
+        oar_items = list(results["oars"].items())
+
+        pairs = []  # (name_a, ra, name_b, rb, pair_type)
+        for tn, tr in target_items:
+            for on, orr in oar_items:
+                pairs.append((tn, tr, on, orr, "target-oar"))
+        # GTV↔PTV derselben Läsion (Margin-Check)
+        by_key: dict = {}
+        for tn, tr in target_items:
+            key = tr.get("lesion_key")
+            if key:
+                by_key.setdefault(key, {})[tn.split("_")[0].upper()] = (tn, tr)
+        for key, d in by_key.items():
+            if "GTV" in d and "PTV" in d:
+                (an, ar), (bn, br) = d["GTV"], d["PTV"]
+                pairs.append((an, ar, bn, br, "gtv-ptv"))
+
+        for name_a, ra, name_b, rb, ptype in pairs:
+            with _roi_context(f"{name_a} <-> {name_b}"):
+                d = pair_distances(ra["all_points"], rb["all_points"])
+            results["distances"].append({
+                "structure_a": name_a,
+                "structure_b": name_b,
+                "category_a": ra.get("category"),
+                "category_b": rb.get("category"),
+                "oar_subtype": rb.get("oar_subtype"),
+                "pair_type": ptype,
+                "min_distance_mm": round(d["min"], 2),
+                "hd95_mm": round(d["hd95"], 2),
+                "hausdorff_distance_mm": round(d["hausdorff"], 2),
+                "assd_mm": round(d["assd"], 2),
+                "centroid_distance_mm": round(centroid_distance(
+                    np.array(ra["centroid_mm"]), np.array(rb["centroid_mm"])), 2),
+            })
+        results["distances"].sort(key=lambda e: e["min_distance_mm"])
+    finally:
+        _RNG_VAR.reset(tokens[0])
+        _ISSUES_VAR.reset(tokens[1])
+
+    info = {"names": names, "types": types, "categories": categories,
+            "target_nums": target_nums, "oar_nums": oar_nums, "helper_nums": helper_nums,
+            "analyzed": analyzed, "issues": issues}
+    return results, info
+
+
 def run_analysis(filepath: str,
                  target_names: Optional[list[str]] = None,
                  oar_names: Optional[list[str]] = None,
                  list_only: bool = False) -> dict:
     """
     Hauptfunktion: Lädt RTSTRUCT, analysiert Strukturen, berechnet Abstände.
+
+    Druckschicht um ``analyze_rtstruct`` (gleiche Ausgabe wie bisher).
 
     Parameters
     ----------
@@ -790,126 +979,32 @@ def run_analysis(filepath: str,
     if list_only:
         return {"structures": names, "types": types}
 
-    # Strukturen klassifizieren (kategoriebasiert; Name-Override per --targets/--oars)
-    geom_types = get_structure_geom_types(ds)
-    categories = {
-        num: classify_structure(nm, types.get(num, ""), geom_types.get(num, set()))
-        for num, nm in names.items()
-    }
+    results, info = analyze_rtstruct(ds, target_names, oar_names)
 
-    def _name_matches(nm, patterns):
-        return any(p.lower() in nm.lower() for p in patterns)
-
-    if target_names:
-        target_nums = {n for n, nm in names.items()
-                       if _name_matches(nm, target_names)
-                       and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
-    else:
-        target_nums = {n for n, c in categories.items() if c == CAT_TARGET}
-
-    if oar_names:
-        oar_nums = {n for n, nm in names.items()
-                    if _name_matches(nm, oar_names)
-                    and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
-    else:
-        oar_nums = {n for n, c in categories.items()
-                    if c in (CAT_OAR_SERIAL, CAT_OAR_PARALLEL)}
-
-    helper_nums = {n for n, c in categories.items()
-                   if c == CAT_HELPER and n not in target_nums and n not in oar_nums}
-
-    if not target_nums:
+    if not info["target_nums"]:
         print("\n(!) Keine Zielgebiete gefunden. Verwende --targets um Namen anzugeben.")
-    if not oar_nums:
+    if not info["oar_nums"]:
         print("(!) Keine Risikoorgane gefunden. Verwende --oars um Namen anzugeben.")
 
-    def _subtype(num):
-        c = categories[num]
-        return "serial" if c == CAT_OAR_SERIAL else ("parallel" if c == CAT_OAR_PARALLEL else None)
-
-    results = {"targets": {}, "oars": {}, "helpers": {}, "distances": [], "meta": {}}
-
-    print(f"\n{'=' * 60}")
-    print("ZIELGEBIETE")
-    print(f"{'=' * 60}")
-    for roi_num in sorted(target_nums):
-        roi_name = names[roi_num]
-        r = analyze_structure(ds, roi_num, roi_name, category=categories[roi_num])
-        results["targets"][roi_name] = r
-        _print_structure(r)
-
-    print(f"\n{'=' * 60}")
-    print("RISIKOORGANE")
-    print(f"{'=' * 60}")
-    for roi_num in sorted(oar_nums):
-        roi_name = names[roi_num]
-        r = analyze_structure(ds, roi_num, roi_name,
-                              category=categories[roi_num], oar_subtype=_subtype(roi_num))
-        results["oars"][roi_name] = r
-        _print_structure(r)
-
-    if helper_nums:
-        print(f"\n{'=' * 60}")
-        print("HILFS-/PLANUNGSSTRUKTUREN  (Formmetriken nur eingeschränkt aussagekräftig)")
-        print(f"{'=' * 60}")
-        for roi_num in sorted(helper_nums):
-            roi_name = names[roi_num]
-            r = analyze_structure(ds, roi_num, roi_name, category=CAT_HELPER)
-            results["helpers"][roi_name] = r
-            _print_structure(r)
-
-    # Meta-Informationen (Kategorie-Zählungen, Marker/External nur vermerken)
-    from collections import Counter
-    results["meta"] = {
-        "category_counts": dict(Counter(categories.values())),
-        "external_names": [names[n] for n, c in categories.items() if c == CAT_EXTERNAL],
-        "marker_count": sum(1 for c in categories.values() if c == CAT_MARKER),
+    headers = {
+        "targets": "ZIELGEBIETE",
+        "oars": "RISIKOORGANE",
+        "helpers": "HILFS-/PLANUNGSSTRUKTUREN  (Formmetriken nur eingeschränkt aussagekräftig)",
     }
+    for section in ("targets", "oars", "helpers"):
+        if section == "helpers" and not info["helper_nums"]:
+            continue
+        print(f"\n{'=' * 60}")
+        print(headers[section])
+        print(f"{'=' * 60}")
+        for sec, r in info["analyzed"]:
+            if sec == section:
+                _print_structure(r)
 
-    # ------------------------------------------------------------------
-    # Abstände: klinisch relevante Paare (Target↔OAR + GTV↔PTV derselben Läsion)
-    # statt aller C(n,2)-Kombinationen inkl. Containment-Artefakte.
-    # ------------------------------------------------------------------
-    target_items = list(results["targets"].items())
-    oar_items = list(results["oars"].items())
-
-    pairs = []  # (name_a, ra, name_b, rb, pair_type)
-    for tn, tr in target_items:
-        for on, orr in oar_items:
-            pairs.append((tn, tr, on, orr, "target-oar"))
-    # GTV↔PTV derselben Läsion (Margin-Check)
-    by_key: dict = {}
-    for tn, tr in target_items:
-        key = tr.get("lesion_key")
-        if key:
-            by_key.setdefault(key, {})[tn.split("_")[0].upper()] = (tn, tr)
-    for key, d in by_key.items():
-        if "GTV" in d and "PTV" in d:
-            (an, ar), (bn, br) = d["GTV"], d["PTV"]
-            pairs.append((an, ar, bn, br, "gtv-ptv"))
-
-    if pairs:
+    if results["distances"]:
         print(f"\n{'=' * 60}")
         print("ABSTÄNDE  (Target<->OAR und GTV<->PTV, aufsteigend nach Min-Abstand)")
         print(f"{'=' * 60}")
-        for name_a, ra, name_b, rb, ptype in pairs:
-            d = pair_distances(ra["all_points"], rb["all_points"])
-            results["distances"].append({
-                "structure_a": name_a,
-                "structure_b": name_b,
-                "category_a": ra.get("category"),
-                "category_b": rb.get("category"),
-                "oar_subtype": rb.get("oar_subtype"),
-                "pair_type": ptype,
-                "min_distance_mm": round(d["min"], 2),
-                "hd95_mm": round(d["hd95"], 2),
-                "hausdorff_distance_mm": round(d["hausdorff"], 2),
-                "assd_mm": round(d["assd"], 2),
-                "centroid_distance_mm": round(centroid_distance(
-                    np.array(ra["centroid_mm"]), np.array(rb["centroid_mm"])), 2),
-            })
-
-        results["distances"].sort(key=lambda e: e["min_distance_mm"])
         print(f"{'Struktur A':<24} {'Struktur B':<20} {'Min':>7} {'HD95':>7} "
               f"{'Haus':>7} {'ASSD':>7} {'Zentr':>7}")
         print("-" * 84)
@@ -920,6 +1015,48 @@ def run_analysis(filepath: str,
                   f"{e['centroid_distance_mm']:>7.2f}")
 
     return results
+
+
+def inspect_rtstruct(source, volumes: bool = True) -> dict:
+    """
+    Schnelle Uebersicht fuer eine Oberflaeche, ohne Formmetriken und Abstaende
+    und ohne Ausgabe: ROI-Tabelle (Nummer, Name, DICOM-Typ, Kategorie,
+    Konturtypen, Konturzahl, planimetrisches Volumen, Anzeigefarbe, Marker),
+    POINT-Marker mit Position, referenzierte FrameOfReferenceUIDs sowie Label,
+    Name und Datum des Structure Sets.  ``volumes=False`` spart die
+    Volumenberechnung.
+    """
+    ds = _load(source)
+    names = get_structure_names(ds)
+    types = get_structure_type(ds)
+    geoms = get_structure_geom_types(ds)
+    colors = {}
+    for rc in ds.get("ROIContourSequence", []):
+        col = rc.get("ROIDisplayColor")
+        if col is not None and len(col) == 3:
+            colors[int(rc.ReferencedROINumber)] = [int(v) for v in col]
+    rois = []
+    for num, name in sorted(names.items()):
+        g = geoms.get(num, set())
+        category = classify_structure(name, types.get(num, ""), g)
+        contours = extract_contours(ds, num)
+        rois.append({
+            "number": int(num), "name": name, "rt_type": types.get(num, ""), "category": category,
+            "geometric_types": sorted(t for t in g if t),
+            "n_contours": len(contours),
+            "volume_cm3": round(compute_volume(contours), 3) if volumes else None,
+            "color": colors.get(num),
+            "is_marker": category == CAT_MARKER,
+        })
+    return {
+        "file": None if isinstance(source, pydicom.Dataset) else Path(source).name,
+        "structure_set_label": str(ds.get("StructureSetLabel", "")),
+        "structure_set_name": str(ds.get("StructureSetName", "")),
+        "structure_set_date": str(ds.get("StructureSetDate", "")),
+        "frame_of_reference_uids": sorted(get_rs_frame_of_references(ds)),
+        "rois": rois,
+        "markers": [{"name": n, "position_mm": [float(v) for v in p]} for n, p in find_point_markers(ds)],
+    }
 
 
 def _print_structure(r: dict):
@@ -1164,8 +1301,8 @@ Beispiele:
     if not args.file:
         parser.error("file ist erforderlich (außer mit --self-test)")
 
-    target_list = args.targets.split(",") if args.targets else None
-    oar_list = args.oars.split(",") if args.oars else None
+    target_list = parse_name_list(args.targets)
+    oar_list = parse_name_list(args.oars)
 
     results = run_analysis(
         filepath=args.file,
