@@ -23,8 +23,8 @@ Verwendung:
   python -m dicom_file_modifier.visualizer <rtstruct.dcm> [Optionen]
 
 Beispiele:
-  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm --output output/
-  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm \\
+  python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm --output output/
+  python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm \\
       --targets PTV,CTV --oars Parotis,Blase --output output/
 """
 
@@ -1189,7 +1189,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Beispiele:\n"
-            "  python -m dicom_file_modifier.visualizer data/0000000171/test/1.dcm\n"
+            "  python -m dicom_file_modifier.visualizer data/<case-id>/RS.dcm\n"
             "  python -m dicom_file_modifier.visualizer data/rtstruct.dcm "
             "--targets PTV,CTV --oars Parotis --output output/plots\n"
         ),

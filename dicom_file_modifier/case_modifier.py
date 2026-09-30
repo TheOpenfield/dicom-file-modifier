@@ -34,10 +34,10 @@ Verwendung (Stage 1):
 
 Beispiele:
   # Identitaets-Lauf (nur UID-Refresh, gut zum Verifizieren)
-  python -m dicom_file_modifier.case_modifier data/0000000171
+  python -m dicom_file_modifier.case_modifier data/<case-id>
 
   # Reale Transformation (Stage 1 transformiert nur das CT)
-  python -m dicom_file_modifier.case_modifier data/0000000171 \
+  python -m dicom_file_modifier.case_modifier data/<case-id> \
       --tx 10 --ty 0 --tz -5 --rx 0 --ry 0 --rz 15 --output output/run1
 """
 
@@ -969,8 +969,8 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Beispiele:\n"
-            "  python -m dicom_file_modifier.case_modifier data/0000000171\n"
-            "  python -m dicom_file_modifier.case_modifier data/0000000171 "
+            "  python -m dicom_file_modifier.case_modifier data/<case-id>\n"
+            "  python -m dicom_file_modifier.case_modifier data/<case-id> "
             "--tx 10 --rz 15\n"
         ),
     )

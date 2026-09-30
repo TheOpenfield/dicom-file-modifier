@@ -25,10 +25,10 @@ Verwendung:
 
 Beispiele:
   # 10 mm nach rechts verschieben + 15° um Z drehen, Ergebnis anzeigen
-  python -m dicom_file_modifier.modifier data/0000000171/CT --tx 10 --rz 15
+  python -m dicom_file_modifier.modifier data/<case-id>/CT --tx 10 --rz 15
 
   # Nur Metadaten, Output in eigenem Verzeichnis
-  python -m dicom_file_modifier.modifier data/0000000171/CT --ty -5 --rx 3 \\
+  python -m dicom_file_modifier.modifier data/<case-id>/CT --ty -5 --rx 3 \\
       --method metadata --output output/ct_meta
 """
 
@@ -555,7 +555,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Beispiel:\n"
-            "  python -m dicom_file_modifier.modifier data/0000000171/CT "
+            "  python -m dicom_file_modifier.modifier data/<case-id>/CT "
             "--tx 10 --rz 15\n"
         ),
     )

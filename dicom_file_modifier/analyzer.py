@@ -111,7 +111,7 @@ _HELPER_NAME_RE = re.compile(
 _HELPER_RT_TYPES = ("CONTROL", "DOSE_REGION")
 # Echte Zielvolumina: Name beginnt mit GTV/PTV/CTV/ITV (gefolgt von _ oder Ziffer)
 _TARGET_NAME_RE = re.compile(r"^(gtv|ptv|ctv|itv)[ _0-9]", re.IGNORECASE)
-# Läsions-Schlüssel zum Paaren von GTV mit seinem PTV (z.B. "01M_BM_frontal_li")
+# Läsions-Schlüssel zum Paaren von GTV mit seinem PTV (z.B. "GTV_1"/"PTV_1" -> "1")
 _LESION_KEY_RE = re.compile(r"^(?:gtv|ptv|ctv|itv)_(.+)$", re.IGNORECASE)
 
 
