@@ -41,7 +41,15 @@ dicom-file-modifier/
 │   ├── dose.py              # Dose-grid numerics library (RTDOSE, fine grid, sampling, DVH statistics)
 │   ├── dose_indices.py      # Dose index computation (CI/GI/HI), Eclipse comparison + reports
 │   ├── dose_viz.py          # Dose-index validation view (validation.html, dose_overview.png)
-│   └── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
+│   ├── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
+│   ├── demo.py              # Synthetic demo/test case (CT + RS + RP + RD, no patient data)
+│   ├── phantom.py           # Analytic geometry/dose models and closed-form expectations for demo.py
+│   └── _compat.py           # pydicom 2.x/3.x compatibility shims
+├── tools/
+│   ├── golden.py            # Golden-output harness (CLI parity before/after refactors and upgrades)
+│   ├── golden_rules.json    # Comparison tolerances for the migration mode
+│   ├── cli_surface.py       # argparse snapshot of every CLI (flags, defaults, choices, types)
+│   └── legacy/              # Pinned package list of the environment the baseline was recorded with
 ├── requirements.txt         # Python dependencies
 └── README.md                # This file
 ```
@@ -236,6 +244,37 @@ This produces `output/<case-id>_IDX/`:
 | `--output` | `output` | Base output directory |
 
 See [Dose Index Documentation](#dose-index-documentation) for the definitions, the grid conventions and the Eclipse comparison.
+
+### Synthetic Demo Case and Golden Tests
+
+`demo.py` writes a fully synthetic head-phantom case that every tool accepts, so the tools can be tried, tested and demonstrated without patient data:
+
+```bash
+# Standard case: CT/ subfolder, RS/RP/RD at the case root (Eclipse-style file names)
+python -m dicom_file_modifier.demo output/demo
+# Variants: flat export folder, extra beam doses or two plan doses, no DVH, RLE-compressed CT,
+# eclipse_ref.json with one or two targets
+python -m dicom_file_modifier.demo output/demo_flat --layout flat
+python -m dicom_file_modifier.demo output/demo_rle --rle --rd-set plan+2beams --eclipse-ref ptv1
+```
+
+The case is head-first supine: a water cylinder with a bone shell (CT 128 × 128 px at 2 mm, 80 slices at 1 mm). It contains the following:
+- two spherical PTVs with separated isodoses (PTV_1 R = 10 mm, 20 Gy; PTV_2 R = 6 mm, 18 Gy) and a GTV
+- serial and parallel OARs at known distances, an OAR with an XOR hole and a two-component OAR
+- a helper union, a CONTROL ring, two POINT markers and an empty ROI
+- an RTPLAN with both prescriptions
+- an RTDOSE with an analytic dose (one smooth Hill profile per target) and an Eclipse-style cumulative DVHSequence (targets, body, one OAR)
+
+UIDs are deterministic. `demo_expected.json` holds the closed-form reference values: TV, PIV (component and global), CI, GI, HI and D98/D50/D2 for the slab and Eclipse volume models, plus the planimetric structure volumes.
+
+`tools/golden.py` records the normalized outputs of all CLIs (43 synthetic scenarios including an argparse snapshot of every CLI, optionally local real cases) and compares two runs. The mode is `exact`, or `migration` with the tolerances in `tools/golden_rules.json`. It is the safety net for refactoring the CLI modules and for environment upgrades. Its work directory defaults to `%USERPROFILE%\dfm-golden`, outside the repository, because real-case runs contain patient data and must stay local.
+
+```bash
+python tools/golden.py make-inputs                 # generate the synthetic inputs once (+ SHA-256 manifest)
+python tools/golden.py run --label G0              # run all scenarios, write normalized snapshots
+python tools/golden.py run --label G0 --only "real*" --real data/<case-id>   # add local real cases
+python tools/golden.py compare G0 G1 --mode exact  # or --mode migration
+```
 
 ## Dependencies
 

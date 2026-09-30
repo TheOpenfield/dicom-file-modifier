@@ -1,0 +1,39 @@
+{
+  "_doc": [
+    "Vergleichsregeln fuer tools/golden.py compare.",
+    "Modus 'exact': alles muss nach der Normalisierung identisch sein (Refactoring-PRs nach dem Umgebungswechsel).",
+    "Modus 'migration': Toleranzen unten (Umgebungswechsel P0.2). Erste passende float_rule gewinnt;",
+    "ohne passende Regel gilt 1 Einheit der letzten gedruckten Stelle. Regeln filtern mit 'file' (Pfad im Lauf),",
+    "'key' (letzter Schluessel bzw. CSV-Spalte) oder 'path' (Punktpfad ohne Indizes); alles fnmatch.",
+    "Toleranzen liegen etwa 100x unter klinischer Relevanz und 10-100x ueber Rechenrauschen."
+  ],
+  "migration": {
+    "float_rules": [
+      {"file": "*_analysis.json", "last_digit": true},
+      {"key": "*_cm3", "abs": 1e-4, "rel": 1e-4},
+      {"key": "ci_paddick", "abs": 2e-4},
+      {"key": "ci_rtog", "abs": 2e-4},
+      {"key": "dice", "abs": 2e-4},
+      {"key": "coverage", "abs": 2e-4},
+      {"key": "selectivity", "abs": 2e-4},
+      {"key": "hi_icru83", "rel": 2e-4},
+      {"key": "gi", "rel": 2e-4},
+      {"key": "gm_cm", "abs": 1e-3},
+      {"key": "*_gy", "abs": 1e-3},
+      {"key": "*_pct", "abs": 0.02},
+      {"path": "*ImagePositionPatient", "abs": 2e-6},
+      {"path": "*ImageOrientationPatient", "abs": 2e-6},
+      {"path": "ROIContourSequence.ContourSequence.ContourData", "last_digit": true}
+    ],
+    "pixel_rules": [
+      {"scenario": "mod_meta", "max_abs": 0, "max_frac": 0.0},
+      {"scenario": "cm_meta*", "max_abs": 0, "max_frac": 0.0},
+      {"scenario": "real*_cm_meta", "max_abs": 0, "max_frac": 0.0},
+      {"scenario": "mod_res_o0", "max_abs": 5000, "max_frac": 1e-5},
+      {"scenario": "*", "max_abs": 1, "max_frac": 1e-4}
+    ]
+  },
+  "expected_changes": {
+    "_doc": "Szenario -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet; Details im Bericht trotzdem pruefen. Eintrag erst mit dem jeweiligen PR aktivieren."
+  }
+}

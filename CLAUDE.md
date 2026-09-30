@@ -53,6 +53,14 @@ python -m dicom_file_modifier.dose_indices data/<case-id> --eclipse-compat high 
 python -m dicom_file_modifier.dose_indices data/<case-id> --list
 python -m dicom_file_modifier.dose_indices --self-test
 python -m dicom_file_modifier.rtstruct_writer --self-test
+
+# Synthetic demo case (CT + RS + RP + RD, no patient data; deterministic UIDs, demo_expected.json)
+python -m dicom_file_modifier.demo output/demo [--layout flat] [--rd-set plan+2beams|2plans] \
+    [--no-dvh] [--explicit-vr] [--rle] [--eclipse-ref ptv1|both] [--no-empty-roi] [--size medium]
+# Golden-output harness (CLI parity); work dir %USERPROFILE%\dfm-golden (outside the repo)
+python tools/golden.py make-inputs
+python tools/golden.py run --label G0 [--only PATTERN] [--real data/<case-id> ...]
+python tools/golden.py compare G0 G1 [--mode exact|migration] [--expected]
 ```
 
 `dose_indices` flags: `--target NAME[,NAME]` (default: PTVs classified as targets; a RTPLAN `DoseReferenceDescription` prefix narrows to one), `--rx GY` / `--rx-pct-of-max PCT` (default: RTPLAN `TargetPrescriptionDose`), `--isodose 100,50[,80,12Gy]`, `--grid {1.0,0.5,0.25,0.1}` (in-plane mm, default 0.25; z stays on the dose planes), `--dose-interp {linear,cubic}`, `--volume-model {slab,eclipse}` (eclipse = end slabs count half), `--piv-scope {global,component}` (default component: only the Rx-isodose component(s) overlapping the target), `--iso-contours {mask,field}`, `--eclipse-compat {high,default}` (sets grid = 1 or 2 CT pixels aligned to the CT pixel raster, eclipse volume model, global PIV, linear, field isolines, no simplification), `--label` (default `_IDX`), `--no-rs`, `--include-target`, `--simplify-mm`, `--transfer-syntax`, `--max-name-len`, `--append-csv PATH` (cross-case collection table; refuses a file with an older header), `--eclipse-ref PATH` (default `<case>/eclipse_ref.json` if present), `--eclipse-values "[NAME:]KEY=VAL,..."` (aliases TV/VRX/PIV/V50/CI/GI/HI/D98/...; `V<n>Gy` resolved via Rx), `--eclipse-tol-pct` (default 5; rows outside are marked `!` and listed as warnings, exit code unchanged), `--no-eclipse-dvh`, `--no-viz`, `--no-viz-ct`.
@@ -61,11 +69,42 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no pytest suite, lint config, or build step in this repo. The only automated checks are `python -m dicom_file_modifier.analyzer --self-test` (synthetic geometry: XOR holes, keyhole contours, z-gaps), `python -m dicom_file_modifier.case_modifier <case> --self-test` (rigid-body round trip), `python -m dicom_file_modifier.dose_indices --self-test` (analytic sphere phantom with closed-form CI/GI/HI expectations) and `python -m dicom_file_modifier.rtstruct_writer --self-test` (mask → contour → RTSTRUCT round trip).
+There is no pytest suite, lint config, or build step in this repo yet. The only automated checks are:
+- `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
+- `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
+- `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
+- `python -m dicom_file_modifier.rtstruct_writer --self-test`: mask → contour → RTSTRUCT round trip.
+- The golden-output harness `tools/golden.py`.
+
+**Golden harness (`tools/golden.py`):**
+- It runs 43 scenarios as subprocesses on the demo variants, plus optional local real cases (`real<n>_*`, case folder name replaced by `REAL<n>`).
+- One scenario is `cli_surface`: `tools/cli_surface.py` captures every `main()` parser's options, dests, defaults, choices and types.
+- It writes normalized snapshots. UIDs become `UID<n>` by first occurrence; paths, timestamps and `tempfile` names become placeholders; DICOM is stored as a tag dump plus a pixel hash, and CT pixel arrays go to `arrays.npz`.
+- `compare --mode exact` is for refactoring PRs. `--mode migration` is for environment upgrades and uses the tolerances in `tools/golden_rules.json`.
+- Run it before and after every change to a CLI module. Scenarios tagged `known_bug` record current failures that later fixes are expected to change (`expected_changes` in the rules file).
+- The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
+- `tools/legacy/requirements-py38.txt` pins the pre-upgrade environment the baseline `G0` was recorded with.
 
 ## Architecture
 
-Five runnable modules plus three libraries. `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+Five runnable modules plus three libraries, and the synthetic test-case generator `demo` (with `phantom` and `_compat`). `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+
+### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
+`demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
+- **Contents:**
+  - CT: 128² px at 2 mm, 80 slices at 1 mm, unsigned 12-bit with intercept −1024.
+  - RS: 14 ROIs incl. `Rückenmark` (ISO_IR 100), an XOR-hole OAR, a two-component OAR, `h_PTV_gesamt` typed PTV, a CONTROL ring, POINT markers `HS1`/`Iso` and an empty ROI.
+  - RP: two DoseReferences, PTV_1 20 Gy and PTV_2 18 Gy.
+  - RD: 1 mm grid, uint32 at `DoseGridScaling` 1e-6, relative GFOV, `DVHSequence` for PTV_1/PTV_2/BODY/Hirnstamm.
+- **File names** follow Eclipse (`CT.<uid>.dcm`, `RS.<uid>.dcm`, ...).
+- **UIDs** are deterministic via `generate_uid(PYDICOM_ROOT_UID, entropy_srcs=[seed, role, i])`.
+- **DS values** are formatted by `demo._ds` (≤ 16 chars, identical on pydicom 2/3); files are written through `_compat.dcmwrite_file_format`.
+- **`phantom.py`:**
+  - `HillField` gives one smooth dose field per target.
+  - `SphereTarget.expected` computes closed-form slab/eclipse values and PIV/PIV50 component vs global, neglecting cross-talk between the fields (< 0.02 Gy).
+  - `cumulative_dvh` builds a numeric DVH on a fine grid. The BODY DVH is sampled only inside the dose-grid box; outside it counts as 0 Gy, like a TPS.
+- **Validation:** the default case passes `validate_ct_geometry`, `validate_index_against_rs`, `dose_grid_from_dataset` (no warnings) and `read_dvh_sequence` (no notes). `dose_indices` reproduces `demo_expected.json` within ~1 %.
+- **Scope:** head-first only. Feet-first is out of scope for the tool.
 
 ### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` / `dose_viz.py` — dose indices
 Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → `build_eclipse_reference` / `compare_with_eclipse` (RTDOSE `DVHSequence` via `dose.read_dvh_sequence`, `eclipse_ref.json`, `--eclipse-values`; precedence cli > json > dvh, gaps filled by `derive_eclipse_values`) → RS export → `dose_viz.run_dose_visualization` (`validation.html` + `dose_overview.png`, wrapped in try/except like the RS export) → report/JSON/TXT/CSV.
@@ -121,5 +160,6 @@ This module also hosts the **case-transform visualisation** used by `case_modifi
 - `data/` and `output/` are gitignored — don't commit DICOM files or generated artifacts.
 - Assign a new `SOPInstanceUID` only via `modifier.set_sop_instance_uid`: it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
 - Some user-facing strings and argparse help text are in German; keep that consistent within each module rather than mixing languages.
+- Windows `MAX_PATH` (260): Eclipse-style input names (`RS.<64-char uid>.dcm`) plus deep output folders can exceed it. For example, `analyzer --output` writes `<stem>_analysis.json` and fails with `FileNotFoundError` under the long scratchpad path. Keep test and golden work dirs short.
 - The README contains substantial mathematical documentation (volume, sphericity, Hausdorff, affine math, interpolation orders) — consult it before changing the geometric formulas, since the implementations are derived from those exact definitions.
 - README math: write display equations as ` ```math ` fenced blocks, not `$$…$$`, and keep inline `$…$` free of backslash-punctuation (`\{`, `\|`, `\,`, `\;`, `\!`, `\\`; use `\lbrace`, `\lVert … \rVert` etc.). GitHub's Markdown parser strips those backslash escapes before MathJax runs, which silently corrupts or breaks the formula.
