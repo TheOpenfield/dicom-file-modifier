@@ -59,6 +59,10 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
     assert page.roi_table.rowCount() == len(page.info.rtstruct["rois"]) > 0
     assert "PTV_1" in page.preview_label.text()
     assert page.out_label.text().endswith(f"{demo.root.name}_STRUCT")
+    assert win.windowTitle().endswith(demo.root.name) and page.state.text.text().startswith("Bereit")
+    roles = {page.roi_table.item(i, 0).text(): page.roi_table.item(i, 4).text()
+             for i in range(page.roi_table.rowCount())}
+    assert roles["PTV_1"] == "Zielvolumen" and roles["Hirnstamm"] == "Risikoorgan"
 
     page.start_button.click()
     assert not page.start_button.isEnabled() and win.cancel_button.isVisible()
@@ -69,6 +73,9 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
     assert out == tmp_path / "results" / f"{demo.root.name}_STRUCT" and (out / "run.json").is_file()
     assert page.gallery.count() == sum(1 for p in out.glob("*.png")) > 0
     assert "statistics" in res["outputs"] and page.stats_view.toPlainText().strip()
+    assert "Zielvolumen" in page.summary_label.text() and page.runjson_button.isEnabled()
+    page.command_button.click()
+    assert QApplication.clipboard().text().startswith("dfm analyze")
     assert page.start_button.isEnabled() and not win.cancel_button.isVisible()
     assert page.out_label.text().endswith("_STRUCT_2")          # naechster Lauf in neuen Ordner
     assert "RTSTRUCT Analyse" in win.log.toPlainText()
@@ -98,9 +105,10 @@ def test_dose_page_end_to_end(app, demo, tmp_path):
     # ungueltige Isodosen: Feld rot umrandet, Start gesperrt
     iso = page.form.widget("isodose")
     iso.setText("100,abc")
-    assert not page.start_button.isEnabled() and "border" in iso.styleSheet()
+    assert not page.start_button.isEnabled() and page.form.error_fields() == {"isodose"}
+    assert page.state.text.text() == "Nicht startbar"
     page.form.set_settings(dose.Settings(viz=False))
-    assert page.start_button.isEnabled() and iso.styleSheet() == ""
+    assert page.start_button.isEnabled() and not page.form.error_fields()
 
     page.start_button.click()
     wait_until(app, lambda: page.last_result is not None)

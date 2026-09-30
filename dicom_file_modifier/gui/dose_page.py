@@ -9,13 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QSplitter, QVBoxLayout
+from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QTabWidget, QVBoxLayout
 
 from ..api import dose, selection
 from ..api.sysinfo import format_bytes
 from .page import WorkflowPage, names_text
-from .widgets import Gallery, SettingsForm, fill_table, make_table, open_path, report_view
+from .widgets import ImageViewer, SettingsForm, fill_table, make_table, open_path, report_view
 
 RX_SOURCE_DE = {"rtplan": "aus dem RTPLAN", "cli": "manuell", "pct_of_max": "in % von Dmax"}
 ECLIPSE_SOURCE_DE = {"dvh": "DVH der RTDOSE", "json": "eclipse_ref.json", "cli": "Eclipse-Werte",
@@ -30,8 +29,8 @@ def _short(name: str, n: int = 44) -> str:
     return name if len(name) <= n else name[:n - 1] + "…"
 
 
-def _num(v, digits: int) -> str:
-    return "–" if v is None else f"{v:.{digits}f}"
+def _num(v, digits: int):
+    return ("–", None) if v is None else (f"{v:.{digits}f}", v)
 
 
 def _eclipse_cell(t: dict) -> str:
@@ -68,12 +67,12 @@ class DosePage(WorkflowPage):
         self.viz_button.setEnabled(False)
         self.viz_button.clicked.connect(lambda: self._viz and open_path(self._viz))
         self._viz = None
-        self.gallery = Gallery()
+        self.gallery = ImageViewer()
         self.report = report_view()
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(self.gallery)
-        split.addWidget(self.report)
-        self.build([(inputs, 0)], form, [(self.metrics, 0), (split, 1)], buttons=[self.viz_button])
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.gallery, "Dosisübersicht")
+        self.tabs.addTab(self.report, "Bericht")
+        self.build([(inputs, 0)], form, [(self.metrics, 0), (self.tabs, 1)], buttons=[self.viz_button])
 
     def selection(self, case):
         self.files_label.clear()
@@ -158,3 +157,15 @@ class DosePage(WorkflowPage):
         txt = outputs.get("txt")
         if txt and (out / txt).is_file():
             self.report.setPlainText((out / txt).read_text(encoding="utf-8", errors="replace"))
+
+    def summary_text(self, result: dict) -> str:
+        s = result.get("summary") or {}
+        if not s:
+            return ""
+        n = len(s.get("targets", {}))
+        parts = [f"{n} Zielvolumen"]
+        if s.get("rx_gy") is not None:
+            parts.insert(0, f"Rx {s['rx_gy']:.2f} Gy")
+        if s.get("n_voxels"):
+            parts.append(f"Feingitter {s['n_voxels'] / 1e6:.1f} M Voxel")
+        return "  ·  ".join(parts)

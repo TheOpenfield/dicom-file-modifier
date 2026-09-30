@@ -240,10 +240,10 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `app.py` | `dfm gui [CASE]`; cleans up orphaned staging folders at start |
 | `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
 | `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
-| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, optional collapsible `advanced` fields), `IssueList`, `Gallery`, `make_table`/`fill_table`, `report_view` |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style), `StateLine`, `IssueList` (double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
-| `structures_page.py` | RS combo, ROI table, gallery and `statistics.txt` |
+| `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
 | `dose_page.py` | files and dose info, form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), metric table from `summary`, report, `dose_overview.png`, button for `validation.html` |
 
 `JobRunner` details:
@@ -255,7 +255,9 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 - `inspect` runs in the thread pool with a token, so stale results are dropped.
 - `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
 - The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
-- A page supplies `selection`, `on_inspected`, `check`, `clear_outputs` and `show_outputs`.
+- The result header has "Befehl kopieren" (`command_string`), `run.json` and the run line: duration plus the settings that differ from the defaults.
+- The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
+- A page supplies `selection`, `on_inspected`, `check`, `clear_outputs`, `show_outputs` and `summary_text`.
 
 The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fall".
 

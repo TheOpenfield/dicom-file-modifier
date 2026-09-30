@@ -1,22 +1,37 @@
 """
 Grundgeruest der Workflow-Seiten: Eingaben -> Einstellungen -> Pruefung ->
 Start -> Ergebnis.  Die Seite liefert ``api`` (Workflow-Modul), ``selection``,
-``on_inspected``, ``check`` und ``show_outputs``; Inspektion im Hintergrund,
-Pruefung bei jeder Aenderung, Lauf ueber das Hauptfenster (Worker).
+``on_inspected``, ``check``, ``clear_outputs``/``show_outputs`` und optional
+``summary_text``; Inspektion im Hintergrund, Pruefung bei jeder Aenderung,
+Lauf ueber das Hauptfenster (Worker).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                               QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+                               QScrollArea, QSplitter, QVBoxLayout, QWidget)
 
 from ..api import jobs as api_jobs
+from ..api.fields import command_string
 from ..api.issues import Issue, has_errors, issue_from_exception
 from ..api.outputs import OutputSpec
 from .jobs import run_in_background
-from .widgets import STATUS_DE, IssueList, breakable, open_path
+from .widgets import STATUS_DE, IssueList, StateLine, breakable, open_path
+
+# Laengster Dateiname unter dem Ergebnisordner (z.B. RS.<64-Zeichen-UID>_analysis.json)
+# plus Trenner: laengere Ordnerpfade stossen an MAX_PATH (260) von Windows
+LONGEST_FILE_NAME = 100
+MAX_PATH = 259
+
+
+def _value_text(v) -> str:
+    if isinstance(v, bool):
+        return "ja" if v else "nein"
+    if isinstance(v, (list, tuple)):
+        return ", ".join(map(str, v))
+    return "aus" if v is None else str(v)
 
 
 def names_text(names: list, limit: int = 8) -> str:
@@ -34,9 +49,11 @@ class WorkflowPage(QWidget):
     def __init__(self, main):
         super().__init__()
         self.main = main                # MainWindow
-        self.case = self.info = self.last_result = self.form = None
+        self.case = self.info = self.last_result = self.form = self._left = None
         self._token = 0
         self._running = self._ok = False
+        self._job_settings = None
+        self.state = StateLine()
         self.preview_label = QLabel("Kein Datensatz geöffnet.")
         self.preview_label.setWordWrap(True)
         self.out_label = QLabel()
@@ -45,12 +62,27 @@ class WorkflowPage(QWidget):
         self.issues.hide()
         self.start_button = QPushButton(self.start_text)
         self.start_button.setEnabled(False)
+        self.start_button.setMinimumHeight(34)
+        font = self.start_button.font()
+        font.setBold(True)
+        self.start_button.setFont(font)
         self.start_button.clicked.connect(self._start)
+
         self.status_label = QLabel("Noch kein Ergebnis.")
         self.status_label.setWordWrap(True)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.hide()
         self.open_button = QPushButton("Ordner öffnen")
-        self.open_button.setEnabled(False)
         self.open_button.clicked.connect(lambda: open_path(self.last_result["output_dir"]))
+        self.command_button = QPushButton("Befehl kopieren")
+        self.command_button.setToolTip("Gleichwertigen dfm-Befehl in die Zwischenablage kopieren")
+        self.command_button.clicked.connect(self._copy_command)
+        self.runjson_button = QPushButton("run.json")
+        self.runjson_button.setToolTip("Protokoll des Laufs: Versionen, Einstellungen, Eingaben mit UIDs")
+        self.runjson_button.clicked.connect(lambda: open_path(Path(self.last_result["output_dir"]) / "run.json"))
+        for b in (self.open_button, self.command_button, self.runjson_button):
+            b.setEnabled(False)
         self.result_issues = IssueList()
         self.result_issues.hide()
 
@@ -65,14 +97,15 @@ class WorkflowPage(QWidget):
         box = QGroupBox("Einstellungen")
         QVBoxLayout(box).addWidget(form)
         col.addWidget(box)
-        check = QGroupBox("Prüfung")
+        check = QGroupBox("Prüfung vor dem Start")
         lay = QVBoxLayout(check)
-        for w in (self.preview_label, self.issues, self.out_label):
+        for w in (self.state, self.preview_label, self.issues, self.out_label):
             lay.addWidget(w)
         col.addWidget(check)
         col.addWidget(self.start_button)
         if not any(stretch for _, stretch in inputs):
             col.addStretch(1)                           # Gruppen oben kompakt halten
+        self._left = left
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(left)
@@ -80,8 +113,11 @@ class WorkflowPage(QWidget):
         result = QGroupBox("Ergebnis")
         lay = QVBoxLayout(result)
         head = QHBoxLayout()
-        head.addWidget(self.status_label, 1)
-        for b in list(buttons) + [self.open_button]:
+        text = QVBoxLayout()
+        text.addWidget(self.status_label)
+        text.addWidget(self.summary_label)
+        head.addLayout(text, 1)
+        for b in list(buttons) + [self.command_button, self.runjson_button, self.open_button]:
             head.addWidget(b)
         lay.addLayout(head)
         lay.addWidget(self.result_issues)
@@ -113,6 +149,10 @@ class WorkflowPage(QWidget):
     def show_outputs(self, result: dict, out: Path) -> None:
         """Ergebnis-Widgets aus dem ``JobResult``-dict fuellen."""
 
+    def summary_text(self, result: dict) -> str:
+        """Kurzfassung des Ergebnisses (eine Zeile)."""
+        return ""
+
     # -- Datensatz und Inspektion ------------------------------------------------------
     def set_case(self, case) -> None:
         self.case = case
@@ -128,7 +168,7 @@ class WorkflowPage(QWidget):
             return
         if sel is None:
             return
-        self.show_check("Datensatz wird gelesen …", [], False)
+        self.show_check("Datensatz wird gelesen …", [], False, pending=True)
         run_in_background(lambda: self.api.inspect(sel),
                           lambda info, err: self._on_inspected(token, info, err))
 
@@ -158,14 +198,30 @@ class WorkflowPage(QWidget):
         text, issues, ok = self.check(s)
         out = self.output_spec()
         issues = list(issues) + out.validate()
+        folder = None
+        if ok and not has_errors(issues):
+            folder = out.target_dir(self.api.default_folder(s, self.info.selection))
+            if len(str(folder)) + LONGEST_FILE_NAME > MAX_PATH:
+                issues.append(Issue(
+                    "warning", "OUTPUT.PATH_LONG",
+                    f"Ergebnispfad sehr lang ({len(str(folder))} Zeichen): Windows erlaubt 260 Zeichen "
+                    "je Datei, lange DICOM-Dateinamen können das Schreiben scheitern lassen.",
+                    hint_de="Kürzeren Ergebnis-Stammordner wählen (Symbolleiste: Ergebnisordner …)."))
         ok = ok and not has_errors(issues)
         self.form.mark_issues(issues)
         self.show_check(text, issues, ok)
-        if ok:
-            folder = out.target_dir(self.api.default_folder(s, self.info.selection))
+        if folder is not None and ok:
             self.out_label.setText(f"Ergebnisordner: {breakable(folder)}")
 
-    def show_check(self, text: str, issues: list, ok: bool) -> None:
+    def show_check(self, text: str, issues: list, ok: bool, pending: bool = False) -> None:
+        if pending:
+            self.state.set_state(None, "Wird geprüft …")
+        elif ok:
+            warned = any((i.level if hasattr(i, "level") else i["level"]) == "warning" for i in issues)
+            self.state.set_state("warning" if warned else "ok",
+                                 "Bereit, mit Hinweisen" if warned else "Bereit zum Start")
+        else:
+            self.state.set_state("error", "Nicht startbar")
         self.preview_label.setText(text)
         self.issues.set_issues(issues)
         self.out_label.clear()
@@ -182,25 +238,53 @@ class WorkflowPage(QWidget):
 
     def set_running(self, running: bool) -> None:
         self._running = running
+        if self._left is not None:
+            self._left.setEnabled(not running)          # der Lauf rechnet mit den Werten beim Start
         self._update_start()
 
     # -- Lauf und Ergebnis -------------------------------------------------------------
     def _start(self) -> None:
-        job = api_jobs.new_job(self.api.WORKFLOW, self.form.settings(), self.info.selection,
+        self._job_settings = self.form.settings()
+        job = api_jobs.new_job(self.api.WORKFLOW, self._job_settings, self.info.selection,
                                self.output_spec())
         self.last_result = None
         self.status_label.setText("Läuft …")
-        self.open_button.setEnabled(False)
+        self.summary_label.hide()
+        for b in (self.open_button, self.command_button, self.runjson_button):
+            b.setEnabled(False)
         self.result_issues.set_issues([])
         self.clear_outputs()
         self.main.start_job(self, job, self.title)
+
+    def _copy_command(self) -> None:
+        QApplication.clipboard().setText(command_string(self.last_result.get("command") or []))
+
+    def _run_line(self, result: dict) -> str:
+        """Dauer und die vom Standard abweichenden Einstellungen des Laufs."""
+        parts = []
+        total = (result.get("timings") or {}).get("total_s")
+        if total is not None:
+            parts.append(f"Dauer {total:.1f} s")
+        if self._job_settings is not None:
+            changed = self._job_settings.non_default()
+            if changed:
+                parts.append("abweichend vom Standard: " + ", ".join(
+                    f"{self.form.label_of(k)} = {_value_text(v)}" for k, v in changed.items()))
+        return "  ·  ".join(parts)
 
     def show_result(self, result: dict) -> None:
         self.last_result = result
         out = result.get("output_dir")
         self.status_label.setText(STATUS_DE.get(result["status"], result["status"])
                                   + (f":  {breakable(out)}" if out else ""))
+        lines = [t for t in (self.summary_text(result) if out else "", self._run_line(result)) if t]
+        self.summary_label.setText("\n".join(lines))
+        self.summary_label.setVisible(bool(lines))
         self.open_button.setEnabled(bool(out))
+        self.runjson_button.setEnabled(bool(out) and (Path(out) / "run.json").is_file())
+        self.command_button.setEnabled(bool(result.get("command")))
+        self.command_button.setToolTip(command_string(result.get("command") or []) or
+                                       "Kein Befehl verfügbar")
         self.result_issues.set_issues(result.get("issues", []))
         if out:
             self.show_outputs(result, Path(out))

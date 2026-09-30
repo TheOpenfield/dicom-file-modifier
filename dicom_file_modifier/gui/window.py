@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot
-from PySide6.QtWidgets import (QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+from PySide6.QtCore import QSize, Qt, Slot
+from PySide6.QtGui import QPalette
+from PySide6.QtWidgets import (QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem,
                                QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSizePolicy, QStackedWidget, QStyle, QToolBar,
                                QWidget)
@@ -86,9 +88,15 @@ class MainWindow(QMainWindow):
         self.pages = [self.structures, self.dose]
         self.nav = QListWidget()
         self.nav.setFixedWidth(170)
+        self.nav.setFrameShape(QFrame.Shape.NoFrame)
+        palette = self.nav.palette()
+        palette.setColor(QPalette.ColorRole.Base, palette.color(QPalette.ColorRole.Window))
+        self.nav.setPalette(palette)
         self.stack = QStackedWidget()
         for page in self.pages:
-            self.nav.addItem(page.title)
+            item = QListWidgetItem(page.title)
+            item.setSizeHint(QSize(0, 34))
+            self.nav.addItem(item)
             self.stack.addWidget(page)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
@@ -105,14 +113,17 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Abbrechen")
         self.cancel_button.hide()
         self.cancel_button.clicked.connect(self.cancel_job)
+        self.root_label = QLabel()
+        self.root_label.setEnabled(False)                 # grau: nur Information
         self.statusBar().addWidget(self.job_label, 1)
+        self.statusBar().addPermanentWidget(self.root_label)
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_button)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
-        dock = QDockWidget("Protokoll", self)
+        dock = self.log_dock = QDockWidget("Protokoll", self)
         dock.setObjectName("log")
         dock.setWidget(self.log)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
@@ -143,6 +154,7 @@ class MainWindow(QMainWindow):
             return
         self.case = case
         self.case_label.setText("  " + case.summary())
+        self.setWindowTitle(f"{APP_NAME} – {case.folder.name}")
         for page in self.pages:
             page.set_case(case)
 
@@ -168,6 +180,7 @@ class MainWindow(QMainWindow):
 
     def _update_root_tooltip(self) -> None:
         self.root_action.setToolTip(f"Ergebnisse unter: {self.config.results_root}")
+        self.root_label.setText(f"Ergebnisse: {self.config.results_root}")
 
     # -- Jobs ----------------------------------------------------------------------------
     def start_job(self, page, job, title: str) -> None:
@@ -191,7 +204,10 @@ class MainWindow(QMainWindow):
     def _on_event(self, ev: dict) -> None:
         kind = ev.get("type")
         if kind == "log":
-            self.log.appendPlainText(ev.get("msg", ""))
+            msg = ev.get("msg", "")
+            if self.runner.job is not None:              # der Staging-Ordner existiert nach dem Lauf nicht mehr
+                msg = msg.replace(str(self.runner.job.staging_dir), "<Ergebnisordner>")
+            self.log.appendPlainText(msg)
         elif kind == "issue":
             self.log.appendPlainText(f"[{ev.get('level')}] {ev.get('message_de')}")
         elif kind == "stage" and self.cancel_button.isEnabled():
@@ -207,6 +223,8 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.cancel_button.hide()
         self.job_label.setText(STATUS_DE.get(result.get("status"), str(result.get("status"))))
+        if result.get("status") == "failed":
+            self.log_dock.show()
         for p in self.pages:
             p.set_running(False)
         page, self._job_page = self._job_page, None
