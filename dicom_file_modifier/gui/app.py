@@ -34,8 +34,9 @@ def main(argv: Optional[list] = None) -> int:
 
 def _smoke_test(app, case) -> int:
     """
-    Pruefung einer Installation (auch der gefrorenen App): Datensatz oeffnen und die
-    Strukturanalyse ueber den Worker rechnen, Ergebnisse in einem Temp-Ordner.
+    Pruefung einer Installation (auch der gefrorenen App): Datensatz oeffnen, alle
+    Seiten pruefen lassen und die Strukturanalyse ueber den Worker rechnen,
+    Ergebnisse in einem Temp-Ordner.
     Exit 0 ok, 1 Lauf fehlgeschlagen, 2 kein Datensatz, 3 Pruefung nicht bestanden, 4 Zeitueberschreitung.
     """
     import shutil
@@ -64,7 +65,7 @@ def _smoke_test(app, case) -> int:
     try:
         win.show()
         win.open_case(case)
-        if not wait(page.start_button.isEnabled, 120):
+        if not wait(lambda: all(p.start_button.isEnabled() for p in win.pages), 120):
             return 3
         page.start_button.click()
         if not wait(lambda: page.last_result is not None, 600):

@@ -3,9 +3,10 @@ Pruefung des onedir-Bundles (Standard ``dist/DICOM-RT-Toolkit``); Exit 0 = ok.
 
   - Groesse unter MAX_MB, keine DICOM-Dateien im Bundle
   - dfm.exe: Versionen (alle Bibliotheken gefunden), alle Self-Tests,
-    Demo-Fall, Dosisindizes mit Validierungsansicht (plotly, matplotlib)
-  - DICOM-RT-Toolkit.exe --smoke-test: Strukturanalyse des Demo-Falls ueber
-    den gefrorenen Worker (offscreen)
+    Demo-Fall, Dosisindizes mit Validierungsansicht (plotly, matplotlib),
+    Transformation mit Vorher/Nachher-Ansichten
+  - DICOM-RT-Toolkit.exe --smoke-test: alle Seiten pruefen den Demo-Fall,
+    dann Strukturanalyse ueber den gefrorenen Worker (offscreen)
 
   python packaging/check_bundle.py [BUNDLE_DIR] [--zip]
 
@@ -89,15 +90,19 @@ def main(argv=None) -> int:
             ("dfm selftest", [dfm, "selftest"]),
             ("dfm demo", [dfm, "demo", tmp / "demo"]),
             ("dfm dose-indices", [dfm, "dose-indices", tmp / "demo", "--output", tmp / "out"]),
+            ("dfm case-transform", [dfm, "case-transform", tmp / "demo", "--tx", "2", "--rz", "5",
+                                    "--center", "marker:HS1", "--non-interactive", "--output", tmp / "tr"]),
         ]
         for step, cmd in steps:
             if run(step, cmd).returncode:
                 errors.append(step)
-        viz = sorted(p.name for p in (tmp / "out").rglob("*") if p.suffix in (".html", ".png"))
-        if viz != ["dose_overview.png", "validation.html"]:
-            errors.append(f"Validierungsansicht unvollstaendig: {viz}")
+        for out, want in (("out", ["dose_overview.png", "validation.html"]),
+                          ("tr", ["displacement.png", "transform_3d.html", "transform_overview.png"])):
+            viz = sorted(p.name for p in (tmp / out).rglob("*") if p.suffix in (".html", ".png"))
+            if viz != want:
+                errors.append(f"Ansichten unvollstaendig: {viz}")
         env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
-        if run("App --smoke-test (Strukturanalyse ueber den Worker)",
+        if run("App --smoke-test (alle Seiten geprueft, Strukturanalyse ueber den Worker)",
                [gui, "--smoke-test", tmp / "demo"], env=env).returncode:
             errors.append("App-Smoke-Test")
     finally:

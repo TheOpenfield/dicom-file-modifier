@@ -271,8 +271,8 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
   `cli.py` and `api.workflow()` import the tools through importlib, so the spec lists them as hidden imports.
 - `check_bundle.py` checks the build:
   - the size and that it holds no DICOM files;
-  - the versions, `dfm selftest`, the demo case and dose indices with viz;
-  - `DICOM-RT-Toolkit.exe --smoke-test CASE`, the structure page through the frozen worker, offscreen.
+  - the versions, `dfm selftest`, the demo case, dose indices with viz and a case transform with its before/after views;
+  - `DICOM-RT-Toolkit.exe --smoke-test CASE`: every page inspects the case, then the structure page runs through the frozen worker, offscreen.
 - Build with `.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm`. A plain `uv sync` removes the `gui` extra and the `build` group again (exact sync); `uv run` keeps them.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
