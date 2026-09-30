@@ -68,6 +68,7 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
 
     page.start_button.click()
     assert not page.start_button.isEnabled() and win.cancel_button.isVisible()
+    assert not win.open_case_button.isEnabled()                   # kein Datensatzwechsel im Lauf
     wait_until(app, lambda: page.last_result is not None)
     res = page.last_result
     assert res["status"] in ("ok", "ok_warnings"), res["issues"]
@@ -84,6 +85,12 @@ def test_structures_page_end_to_end(app, demo, tmp_path):
     assert "RTSTRUCT Analyse" in win.log.toPlainText()
     assert sorted(p.name for p in (tmp_path / "results").iterdir()) == [out.name]
     assert not any((tmp_path / "jobs").iterdir())                # Job-Datei aufgeraeumt
+
+    assert win.open_case_button.isEnabled()
+    win.open_case(demo.root)                                      # neu geoeffnet: Ergebnis geleert
+    assert page.last_result is None and not page.open_button.isEnabled()
+    assert page.result_state.text.text() == "Noch kein Ergebnis." and page.gallery.count() == 0
+    assert not page.summary_label.isVisible() and not page.stats_view.toPlainText()
     win.close()
 
 

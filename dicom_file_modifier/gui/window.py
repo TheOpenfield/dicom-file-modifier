@@ -164,6 +164,10 @@ class MainWindow(QMainWindow):
             self.open_case(folder)
 
     def open_case(self, folder) -> None:
+        if self.runner.running:                           # das Ergebnis gehoert zum geoeffneten Datensatz
+            QMessageBox.information(self, APP_NAME, "Während eines Laufs lässt sich kein anderer "
+                                                    "Datensatz öffnen.")
+            return
         try:
             case = Case.open(folder)
         except OSError as exc:
@@ -212,6 +216,7 @@ class MainWindow(QMainWindow):
         self.progress.show()
         self.cancel_button.setEnabled(True)
         self.cancel_button.show()
+        self.open_case_button.setEnabled(False)
         for p in self.pages:
             p.set_running(True)
 
@@ -245,6 +250,7 @@ class MainWindow(QMainWindow):
         self.job_label.setText(STATUS_DE.get(result.get("status"), str(result.get("status"))))
         if result.get("status") == "failed":
             self.log_dock.show()
+        self.open_case_button.setEnabled(True)
         for p in self.pages:
             p.set_running(False)
         page, self._job_page = self._job_page, None

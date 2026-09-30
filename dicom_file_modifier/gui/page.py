@@ -183,6 +183,7 @@ class WorkflowPage(QWidget):
     # -- Datensatz und Inspektion ------------------------------------------------------
     def set_case(self, case) -> None:
         self.case = case
+        self._reset_result("Noch kein Ergebnis.")      # das Ergebnis gehoerte zum vorigen Datensatz
         self.inspect()
 
     def inspect(self) -> None:
@@ -275,15 +276,18 @@ class WorkflowPage(QWidget):
         self._job_disabled = set(self._job_settings.disabled_fields(self.info))    # wirkten nicht
         job = api_jobs.new_job(self.api.WORKFLOW, self._job_settings, self.info.selection,
                                self.output_spec())
+        self._reset_result("Läuft …")
+        self.main.start_job(self, job, self.title)
+
+    def _reset_result(self, text: str) -> None:
         self.last_result = None
-        self.result_state.set_state(None, "Läuft …")
+        self.result_state.set_state(None, text)
         self.result_state.setToolTip("")
         self.summary_label.hide()
         for b in (self.open_button, self.more_button):
             b.setEnabled(False)
         self.result_issues.set_issues([])
         self.clear_outputs()
-        self.main.start_job(self, job, self.title)
 
     def _copy_command(self) -> None:
         QApplication.clipboard().setText(command_string(self.last_result.get("command") or []))
