@@ -117,3 +117,11 @@ def test_gui_process_never_loads_plot_modules(demo, tmp_path):
                          capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"ready": True, "bad": []}
+
+
+def test_smoke_test_option_runs_the_structure_page(demo):
+    """``dfm gui --smoke-test CASE``: die Installationspruefung der (gefrorenen) App."""
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+    out = subprocess.run([sys.executable, "-m", "dicom_file_modifier", "gui", "--smoke-test", str(demo.root)],
+                         capture_output=True, text=True, timeout=300, env=env, stdin=subprocess.DEVNULL)
+    assert out.returncode == 0, out.stderr

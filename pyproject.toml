@@ -50,6 +50,10 @@ Repository = "https://github.com/TheOpenfield/dicom-file-modifier"
 [dependency-groups]
 test = ["pytest>=8"]
 lint = ["ruff>=0.6"]
+build = [
+    "pyinstaller>=6.16",
+    "pyinstaller-hooks-contrib>=2025.9",
+]
 
 [tool.uv]
 default-groups = ["test"]

@@ -14,6 +14,14 @@ from .config import APP_NAME, AppConfig
 from .jobs import JobRunner
 from .widgets import STATUS_DE
 
+ABOUT_HTML = (
+    "<b>{app} {version}</b><br>Strukturanalyse, Dosisindizes und starre Transformation "
+    "von DICOM-RT-Daten.<br><br>"
+    "<b>Nur für Forschung und Lehre – kein Medizinprodukt.</b> Nicht für die klinische Anwendung "
+    "validiert oder zertifiziert; nicht zum Erstellen, Ändern oder Prüfen von Daten für die "
+    "Behandlung von Patientinnen und Patienten verwenden. Alle Ergebnisse vor jeder klinischen "
+    "Verwendung unabhängig durch qualifizierte Medizinphysik prüfen. Nutzung auf eigene Gefahr."
+    "<br><br>Lizenz: MIT")
 
 
 @dataclass
@@ -104,12 +112,17 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
         dock.hide()
         bar.addAction(dock.toggleViewAction())
+        bar.addAction("Info", self.show_about)
 
         self.runner.event.connect(self._on_event)
         self.runner.finished.connect(self._on_finished)
         self._update_root_tooltip()
 
     # -- Fall ----------------------------------------------------------------------------
+    def show_about(self) -> None:
+        from .. import __version__
+        QMessageBox.about(self, f"Über {APP_NAME}", ABOUT_HTML.format(app=APP_NAME, version=__version__))
+
     def choose_case(self) -> None:
         start = str(self.case.folder.parent) if self.case else ""
         folder = QFileDialog.getExistingDirectory(self, "Fallordner wählen", start)

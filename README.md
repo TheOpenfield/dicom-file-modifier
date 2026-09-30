@@ -115,6 +115,13 @@ The results appear as a gallery with the statistics. The first page is the struc
 
 Every run happens in a separate worker process (`dfm worker`). It writes to a staging folder that becomes the result folder only when the run succeeds. A cancelled run leaves nothing behind. The results go under `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`; the toolbar changes this folder.
 
+Build the Windows app as a folder (PyInstaller onedir, no installer yet). `dist\DICOM-RT-Toolkit\` then holds `DICOM-RT-Toolkit.exe` (the app) and `dfm.exe` (CLI and worker). The check tests the bundle: self-tests, demo case, dose indices and an app smoke test through the frozen worker.
+```bash
+uv sync --extra gui --group build
+.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm
+.venv\Scripts\python packaging/check_bundle.py --zip   # check; if it passes, write dist\DICOM-RT-Toolkit-<version>-win64.zip
+```
+
 ### Python API
 
 `dicom_file_modifier.api` offers the three workflows as functions: structure analysis, dose indices and transformation. The planned desktop app is built on this layer, and scripts can use it as well. Each workflow module has the same steps:

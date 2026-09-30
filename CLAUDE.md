@@ -251,6 +251,18 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 
 New pages follow the structure page.
 
+**Packaging (`packaging/`):**
+- `dfm.spec` builds one PyInstaller onedir folder `dist/DICOM-RT-Toolkit/` with two EXEs:
+  - `DICOM-RT-Toolkit.exe`: windowed, the GUI;
+  - `dfm.exe`: console, the CLI and the worker, without Qt.
+
+  `cli.py` and `api.workflow()` import the tools through importlib, so the spec lists them as hidden imports.
+- `check_bundle.py` checks the build:
+  - the size and that it holds no DICOM files;
+  - the versions, `dfm selftest`, the demo case and dose indices with viz;
+  - `DICOM-RT-Toolkit.exe --smoke-test CASE`, the structure page through the frozen worker, offscreen.
+- Build with `.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm`. A plain `uv sync` removes the `gui` extra and the `build` group again (exact sync); `uv run` keeps them.
+
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
 - **Contents:**
