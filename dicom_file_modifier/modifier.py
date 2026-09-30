@@ -33,6 +33,7 @@ Beispiele:
 """
 
 import os
+import sys
 import copy
 import glob
 import argparse
@@ -42,6 +43,8 @@ from pydicom.uid import generate_uid
 from scipy.ndimage import map_coordinates, spline_filter
 from scipy.spatial.transform import Rotation
 
+from ._compat import replace_pixel_data
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Laden
@@ -49,7 +52,7 @@ from scipy.spatial.transform import Rotation
 
 def load_ct_series(ct_dir: str) -> list:
     """Lädt alle DICOM-Dateien aus einem Verzeichnis, sortiert nach Z-Position."""
-    files = sorted(glob.glob(os.path.join(ct_dir, "*.dcm")))
+    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
     if not files:
         raise FileNotFoundError(f"Keine DICOM-Dateien in {ct_dir!r}")
 
@@ -333,12 +336,9 @@ def save_ct_series(
             # Auf gültigen int16-Wertebereich begrenzen
             stored = np.clip(stored, -32768, 32767).astype(np.int16)
 
-            nd.PixelData         = stored.tobytes()
-            nd.Rows, nd.Columns  = stored.shape
-            nd.BitsAllocated     = 16
-            nd.BitsStored        = 16
-            nd.HighBit           = 15
-            nd.PixelRepresentation = 1   # vorzeichenbehaftet (int16)
+            # int16 vorzeichenbehaftet, unkomprimiert; komprimierte Quellen werden
+            # auf Explicit VR Little Endian umgestellt (siehe _compat)
+            replace_pixel_data(nd, stored)
 
         out_path = os.path.join(output_dir, f"CT_{k:04d}.dcm")
         nd.save_as(out_path)
@@ -546,7 +546,7 @@ def visualize_3d(
 #  Hauptprogramm
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "CT DICOM Rigid Body Transformer – "
@@ -606,7 +606,7 @@ def main() -> None:
     grp_v.add_argument("--no-viz", action="store_true",
                        help="Visualisierung überspringen")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # ── Laden ──────────────────────────────────────────────────────────────
     print(f"\nLade CT-Serie aus {args.ct_dir!r} …")
@@ -670,7 +670,8 @@ def main() -> None:
         )
 
     print("\nFertig!")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

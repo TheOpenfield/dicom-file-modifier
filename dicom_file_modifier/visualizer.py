@@ -29,6 +29,7 @@ Beispiele:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -1183,7 +1184,7 @@ def run_visualization(results: dict, output_dir: Path) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description="RTSTRUCT Visualizer – Plots aus DICOM RT Structure Sets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1201,7 +1202,7 @@ def main() -> None:
                         help="Komma-getrennte Zielgebiet-Namen (z.B. PTV,CTV)")
     parser.add_argument("--oars", type=str, default=None,
                         help="Komma-getrennte Risikoorgan-Namen")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     target_list = args.targets.split(",") if args.targets else None
     oar_list    = args.oars.split(",")    if args.oars    else None
@@ -1213,7 +1214,8 @@ def main() -> None:
     )
 
     run_visualization(results, Path(args.output))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

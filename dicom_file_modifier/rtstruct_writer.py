@@ -31,6 +31,7 @@ from pydicom.uid import (PYDICOM_IMPLEMENTATION_UID, ExplicitVRLittleEndian,
 
 from . import dose as dm
 from . import analyzer as ana
+from ._compat import dcmwrite_file_format
 from .case_modifier import _label_with_suffix, _truncate
 from .modifier import set_sop_instance_uid
 
@@ -78,7 +79,7 @@ def build_ct_slice_index(ct_dir: str) -> dict:
     import glob
     import os
 
-    files = sorted(glob.glob(os.path.join(str(ct_dir), "*.dcm")))
+    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
     slices = []
     for f in files:
         try:
@@ -438,13 +439,12 @@ def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,
     fm.ImplementationVersionName = f"PYDICOM {pydicom.__version__}"[:16]
     validate_file_meta(fm, enforce_standard=True)
     ds.file_meta = fm
-    ds.is_little_endian = True
-    ds.is_implicit_VR = (ts == ImplicitVRLittleEndian)
     set_sop_instance_uid(ds, str(fm.MediaStorageSOPInstanceUID))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with _writing_validation(pdconfig.RAISE):
-        pydicom.dcmwrite(str(out_path), ds, write_like_original=False)
+        # Kodierung aus der Transfer Syntax (pydicom 2.x: Flags, 3.x: enforce_file_format)
+        dcmwrite_file_format(out_path, ds)
     return ds
 
 

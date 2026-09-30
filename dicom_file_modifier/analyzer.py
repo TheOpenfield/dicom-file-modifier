@@ -890,7 +890,7 @@ def run_analysis(filepath: str,
 
     if pairs:
         print(f"\n{'=' * 60}")
-        print("ABSTÄNDE  (Target↔OAR und GTV↔PTV, aufsteigend nach Min-Abstand)")
+        print("ABSTÄNDE  (Target<->OAR und GTV<->PTV, aufsteigend nach Min-Abstand)")
         print(f"{'=' * 60}")
         for name_a, ra, name_b, rb, ptype in pairs:
             d = pair_distances(ra["all_points"], rb["all_points"])
@@ -1131,7 +1131,7 @@ def _run_self_test() -> int:
 # 8. CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Analyse von DICOM RT Structure Sets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1157,10 +1157,10 @@ Beispiele:
                         help="Synthetische Konsistenztests (Ring/Loch, Keyhole, "
                              "Kugeln, z-Lücken); Exit 0 = pass, 1 = fail")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.self_test:
-        sys.exit(_run_self_test())
+        return _run_self_test()
     if not args.file:
         parser.error("file ist erforderlich (außer mit --self-test)")
 
@@ -1186,6 +1186,7 @@ Beispiele:
     print(f"\n{'=' * 60}")
     print("Analyse abgeschlossen.")
     print(f"{'=' * 60}\n")
+    return 0
 
 
 def _results_to_jsonable(obj):
@@ -1209,4 +1210,4 @@ def _results_to_jsonable(obj):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

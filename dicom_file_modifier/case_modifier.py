@@ -1054,7 +1054,8 @@ def _resolve_center_from_args(
             return pos, f"Marker '{args.center.split(':', 1)[1].strip()}'"
         return pos, "manuell"
 
-    if args.non_interactive or not sys.stdin.isatty():
+    # Ohne Konsole (pythonw, GUI-EXE) ist sys.stdin None -> nie interaktiv
+    if args.non_interactive or sys.stdin is None or not sys.stdin.isatty():
         return None, "Volumenmitte"
 
     pos = interactive_center_prompt(rs_ds, volume_center_lps)
@@ -1214,7 +1215,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
         # CT-Metadaten ohne Pixel laden -> Volumenzentrum berechnen.
         import glob
-        ct_files = sorted(glob.glob(os.path.join(str(ct_dir), "*.dcm")))
+        ct_files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
         meta_slices = []
         for f in ct_files:
             try:

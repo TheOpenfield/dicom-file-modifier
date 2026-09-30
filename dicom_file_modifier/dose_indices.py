@@ -48,9 +48,12 @@ from typing import Optional
 
 import numpy as np
 import pydicom
+from pydicom.valuerep import format_number_as_ds
+from scipy.integrate import trapezoid
 
 from . import analyzer as ana
 from . import dose as dm
+from ._compat import PYDICOM_MAJOR
 
 TOOL_NAME = "dose_indices"
 TOOL_VERSION = "1.1.0"
@@ -1723,7 +1726,7 @@ class _Phantom:
 
         levels = np.linspace(0.0, self.DMAX, 801)
         vcum = np.array([inter(L) if L > 0 else TV for L in levels])
-        dmean = float(np.trapz(vcum, levels) / TV)
+        dmean = float(trapezoid(vcum, levels) / TV)
         d2, d50, d98, d95 = d_at(0.02), d_at(0.50), d_at(0.98), d_at(0.95)
         return {
             "tv": TV, "piv": PIV, "tv_piv": I, "piv50": PIV50,
@@ -1741,12 +1744,15 @@ def _synthetic_rtdose_dataset(dose: dm.DoseGrid, absolute_gfov: bool = False) ->
     from pydicom.dataset import Dataset, FileMetaDataset
     from pydicom.uid import ExplicitVRLittleEndian
 
-    scaling = float(dose.dmax) / 4.0e9
+    # DS hat hoechstens 16 Zeichen; mit dem gekuerzten Wert rechnen, damit Pixel
+    # und DoseGridScaling zusammenpassen
+    scaling = float(format_number_as_ds(float(dose.dmax) / 4.0e9))
     px = np.round(dose.array.astype(np.float64) / scaling).astype(np.uint32)
     ds = Dataset()
     ds.file_meta = FileMetaDataset()
     ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-    ds.is_little_endian, ds.is_implicit_VR = True, False
+    if PYDICOM_MAJOR < 3:   # pydicom 2.x braucht die Flags fuer pixel_array im Speicher
+        ds.is_little_endian, ds.is_implicit_VR = True, False
     ds.Modality = "RTDOSE"
     ds.SOPInstanceUID = "1.2.3.4"
     ds.FrameOfReferenceUID = "1.2.3"
@@ -1761,7 +1767,7 @@ def _synthetic_rtdose_dataset(dose: dm.DoseGrid, absolute_gfov: bool = False) ->
     ds.Rows, ds.Columns = dose.shape[1], dose.shape[2]
     ds.SamplesPerPixel, ds.PhotometricInterpretation = 1, "MONOCHROME2"
     ds.BitsAllocated, ds.BitsStored, ds.HighBit, ds.PixelRepresentation = 32, 32, 31, 0
-    ds.DoseGridScaling = scaling
+    ds.DoseGridScaling = format_number_as_ds(scaling)
     ds.PixelData = px.tobytes()
     return ds
 
@@ -1933,7 +1939,8 @@ def _run_self_test() -> int:
         it = _DS()
         it.DVHType, it.DoseUnits, it.DoseType = dvh_type, units, "PHYSICAL"
         it.DVHDoseScaling, it.DVHVolumeUnits, it.DVHNumberOfBins = scaling, "CM3", n_bins
-        it.DVHData = [v for pair in zip([width / scaling] * n_bins, vols.tolist()) for v in pair]
+        it.DVHData = [format_number_as_ds(float(v))
+                      for pair in zip([width / scaling] * n_bins, vols.tolist()) for v in pair]
         r_ = _DS()
         r_.ReferencedROINumber, r_.DVHROIContributionType = roi, "INCLUDED"
         it.DVHReferencedROISequence = _Seq([r_])

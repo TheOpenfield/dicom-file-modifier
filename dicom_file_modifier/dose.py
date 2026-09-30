@@ -28,6 +28,7 @@ from typing import Optional
 import numpy as np
 import pydicom
 from scipy import ndimage
+from scipy.integrate import trapezoid
 
 from . import analyzer as ana
 
@@ -393,7 +394,7 @@ def dvh_statistics(dvh: EclipseDVH, rx_gy: float) -> dict:
     tot = dvh.total_volume_cm3
     dmean = dvh.dmean_gy
     if dmean is None and tot > 0 and len(dvh.dose_gy) > 1:
-        dmean = float(np.trapz(dvh.volume_cm3, dvh.dose_gy) / tot)
+        dmean = float(trapezoid(dvh.volume_cm3, dvh.dose_gy) / tot)
     return {
         "total_cm3": tot,
         "v_rx_cm3": dvh.v_at(rx_gy),
