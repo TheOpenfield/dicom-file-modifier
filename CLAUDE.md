@@ -204,15 +204,33 @@ Two transform paths sharing the same affine math:
 Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` — in SciPy uppercase = intrinsic; the same matrix as an extrinsic ZYX rotation) about the volume's geometric centre; the offset is folded into `T` so a single 4×4 matrix represents the whole transform. All output series get fresh `SeriesInstanceUID` and per-slice `SOPInstanceUID`s. Optional Plotly HTML viz extracts surfaces with marching cubes (`skimage.measure.marching_cubes`).
 
 ### `case_modifier.py` — case-level lockstep transform of CT + RTSTRUCT
-Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both. Pipeline:
+Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both.
 
-1. `discover_case` auto-finds `CT/` subdir and the unique `RS*.dcm` (override with `--rs`); warns about sibling `RP*`/`RD*` that do not get transformed.
-2. `validate_ct_geometry` enforces uniform `ImageOrientationPatient`, `PixelSpacing`, and slice spacing within 1% (it does not check that the orientation is axial or head-first). `validate_for_consistency` checks that the RTSTRUCT references the CT's `FrameOfReferenceUID`.
-3. `find_point_markers` enumerates all ROIs whose `ContourGeometricType == "POINT"` — these become valid rotation centres alongside `volume` and explicit `x,y,z`. `parse_center_spec` handles all three forms; `interactive_center_prompt` is used when stdin is a TTY and no `--center` is given.
-4. CT transform runs through `modifier`'s `build_rigid_transform`, `resample_volume` / `apply_metadata_transform`, and `save_ct_series`. `save_ct_series` returns a `{series_uid, frame_of_reference_uid_used, sop_map}` dict so the RS rewrite can map old→new SOP UIDs.
-5. `transform_rtstruct` applies `T` to every `ContourData` triple (rigid → no point-cloud distortion; 3D volume preserved), rewrites every `ReferencedSOPInstanceUID` via `sop_map`, updates `RTReferencedSeriesSequence.SeriesInstanceUID` to point at the new CT, optionally mints a new `FrameOfReferenceUID` (--new-frame-of-reference), and inserts a synthetic POINT-type ROI named `Drehpunkt` at `centre + (tx,ty,tz)` so the planner sees the rotation centre at a glance.
-6. Aria-visible metadata: `StructureSetLabel` truncated to DICOM SH (16 chars) with the suffix preserved; `StructureSetDescription` (VR ST; the tool truncates to 64 chars) carries the transform string via `build_transform_description`; `SeriesDescription` mirrors the CT's; `SeriesNumber += 1000` so the transformed series is distinct from the original.
-7. `--self-test` runs three metadata-mode checks: an identity round trip (all `ContourData` within 1e-4 mm of the input) and pairwise-distance preservation under a 15° Z- and a 5° X-rotation (within 1e-3 mm). `--verify` after a real run computes per-ROI centroids and compares with `T @ centroid_orig` (centroids are linear under rigid transforms). `--dry-run` validates inputs and prints `T` + planned output paths without writing.
+**Stages (P0.5).** `run_case_transform` keeps its signature and runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
+- **`preflight_case` → `CasePreflight`** reads headers only:
+  - `discover_case(..., return_siblings=True)` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`. Called the old way, it still prints the sibling note and returns `(ct_dir, rs_path)`.
+  - `load_ct_headers` reads the CT headers (`stop_before_pixels`, sorted by z) and rejects duplicate SOP UIDs.
+  - `validate_ct_geometry` checks for uniform IOP/`PixelSpacing`, slice spacing within 1 %, and the **orientation guard** `unit(IPP₁−IPP₀)·cross(row, col) ≥ 0.999`. It rejects feet-first and gantry tilt with `UserInputError` `CT.ORIENTATION_UNSUPPORTED`; HFS/HFP pass.
+  - `validate_for_consistency` checks that the RS references the CT's FoR.
+  - `validate_label` rejects `--label` values that Windows forbids in the output dir name or `RS<label>.dcm`: characters `<>:"/\|?*`, reserved names, a trailing dot or space.
+- **`resolve_center`** takes `volume`, `marker:NAME` or `x,y,z`. The prompt appears only if interactive and stdin is a TTY; stdin may be `None` under pythonw/GUI.
+- **`plan_transform` → `TransformPlan`** builds `T` and the paths, and pre-assigns all UIDs: CT series, `sop_map` old→new, optional FoR. It already runs `transform_rtstruct` and `check_contour_clipping`, so a bad RS reference (`KeyError`) fails before anything is written. The dry run stops here and loads no pixels.
+- **`execute_transform`** loads pixels (`modifier.load_ct_series`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
+- The result dict adds `issues` (`issues.Issue.to_dict()`: `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`), `clipping`, `method` and `for_strategy`.
+- Console output is unchanged, except that the sibling note appears once instead of twice.
+- Stages reported to `_runtime`: `preflight` / `plan` / `ct_transform` / `rs_write` / `verify` / `viz`, with a cancel check between them.
+
+**What gets written:**
+- `transform_rtstruct` applies `T` to every `ContourData` triple (rigid, so no point-cloud distortion; the 3D volume is preserved). It rewrites every `ReferencedSOPInstanceUID` via `sop_map`, points `RTReferencedSeriesSequence.SeriesInstanceUID` at the new CT, optionally sets the new `FrameOfReferenceUID` (`--new-frame-of-reference`), and inserts a POINT ROI `Drehpunkt` at `centre + (tx,ty,tz)`. The RS SOP/series UIDs can be passed in (`rs_sop_uid`, `rs_series_uid`).
+- Aria-visible metadata:
+  - `StructureSetLabel` is cut to DICOM SH (16 chars) with the suffix preserved.
+  - `StructureSetDescription` (VR ST; the tool cuts it to 64 chars) carries the transform string from `build_transform_description`.
+  - `SeriesDescription` mirrors the CT's.
+  - `SeriesNumber += 1000` on CT and RS.
+
+**Checks:**
+- `--self-test` runs three metadata-mode checks: an identity round trip (all `ContourData` within 1e-4 mm) and pairwise-distance preservation under a 15° Z- and a 5° X-rotation (within 1e-3 mm).
+- `--verify` compares per-ROI centroids with `T @ centroid_orig`, since centroids are linear under rigid transforms. It returns `passed` against `VERIFY_THRESHOLD_MM` (1e-3). It prints a warning only on FAIL, and the exit code is unchanged.
 
 After a real (non-`--dry-run`) write, unless `--no-viz` is given, it calls `visualizer.run_case_visualization` with the in-memory original + transformed RS, `T`, the rotation centre, the `Drehpunkt` position, and the POINT-marker list, writing the three before/after plots into the case output dir. The call is wrapped in a try/except so a visualisation failure never invalidates the already-written transform.
 

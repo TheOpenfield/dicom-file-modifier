@@ -41,12 +41,10 @@
     ]
   },
   "expected_changes": {
-    "_doc": "Szenario-Muster -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet. Wert: Text (das ganze Szenario darf abweichen) oder {reason, only: [Muster der Abweichungsmeldungen]} (nur diese Abweichungen sind erwartet, jede andere bleibt FAIL). Erstes passendes Muster gewinnt, daher spezielle Eintraege zuerst. Eintrag mit dem jeweiligen PR aktivieren und nach dem Re-Baseline wieder entfernen (P0.2: docs/migration-py314.md).",
-    "dose_ecl2": "P0.4 (Verhaltensaenderung): fremdes Ziel in eclipse_ref.json -> Hinweis statt Exit 2",
-    "dose_rx_gy_crash": "P0.4: Isodose auf Rx in Gy (20Gy) -> kanonischer Schluessel statt KeyError",
-    "dose_*": {"reason": "P0.4 (Verhaltensaenderung): SoftwareVersions ungekuerzt (VR LO)",
-               "only": ["*.dcm: SoftwareVersions *"]},
-    "real*_dose_*": {"reason": "P0.4 (Verhaltensaenderung): SoftwareVersions ungekuerzt (VR LO)",
-                     "only": ["*.dcm: SoftwareVersions *"]}
+    "_doc": "Szenario-Muster -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet. Wert: Text (das ganze Szenario darf abweichen) oder {reason, only: [Muster der Abweichungsmeldungen]} (nur diese Abweichungen sind erwartet, jede andere bleibt FAIL). Erstes passendes Muster gewinnt, daher spezielle Eintraege zuerst. Achtung fnmatch: [..] ist eine Zeichenklasse, also 'stdout* Z.1 ...' statt 'stdout[*] ...'. Eintrag mit dem jeweiligen PR aktivieren und nach dem Re-Baseline wieder entfernen (P0.2: docs/migration-py314.md).",
+    "cm_*": {"reason": "P0.5: RP/RD-Hinweis nur noch einmal (nach 'Lade Case' bzw. gar nicht bei --list-markers/--self-test)",
+             "only": ["stdout* Z.1 nur in A*"]},
+    "real*_cm_*": {"reason": "P0.5: RP/RD-Hinweis nur noch einmal (nach 'Lade Case')",
+                   "only": ["stdout* Z.1 nur in A*"]}
   }
 }

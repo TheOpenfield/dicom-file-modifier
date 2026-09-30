@@ -267,6 +267,10 @@ def save_ct_series(
     new_volume_hu: "np.ndarray | None" = None,
     series_description_suffix: str = "_transformed",
     frame_of_reference_uid: "str | None" = None,
+    *,
+    series_uid: "str | None" = None,
+    sop_map: "dict | None" = None,
+    series_number_offset: int = 0,
 ) -> dict:
     """
     Speichert CT-Slices als DICOM-Dateien mit neuer SeriesInstanceUID.
@@ -286,6 +290,15 @@ def save_ct_series(
         unverändert.  Wenn ein String, wird sie auf jedem geschriebenen Slice
         überschrieben (z. B. wenn das aufrufende Tool eine neue FoR vergibt).
 
+    series_uid, sop_map:
+        Vorab vergebene SeriesInstanceUID bzw. ``{alte_SOP: neue_SOP}``, damit
+        abhängige Objekte (RTSTRUCT) vor dem Schreiben fertig sein können.
+        Fehlt eine UID, wird sie hier erzeugt.
+
+    series_number_offset:
+        Wird auf ``SeriesNumber`` jedes Slices addiert (0 = unverändert);
+        nicht numerische Werte bleiben stehen.
+
     Rückgabe:
         Dict mit folgenden Keys, hilfreich für nachgelagerte Schritte
         (z. B. RTSTRUCT-UID-Rewriting):
@@ -296,8 +309,9 @@ def save_ct_series(
                                              (eine Eintragung pro Slice)
     """
     os.makedirs(output_dir, exist_ok=True)
-    series_uid = generate_uid()
-    sop_map: dict = {}
+    planned = dict(sop_map or {})
+    series_uid = series_uid or generate_uid()
+    sop_map = {}
     for_used: "str | None" = None
 
     for k, ds in enumerate(slices):
@@ -305,7 +319,7 @@ def save_ct_series(
         nd.SeriesInstanceUID = series_uid
 
         old_sop = str(getattr(ds, "SOPInstanceUID", ""))
-        new_sop = generate_uid()
+        new_sop = planned.get(old_sop) or generate_uid()
         set_sop_instance_uid(nd, new_sop)
         if old_sop:
             sop_map[old_sop] = str(new_sop)
@@ -316,6 +330,12 @@ def save_ct_series(
 
         orig_desc = str(getattr(ds, "SeriesDescription", "CT"))
         nd.SeriesDescription = orig_desc + series_description_suffix
+
+        if series_number_offset:
+            try:
+                nd.SeriesNumber = int(getattr(nd, "SeriesNumber", 0) or 0) + series_number_offset
+            except (TypeError, ValueError):
+                pass
 
         if new_volume_hu is not None:
             slope     = float(getattr(ds, "RescaleSlope",     1.0))

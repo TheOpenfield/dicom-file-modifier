@@ -995,23 +995,41 @@ def _show(v, diff: Diff) -> str:
 
 
 def _cmp_lines(a: list, b: list, rules: Rules, where: str, diff: Diff, numeric_warn: bool):
-    """Zeilenvergleich; im Migrationsmodus Zahlen mit 1 Einheit der letzten Stelle."""
-    if len(a) != len(b):
-        diff.fail(f"{where}: {len(a)} vs {len(b)} Zeilen")
-    for i, (x, y) in enumerate(zip(a, b)):
-        if x == y:
+    """
+    Zeilenvergleich mit Ausrichtung (difflib): eingefuegte oder entfernte
+    Zeilen erscheinen einzeln ("Z.n nur in A/B"), nicht als Kaskade
+    verschobener Zeilen.  Zeilen mit gleichem Text und anderen Zahlen werden
+    zahlenweise verglichen (Migrationsmodus: 1 Einheit der letzten Stelle).
+    """
+    if a == b:
+        return
+    import difflib
+
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        if tag == "equal":
             continue
-        tx, ty = _NUM_RE.split(x), _NUM_RE.split(y)
-        nx, ny = _NUM_RE.findall(x), _NUM_RE.findall(y)
-        if tx == ty and len(nx) == len(ny):
-            bad = [(u, v) for u, v in zip(nx, ny) if not rules.tol_ok(float(u), float(v), where, "", u, v)]
-            if not bad:
-                continue
-            msg = f"{where} Z.{i + 1}: Zahlen " + ", ".join(f"{u}->{v}" for u, v in bad[:4])
-            (diff.warn if numeric_warn else diff.fail)(msg)
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            for k in range(i2 - i1):
+                _cmp_line(a[i1 + k], b[j1 + k], i1 + k, rules, where, diff, numeric_warn)
             continue
-        content = "" if diff.redact else f": {_ascii(x[:70])!r} vs {_ascii(y[:70])!r}"
-        diff.fail(f"{where} Z.{i + 1} Text weicht ab{content}")
+        for k in range(i1, i2):
+            diff.fail(f"{where} Z.{k + 1} nur in A" + ("" if diff.redact else f": {_ascii(a[k][:70])!r}"))
+        for k in range(j1, j2):
+            diff.fail(f"{where} Z.{k + 1} nur in B" + ("" if diff.redact else f": {_ascii(b[k][:70])!r}"))
+
+
+def _cmp_line(x: str, y: str, i: int, rules: Rules, where: str, diff: Diff, numeric_warn: bool):
+    tx, ty = _NUM_RE.split(x), _NUM_RE.split(y)
+    nx, ny = _NUM_RE.findall(x), _NUM_RE.findall(y)
+    if tx == ty and len(nx) == len(ny):
+        bad = [(u, v) for u, v in zip(nx, ny) if not rules.tol_ok(float(u), float(v), where, "", u, v)]
+        if not bad:
+            return
+        msg = f"{where} Z.{i + 1}: Zahlen " + ", ".join(f"{u}->{v}" for u, v in bad[:4])
+        (diff.warn if numeric_warn else diff.fail)(msg)
+        return
+    content = "" if diff.redact else f": {_ascii(x[:70])!r} vs {_ascii(y[:70])!r}"
+    diff.fail(f"{where} Z.{i + 1} Text weicht ab{content}")
 
 
 def _cmp_pixels(fa: dict, fb: dict, name: str, file: str, rules: Rules, arrays: tuple, diff: Diff):

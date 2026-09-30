@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import glob
 import os
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -56,23 +58,31 @@ from pydicom.dataset import Dataset
 from pydicom.sequence import Sequence
 from pydicom.uid import generate_uid
 
+from . import _runtime
 from . import modifier as mod
 # Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
 from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references
+from .issues import Issue, UserInputError
+
+VERIFY_THRESHOLD_MM = 1e-3      # --verify: max. Centroid-Abweichung fuer PASS
 
 
 # ---------------------------------------------------------------------------
 # Auto-Discovery
 # ---------------------------------------------------------------------------
 
-def discover_case(case_dir: str, rs_override: "str | None" = None) -> tuple[Path, Path]:
+def discover_case(case_dir: str, rs_override: "str | None" = None, *,
+                  return_siblings: bool = False) -> tuple:
     """
     Sucht im ``case_dir`` den ``CT/``-Unterordner und genau eine ``RS*.dcm``-Datei.
 
     Wirft ``FileNotFoundError`` / ``ValueError`` mit klarer Fehlermeldung,
     falls die Konvention verletzt ist.  Bei mehreren RS-Dateien wird der Aufrufer
     aufgefordert, mit ``--rs <pfad>`` explizit auszuwaehlen.
-    Hinweis-Druck (kein Error), wenn parallel RP*/RD*-Dateien vorhanden sind.
+
+    Rueckgabe ``(ct_dir, rs_path)``; parallel liegende RP*/RD*-Dateien werden
+    dann als Hinweis gedruckt.  Mit ``return_siblings=True`` still und
+    ``(ct_dir, rs_path, siblings)`` (Liste der RP*/RD*-Pfade).
     """
     case = Path(case_dir)
     if not case.is_dir():
@@ -105,14 +115,17 @@ def discover_case(case_dir: str, rs_override: "str | None" = None) -> tuple[Path
         rs_path = rs_files[0]
 
     extras = sorted(list(case.glob("RP*.dcm")) + list(case.glob("RD*.dcm")))
+    if return_siblings:
+        return ct_dir, rs_path, extras
     if extras:
-        names = ", ".join(p.name for p in extras)
-        print(
-            f"  Hinweis: Zusaetzliche Plan-/Dosis-Dateien gefunden "
-            f"({names}). Diese werden NICHT mit-transformiert."
-        )
-
+        print(_siblings_note(extras))
     return ct_dir, rs_path
+
+
+def _siblings_note(extras: list) -> str:
+    names = ", ".join(p.name for p in extras)
+    return (f"  Hinweis: Zusaetzliche Plan-/Dosis-Dateien gefunden "
+            f"({names}). Diese werden NICHT mit-transformiert.")
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +238,8 @@ def check_contour_clipping(
 
 def _verify_rs_centroids(orig_ds: pydicom.Dataset,
                          new_rs_path: str,
-                         T: np.ndarray) -> dict:
+                         T: np.ndarray,
+                         threshold_mm: float = VERIFY_THRESHOLD_MM) -> dict:
     """
     Liest das frisch geschriebene RTSTRUCT wieder ein, berechnet pro ROI den
     Centroid und vergleicht ihn mit ``T @ centroid_orig``.  Druckt die maximale
@@ -235,7 +249,9 @@ def _verify_rs_centroids(orig_ds: pydicom.Dataset,
     mean(T(p_i)).  Eine signifikante Abweichung deutet auf einen Indizierungs-
     oder Reshape-Bug im Transform-Pfad hin.
 
-    Rueckgabe: dict mit ``"max_err_mm"``, ``"checked"``, ``"worst_roi"``.
+    Rueckgabe: dict mit ``"max_err_mm"``, ``"checked"``, ``"worst_roi"``,
+    ``"threshold_mm"`` und ``"passed"`` (``max_err_mm <= threshold_mm``).
+    Nur bei FAIL wird zusaetzlich eine Warnung gedruckt; der CLI-Exit bleibt.
     """
     from .analyzer import load_rtstruct, extract_contours, get_structure_names
 
@@ -266,17 +282,26 @@ def _verify_rs_centroids(orig_ds: pydicom.Dataset,
     print(f"  Geprueft: {checked} ROIs   "
           f"max Abweichung: {max_err:.3e} mm   "
           f"(worst: {worst})")
-    return {"max_err_mm": max_err, "checked": checked, "worst_roi": worst}
+    passed = bool(max_err <= threshold_mm)
+    if not passed:
+        print(f"  ! WARNUNG ! Centroid-Abweichung ueber der Schwelle {threshold_mm:g} mm -> FAIL")
+    return {"max_err_mm": max_err, "checked": checked, "worst_roi": worst,
+            "threshold_mm": float(threshold_mm), "passed": passed}
 
 
 def validate_ct_geometry(slices: list, atol_iop: float = 1e-3,
                         rel_tol_spacing: float = 0.01) -> None:
     """
-    Pre-Flight-Check der CT-Geometrie.  Wirft ``ValueError`` wenn:
+    Pre-Flight-Check der CT-Geometrie (nach z sortierte Slices, Header genuegen).
+    Wirft ``ValueError`` wenn:
       - weniger als 2 Slices
       - ImageOrientationPatient variiert ueber Slices (>= ``atol_iop``)
       - PixelSpacing nicht einheitlich
       - Slice-Spacing nicht uniform (relative Abweichung >= ``rel_tol_spacing``)
+      - die Lagerung nicht Head-First ist oder das CT gekippt ist: der
+        Schichtschritt zeigt nicht entlang ``cross(row, col)``
+        (``UserInputError`` mit Code ``CT.ORIENTATION_UNSUPPORTED``; HFS/HFP
+        passieren, FFS/FFP und Gantry-Kippung > ~2.6 Grad nicht)
     """
     if len(slices) < 2:
         raise ValueError(
@@ -314,6 +339,78 @@ def validate_ct_geometry(slices: list, atol_iop: float = 1e-3,
             f"  min={diffs.min():.3f} mm, max={diffs.max():.3f} mm, "
             f"mean={mean:.3f} mm"
         )
+
+    # Orientierungs-Guard (Plan: Feet-First wird nicht unterstuetzt)
+    normal = np.cross(iop_ref[:3], iop_ref[3:])
+    step = ipps[1] - ipps[0]
+    cos_step = float(step @ normal / (np.linalg.norm(step) * np.linalg.norm(normal)))
+    if cos_step < 0.999:
+        kind = ("Feet-First-Lagerung (Schichtnormale zeigt nach inferior)" if cos_step < 0
+                else f"gekipptes CT (Schichtschritt {np.degrees(np.arccos(min(cos_step, 1.0))):.1f} Grad "
+                     "zur Schichtnormalen)")
+        raise UserInputError(Issue(
+            "error", "CT.ORIENTATION_UNSUPPORTED",
+            f"CT-Orientierung nicht unterstuetzt: {kind}.",
+            hint_de="Unterstuetzt werden Head-First-Lagerungen (HFS, HFP) ohne Gantry-Kippung.",
+            detail=f"ImageOrientationPatient {iop_ref.tolist()}, Schichtschritt {step.round(4).tolist()} mm",
+        ))
+
+
+def load_ct_headers(ct_dir) -> list:
+    """
+    CT-Header ohne Pixeldaten (``stop_before_pixels``), nach z sortiert.  Fuer
+    Pruefung, Geometrie und Planung; ``modifier.load_ct_series`` laedt die
+    Pixel erst beim Ausfuehren.
+    """
+    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
+    if not files:
+        raise FileNotFoundError(f"Keine DICOM-Dateien in {str(ct_dir)!r}")
+    headers = []
+    for f in files:
+        try:
+            ds = pydicom.dcmread(f, stop_before_pixels=True)
+        except Exception:
+            continue
+        if hasattr(ds, "ImagePositionPatient"):
+            headers.append(ds)
+    if not headers:
+        raise ValueError(f"Keine gueltigen CT-Slices in {str(ct_dir)!r}")
+    headers.sort(key=lambda s: float(s.ImagePositionPatient[2]))
+    sops = [str(getattr(s, "SOPInstanceUID", "")) for s in headers]
+    dup = len(sops) - len(set(sops))
+    if dup:
+        raise UserInputError(Issue(
+            "error", "CT.DUPLICATE_SOP", f"CT-Ordner enthaelt {dup} doppelte SOPInstanceUID(s).",
+            hint_de="Jede CT-Schicht darf nur einmal im Ordner liegen (Doppelexport?)."))
+    return headers
+
+
+# Unter Windows in Datei-/Ordnernamen verboten
+_WIN_FORBIDDEN = set('<>:"/\\|?*')
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def validate_label(label: str, case_id: str) -> None:
+    """
+    ``--label`` bildet den Ausgabeordner ``<case_id><label>`` und die Datei
+    ``RS<label>.dcm``; Zeichen und Namen, die Windows ablehnt, ergeben einen
+    ``UserInputError`` (CLI-Exit 2), bevor etwas geschrieben wird.
+    """
+    bad = sorted({c for c in label if c in _WIN_FORBIDDEN or ord(c) < 32})
+    if bad:
+        shown = " ".join(repr(c) for c in bad)
+        raise UserInputError(Issue(
+            "error", "CASE.LABEL_INVALID", f"--label {label!r} enthaelt unzulaessige Zeichen: {shown}",
+            hint_de='Buchstaben, Ziffern, "_", "-" und "." verwenden (nicht < > : " / \\ | ? *).',
+            field="label"))
+    for name in (f"{case_id}{label}", f"RS{label}"):
+        if name.split(".")[0].upper() in _WIN_RESERVED or name.endswith((".", " ")):
+            raise UserInputError(Issue(
+                "error", "CASE.LABEL_INVALID",
+                f"--label {label!r} ergibt den unter Windows unzulaessigen Namen {name!r}.",
+                hint_de="Reservierte Namen (CON, NUL, COM1 ...) sowie Punkt oder Leerzeichen am Ende vermeiden.",
+                field="label"))
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +549,9 @@ def transform_rtstruct(
     label_suffix: "str | None" = None,
     description: "str | None" = None,
     series_number_offset: int = 1000,
+    *,
+    rs_sop_uid: "str | None" = None,
+    rs_series_uid: "str | None" = None,
 ) -> pydicom.Dataset:
     """
     Wendet die rigide Transformation T auf das RTSTRUCT an.
@@ -466,7 +566,8 @@ def transform_rtstruct(
     - Wenn ``drehpunkt_position`` angegeben ist, wird eine zusaetzliche POINT-
       ROI ``Drehpunkt`` an dieser Position eingefuegt (im transformierten
       Koordinatensystem).
-    - Frische ``SOPInstanceUID`` und ``SeriesInstanceUID`` fuer das RS selbst.
+    - Frische ``SOPInstanceUID`` und ``SeriesInstanceUID`` fuer das RS selbst
+      (``rs_sop_uid`` / ``rs_series_uid``, wenn vorab vergeben).
     - ``InstanceCreationDate/Time`` wird gesetzt.
 
     Gibt das modifizierte RS-Dataset zurueck (Original wird nicht veraendert).
@@ -510,8 +611,8 @@ def transform_rtstruct(
                     roi.ReferencedFrameOfReferenceUID = new_for_uid
 
     # 4. Neue UIDs fuer das RS selbst (SOPInstanceUID auch im File-Meta-Header)
-    mod.set_sop_instance_uid(new_ds, generate_uid())
-    new_ds.SeriesInstanceUID = generate_uid()
+    mod.set_sop_instance_uid(new_ds, rs_sop_uid or generate_uid())
+    new_ds.SeriesInstanceUID = rs_series_uid or generate_uid()
 
     now = datetime.now()
     new_ds.InstanceCreationDate = now.strftime("%Y%m%d")
@@ -684,6 +785,366 @@ def interactive_center_prompt(
 # Hauptablauf
 # ---------------------------------------------------------------------------
 
+@dataclass
+class CasePreflight:
+    """Ergebnis von ``preflight_case``: geprueft, nur Header gelesen, nichts geschrieben."""
+    case_dir: Path
+    case_id: str
+    ct_dir: Path
+    rs_path: Path
+    siblings: list                 # RP*/RD*-Dateien daneben (werden nicht transformiert)
+    ct_headers: list               # CT-Header ohne Pixel, nach z sortiert
+    rs_ds: pydicom.Dataset
+    ct_for_uid: str
+    geom: dict                     # modifier.extract_geometry der Header
+    volume_center: np.ndarray
+    markers: list                  # find_point_markers(rs_ds)
+    issues: list = field(default_factory=list)
+
+
+def preflight_case(case_dir: str, rs_override: "str | None" = None, label: str = "_RB") -> CasePreflight:
+    """
+    Stufe 1: Discovery, CT-Header (ohne Pixel), Geometrie- und
+    Orientierungspruefung, RTSTRUCT, FoR-Konsistenz, ``--label``.  Druckt den
+    Kopf des Laufs.  Eingabefehler -> ``ValueError``/``FileNotFoundError``.
+    """
+    ctx = _runtime.current()
+    ctx.stage("preflight", "Fall pruefen")
+    ct_dir, rs_path, siblings = discover_case(case_dir, rs_override=rs_override, return_siblings=True)
+    print(f"\nLade Case '{case_dir}' …")
+    issues = []
+    if siblings:
+        print(_siblings_note(siblings))
+        issues.append(Issue(
+            "info", "CASE.SIBLINGS_NOT_TRANSFORMED",
+            "Plan- und Dosisdateien im Fallordner werden nicht mit-transformiert: "
+            + ", ".join(p.name for p in siblings),
+            hint_de="RTPLAN/RTDOSE passen nach der Transformation nicht mehr zum CT."))
+    print(f"  CT-Ordner   : {ct_dir}")
+    print(f"  RTSTRUCT    : {rs_path}")
+
+    headers = load_ct_headers(ct_dir)
+    print(f"  {len(headers)} CT-Slices geladen")
+    validate_ct_geometry(headers)
+
+    rs_ds = pydicom.dcmread(str(rs_path))
+    if getattr(rs_ds, "Modality", None) != "RTSTRUCT":
+        raise ValueError(
+            f"Datei {rs_path!r} ist keine RTSTRUCT (Modalitaet: "
+            f"{getattr(rs_ds, 'Modality', '?')})."
+        )
+    ct_for_uid = get_ct_frame_of_reference(headers)
+    validate_for_consistency(ct_for_uid, rs_ds)
+    print(f"  FrameOfReferenceUID OK ({ct_for_uid[:24]}…)")
+
+    case_id = Path(case_dir).resolve().name
+    validate_label(label, case_id)
+    geom = mod.extract_geometry(headers)
+    vol_c = mod.volume_center(geom)
+    nz, ny, nx = geom["shape"]
+    print(f"  Volumengroesse: {nz} x {ny} x {nx}  Voxel")
+    print(f"  Volumen-Mitte : ({vol_c[0]:.1f}, {vol_c[1]:.1f}, {vol_c[2]:.1f}) mm")
+    return CasePreflight(
+        case_dir=Path(case_dir), case_id=case_id, ct_dir=ct_dir, rs_path=rs_path,
+        siblings=siblings, ct_headers=headers, rs_ds=rs_ds, ct_for_uid=ct_for_uid, geom=geom,
+        volume_center=vol_c, markers=find_point_markers(rs_ds), issues=issues,
+    )
+
+
+def resolve_center(spec: "str | None", rs_ds: pydicom.Dataset, volume_center_lps: np.ndarray,
+                   interactive: bool = True) -> "tuple[np.ndarray | None, str]":
+    """
+    Rotationszentrum aus ``spec`` ('volume', 'marker:NAME', 'x,y,z').  Ohne
+    ``spec`` fragt ein Prompt nach, aber nur wenn ``interactive`` und stdin ein
+    Terminal ist (ohne Konsole, z.B. pythonw oder GUI-EXE, ist stdin None);
+    sonst Volumenmitte.  Rueckgabe: (Position oder None fuer die Volumenmitte,
+    Label fuer Ausgabe und Beschreibung).
+    """
+    if spec is not None:
+        pos = parse_center_spec(spec, rs_ds, volume_center_lps)
+        key = spec.lower().strip()
+        if key == "volume":
+            return None, "Volumenmitte"
+        if key.startswith("marker:"):
+            return pos, f"Marker '{spec.split(':', 1)[1].strip()}'"
+        return pos, "manuell"
+    if not interactive or sys.stdin is None or not sys.stdin.isatty():
+        return None, "Volumenmitte"
+    pos = interactive_center_prompt(rs_ds, volume_center_lps)
+    if np.allclose(pos, volume_center_lps, atol=1e-9):
+        return None, "Volumenmitte"
+    return pos, "interaktiv"
+
+
+@dataclass
+class TransformPlan:
+    """
+    Ergebnis von ``plan_transform``: Matrix, Pfade, vorab vergebene UIDs, das
+    fertig transformierte RTSTRUCT und der Clipping-Befund.  Noch ist nichts
+    geschrieben; Fehler im RTSTRUCT (z.B. Verweise auf fremde CT-Schichten)
+    sind hier bereits aufgefallen.
+    """
+    params: dict                   # tx, ty, tz, rx, ry, rz
+    method: str
+    order: int
+    label: str
+    T: np.ndarray
+    center: np.ndarray
+    center_label: str
+    drehpunkt_pos: np.ndarray
+    case_out: Path
+    ct_out: Path
+    rs_out: Path
+    ct_series_uid: str
+    sop_map: dict                  # alte CT-SOP -> neue CT-SOP
+    new_for_uid: "str | None"
+    for_strategy: str              # keep | new
+    series_number_offset: int
+    new_rs: pydicom.Dataset
+    clipping: list                 # [(roi_name, n_outside, n_total, frac)]
+    issues: list = field(default_factory=list)
+
+
+def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
+                   rx: float, ry: float, rz: float, *, output_dir: str,
+                   method: str = "resample", order: int = 1, label: str = "_RB",
+                   center: "np.ndarray | None" = None, center_label: str = "Volumenmitte",
+                   new_frame_of_reference: bool = False,
+                   series_number_offset: int = 1000) -> TransformPlan:
+    """
+    Stufe 2: Transformationsmatrix, Ausgabepfade und alle neuen UIDs; das
+    RTSTRUCT wird schon hier transformiert und auf Clipping geprueft, damit
+    beim Schreiben kein halber Ausgabeordner entstehen kann.  Druckt den
+    Transformationsblock.
+    """
+    ctx = _runtime.current()
+    ctx.check_cancel()
+    ctx.stage("plan", "Transformation planen")
+    if method not in ("resample", "metadata"):
+        raise ValueError(f"Unbekannte Methode: {method!r}")
+    vol_c = pre.volume_center
+    if center is None:
+        center = vol_c
+        resolved_label = center_label if center_label != "Volumenmitte" else "Volumenmitte"
+    else:
+        center = np.asarray(center, dtype=np.float64).reshape(3)
+        resolved_label = center_label
+
+    print(f"\nTransformation:")
+    print(f"  Translation : tx={tx} mm, ty={ty} mm, tz={tz} mm")
+    print(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [intrinsisch XYZ]")
+    print(f"  Methode     : {method}")
+    print(f"  Zentrum     : {resolved_label}  "
+          f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
+    T = mod.build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
+
+    case_out = Path(output_dir) / f"{pre.case_id}{label}"
+    new_for_uid = str(generate_uid()) if new_frame_of_reference else None
+    for_strategy = "new" if new_frame_of_reference else "keep"
+    ct_series_uid = str(generate_uid())
+    sop_map = {str(s.SOPInstanceUID): str(generate_uid())
+               for s in pre.ct_headers if getattr(s, "SOPInstanceUID", None)}
+    # Drehpunkt im transformierten System: die Rotation laesst das Zentrum
+    # invariant, also T(centre) = centre + (tx, ty, tz).
+    drehpunkt_pos = center + np.array([tx, ty, tz])
+    description = build_transform_description(
+        tx, ty, tz, rx, ry, rz,
+        center_label=resolved_label, method=method, for_strategy=for_strategy,
+    )
+    new_rs = transform_rtstruct(
+        rs_ds=pre.rs_ds, T=T, sop_map=sop_map, new_ct_series_uid=ct_series_uid,
+        new_for_uid=new_for_uid, drehpunkt_position=drehpunkt_pos, label_suffix=label,
+        description=description, series_number_offset=series_number_offset,
+    )
+    clipping = check_contour_clipping(new_rs, pre.geom, method)
+
+    issues = []
+    if for_strategy == "keep":
+        issues.append(Issue(
+            "warning", "CASE.FOR_KEPT",
+            "Original und transformierter Datensatz tragen dieselbe FrameOfReferenceUID.",
+            hint_de="Das TPS legt vorhandene Plaene/Dosen des Originals ungeprueft auf das "
+                    "transformierte CT. Fuer getrennte Planung eine neue FoR vergeben.",
+            field="new_frame_of_reference"))
+    if clipping:
+        issues.append(Issue(
+            "warning", "CASE.CONTOUR_CLIPPING",
+            f"{len(clipping)} Struktur(en) ragen nach der Transformation aus dem CT-Volumen.",
+            hint_de="Dort zeigt das CT Luft statt Anatomie; die Methode 'metadata' vermeidet das.",
+            field="method",
+            detail="\n".join(f"{n}: {o} von {t} Punkten ({f:.1%})" for n, o, t, f in clipping)))
+    return TransformPlan(
+        params={"tx": tx, "ty": ty, "tz": tz, "rx": rx, "ry": ry, "rz": rz},
+        method=method, order=order, label=label, T=T, center=center, center_label=resolved_label,
+        drehpunkt_pos=drehpunkt_pos, case_out=case_out, ct_out=case_out / "CT",
+        rs_out=case_out / f"RS{label}.dcm", ct_series_uid=ct_series_uid, sop_map=sop_map,
+        new_for_uid=new_for_uid, for_strategy=for_strategy,
+        series_number_offset=series_number_offset, new_rs=new_rs, clipping=clipping, issues=issues,
+    )
+
+
+def print_dry_run(pre: CasePreflight, plan: TransformPlan) -> dict:
+    """``--dry-run``: Matrix und geplante Pfade ausgeben; nichts wird geschrieben."""
+    print("\nDRY-RUN  ----  es werden KEINE Dateien geschrieben.")
+    print("\nT-Matrix (Patient -> Patient):")
+    print(np.array2string(plan.T, precision=4, suppress_small=True))
+    print(f"\nGeplante Output-Pfade:")
+    print(f"  CT-Verzeichnis : {plan.ct_out}")
+    print(f"  RTSTRUCT       : {plan.rs_out}")
+    return {
+        "case_id":    pre.case_id,
+        "dry_run":    True,
+        "T":          plan.T.tolist(),
+        "rotation_center": plan.center.tolist(),
+        "rotation_center_label": plan.center_label,
+        "planned_ct_output_dir": str(plan.ct_out),
+        "planned_rs_output_path": str(plan.rs_out),
+        "clipping": _clipping_dicts(plan.clipping),
+        "issues": [i.to_dict() for i in pre.issues + plan.issues],
+    }
+
+
+def _clipping_dicts(clipping: list) -> list:
+    return [{"roi": n, "n_outside": o, "n_total": t, "fraction": f} for n, o, t, f in clipping]
+
+
+def execute_transform(pre: CasePreflight, plan: TransformPlan, *, verify: bool = False,
+                      no_viz: bool = False, viz_ct_surface: bool = False) -> dict:
+    """
+    Stufe 3: CT-Pixel laden, transformieren und in einem Durchgang schreiben
+    (SeriesNumber-Offset und vorab vergebene UIDs), danach das fertige
+    RTSTRUCT; optional ``--verify`` und die Vorher/Nachher-Ansicht.
+    """
+    ctx = _runtime.current()
+    ctx.check_cancel()
+    ctx.stage("ct_transform", "CT transformieren")
+    if plan.new_for_uid is not None:
+        print(f"  FoR-Strategie: NEU ({plan.new_for_uid[:24]}…)")
+    else:
+        print(
+            "  FoR-Strategie: KEEP (alte FoR wird beibehalten).\n"
+            "  ! WARNUNG ! ----------------------------------------------------------\n"
+            "    Beide Datensaetze (Original + transformiert) tragen DIESELBE\n"
+            "    FrameOfReferenceUID, obwohl sie sich physikalisch unterscheiden.\n"
+            "    Das TPS verlinkt sie automatisch ohne Geometrievalidierung.\n"
+            "    Folgen:\n"
+            "      - Vorhandene RTPLAN/RTDOSE des Originals werden auf das\n"
+            "        transformierte CT geworfen, obwohl sie geometrisch nicht\n"
+            "        mehr dazu passen.  Dosis-Overlays sind dann irrefuehrend.\n"
+            "      - Mischen von Konturen aus Original-RS und transformiertem RS\n"
+            "        in einem Plan ergibt klinisch falsche DVHs.\n"
+            "    Verwende --new-frame-of-reference fuer eine saubere Trennung,\n"
+            "    falls die Datensaetze unabhaengig voneinander geplant werden.\n"
+            "  ----------------------------------------------------------------------"
+        )
+
+    slices = mod.load_ct_series(str(pre.ct_dir))
+    if [str(getattr(s, "SOPInstanceUID", "")) for s in slices] != \
+            [str(getattr(h, "SOPInstanceUID", "")) for h in pre.ct_headers]:
+        raise ValueError(f"CT-Ordner {str(pre.ct_dir)!r} hat sich seit der Pruefung geaendert; "
+                         "bitte den Lauf neu starten.")
+    need_hu = plan.method == "resample" or (not no_viz and viz_ct_surface)
+    volume_hu = mod.slices_to_hu(slices) if need_hu else None
+    plan.case_out.mkdir(parents=True, exist_ok=True)
+    save_kw = dict(series_description_suffix=plan.label, frame_of_reference_uid=plan.new_for_uid,
+                   series_uid=plan.ct_series_uid, sop_map=plan.sop_map,
+                   series_number_offset=plan.series_number_offset)
+    if plan.method == "metadata":
+        print("\nAktualisiere DICOM-Metadaten (HU-Werte exakt erhalten) …")
+        out_slices = mod.apply_metadata_transform(slices, plan.T)
+        save_info = mod.save_ct_series(out_slices, str(plan.ct_out), **save_kw)
+    else:
+        print(f"\nNeuabtastung (Interpolationsordnung {plan.order}) …")
+        new_volume = mod.resample_volume(volume_hu, pre.geom["affine"], plan.T, order=plan.order)
+        save_info = mod.save_ct_series(slices, str(plan.ct_out), new_volume_hu=new_volume, **save_kw)
+
+    ctx.check_cancel()
+    ctx.stage("rs_write", "RTSTRUCT schreiben")
+    print("\nTransformiere RTSTRUCT …")
+    new_rs = plan.new_rs
+    new_rs.save_as(str(plan.rs_out))
+    dp = plan.drehpunkt_pos
+    print(f"  RTSTRUCT geschrieben -> {plan.rs_out}")
+    print(f"  Drehpunkt-Marker eingefuegt bei ({dp[0]:.2f}, {dp[1]:.2f}, {dp[2]:.2f}) mm")
+
+    # Clipping (nur resample-Mode; in plan_transform berechnet)
+    if plan.clipping:
+        print("\n  ! CLIPPING-WARNUNG ! Konturpunkte ausserhalb des Output-CT-Grids:")
+        print(f"  {'ROI':<28} {'aussen':>8} {'gesamt':>8} {'Anteil':>8}")
+        for roi_name, n_out, n_total, frac in sorted(plan.clipping, key=lambda x: -x[3]):
+            print(f"    {roi_name:<26} {n_out:>8} {n_total:>8} {frac:>7.1%}")
+        print(
+            "    Diese Strukturen ragen aus dem aufgenommenen Bildvolumen heraus.\n"
+            "    Im TPS sind die Konturen sichtbar, aber das CT zeigt dort -1000 HU\n"
+            "    (Luft) statt Anatomie.  DVH-Auswertungen werden 'kuenstlich besser'\n"
+            "    aussehen, weil Volumenanteile schlicht fehlen.\n"
+            "    Tipp: --method metadata vermeidet das (oblique Slices, exakte\n"
+            "    Geometrie), wird aber von manchen aelteren TPS abgelehnt."
+        )
+
+    issues = list(pre.issues) + list(plan.issues)
+    verify_report = None
+    if verify:
+        ctx.stage("verify", "Centroide pruefen")
+        verify_report = _verify_rs_centroids(pre.rs_ds, str(plan.rs_out), plan.T)
+        if not verify_report["passed"]:
+            issues.append(Issue(
+                "warning", "CASE.VERIFY_FAILED",
+                f"Centroid-Pruefung: Abweichung {verify_report['max_err_mm']:.3e} mm ueber der "
+                f"Schwelle {verify_report['threshold_mm']:g} mm.",
+                hint_de="Transformierte Konturen nicht verwenden und den Fall melden."))
+
+    # Vorher/Nachher-Visualisierung; Fehler duerfen den geschriebenen Transform
+    # nicht entwerten -> defensiv abgefangen.
+    if not no_viz:
+        ctx.check_cancel()
+        ctx.stage("viz", "Vorher/Nachher-Ansicht erstellen")
+        try:
+            from . import visualizer as viz
+            viz.run_case_visualization(
+                orig_ds=pre.rs_ds,
+                new_ds=new_rs,
+                center=plan.center,
+                drehpunkt_pos=plan.drehpunkt_pos,
+                translation=(plan.params["tx"], plan.params["ty"], plan.params["tz"]),
+                T=plan.T,
+                output_dir=plan.case_out,
+                markers=pre.markers,
+                geom=pre.geom,
+                volume_hu=volume_hu,
+                ct_surface=viz_ct_surface,
+            )
+        except _runtime.JobCancelled:
+            raise
+        except Exception as e:
+            print(f"\n  Hinweis: Visualisierung fehlgeschlagen ({e}). "
+                  "Transform-Dateien sind dennoch gueltig geschrieben.")
+            issues.append(Issue("warning", "CASE.VIZ_FAILED",
+                                f"Visualisierung fehlgeschlagen ({type(e).__name__}: {e}).",
+                                hint_de="Die Transform-Dateien sind trotzdem gueltig."))
+
+    print("\nFertig.")
+    return {
+        "case_id":         pre.case_id,
+        "output_dir":      str(plan.case_out),
+        "ct_output_dir":   str(plan.ct_out),
+        "rs_output_path":  str(plan.rs_out),
+        "ct_series_uid":   save_info["series_uid"],
+        "ct_for_uid":      save_info["frame_of_reference_uid_used"],
+        "sop_map":         save_info["sop_map"],
+        "rs_sop_uid":      str(new_rs.SOPInstanceUID),
+        "rs_series_uid":   str(new_rs.SeriesInstanceUID),
+        "rotation_center": plan.center.tolist(),
+        "rotation_center_label": plan.center_label,
+        "drehpunkt_pos":   plan.drehpunkt_pos.tolist(),
+        "verify":          verify_report,
+        "method":          plan.method,
+        "for_strategy":    plan.for_strategy,
+        "clipping":        _clipping_dicts(plan.clipping),
+        "issues":          [i.to_dict() for i in issues],
+    }
+
+
 def run_case_transform(
     case_dir: str,
     output_dir: str,
@@ -703,230 +1164,18 @@ def run_case_transform(
     viz_ct_surface: bool = False,
 ) -> dict:
     """
-    Stage-1-Implementierung: CT transformieren, RS unveraendert kopieren.
-
-    Gibt ein Dict mit den wichtigsten neuen UIDs / Pfaden zurueck (fuer Tests
-    und nachgelagerte Stages nutzbar).
+    Kompletter Lauf in drei Stufen: ``preflight_case`` -> ``plan_transform`` ->
+    ``execute_transform`` (bzw. ``print_dry_run``).  Gibt ein Dict mit den
+    neuen UIDs, Pfaden, Clipping-Befund und ``issues`` zurueck.
     """
-    # ── 1. Discovery + Pre-Flight ────────────────────────────────────────────
-    print(f"\nLade Case '{case_dir}' …")
-    ct_dir, rs_path = discover_case(case_dir, rs_override=rs_override)
-    print(f"  CT-Ordner   : {ct_dir}")
-    print(f"  RTSTRUCT    : {rs_path}")
-
-    slices = mod.load_ct_series(str(ct_dir))
-    print(f"  {len(slices)} CT-Slices geladen")
-    validate_ct_geometry(slices)
-
-    rs_ds = pydicom.dcmread(str(rs_path))
-    if getattr(rs_ds, "Modality", None) != "RTSTRUCT":
-        raise ValueError(
-            f"Datei {rs_path!r} ist keine RTSTRUCT (Modalitaet: "
-            f"{getattr(rs_ds, 'Modality', '?')})."
-        )
-
-    ct_for_uid = get_ct_frame_of_reference(slices)
-    validate_for_consistency(ct_for_uid, rs_ds)
-    print(f"  FrameOfReferenceUID OK ({ct_for_uid[:24]}…)")
-
-    # ── 2. Output-Layout vorbereiten ─────────────────────────────────────────
-    case_id = Path(case_dir).resolve().name
-    case_out = Path(output_dir) / f"{case_id}{label}"
-    ct_out   = case_out / "CT"
-    rs_out   = case_out / f"RS{label}.dcm"
-    if not dry_run:
-        case_out.mkdir(parents=True, exist_ok=True)
-
-    # ── 3. CT-Geometrie & Transform-Matrix ───────────────────────────────────
-    volume_hu = mod.slices_to_hu(slices)
-    geom      = mod.extract_geometry(slices)
-    vol_c     = mod.volume_center(geom)
-    if center is None:
-        center = vol_c
-        resolved_label = center_label if center_label != "Volumenmitte" else "Volumenmitte"
-    else:
-        center = np.asarray(center, dtype=np.float64).reshape(3)
-        resolved_label = center_label
-
-    nz, ny, nx = geom["shape"]
-    print(f"  Volumengroesse: {nz} x {ny} x {nx}  Voxel")
-    print(f"  Volumen-Mitte : ({vol_c[0]:.1f}, {vol_c[1]:.1f}, {vol_c[2]:.1f}) mm")
-
-    print(f"\nTransformation:")
-    print(f"  Translation : tx={tx} mm, ty={ty} mm, tz={tz} mm")
-    print(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [intrinsisch XYZ]")
-    print(f"  Methode     : {method}")
-    print(f"  Zentrum     : {resolved_label}  "
-          f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
-
-    T = mod.build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
-
-    # ── Dry-Run: nur Plan ausgeben, nichts schreiben ─────────────────────────
+    pre = preflight_case(case_dir, rs_override=rs_override, label=label)
+    plan = plan_transform(pre, tx, ty, tz, rx, ry, rz, output_dir=output_dir, method=method,
+                          order=order, label=label, center=center, center_label=center_label,
+                          new_frame_of_reference=new_frame_of_reference,
+                          series_number_offset=series_number_offset)
     if dry_run:
-        print("\nDRY-RUN  ----  es werden KEINE Dateien geschrieben.")
-        print("\nT-Matrix (Patient -> Patient):")
-        print(np.array2string(T, precision=4, suppress_small=True))
-        print(f"\nGeplante Output-Pfade:")
-        case_id_dr = Path(case_dir).resolve().name
-        case_out_dr = Path(output_dir) / f"{case_id_dr}{label}"
-        print(f"  CT-Verzeichnis : {case_out_dr / 'CT'}")
-        print(f"  RTSTRUCT       : {case_out_dr / f'RS{label}.dcm'}")
-        return {
-            "case_id":    Path(case_dir).resolve().name,
-            "dry_run":    True,
-            "T":          T.tolist(),
-            "rotation_center": center.tolist(),
-            "rotation_center_label": resolved_label,
-        }
-
-    # ── 3b. FoR-Strategie ────────────────────────────────────────────────────
-    if new_frame_of_reference:
-        new_for_uid = str(generate_uid())
-        for_strategy = "new"
-        print(f"  FoR-Strategie: NEU ({new_for_uid[:24]}…)")
-    else:
-        new_for_uid = None  # save_ct_series und transform_rtstruct lassen FoR unveraendert
-        for_strategy = "keep"
-        print(
-            "  FoR-Strategie: KEEP (alte FoR wird beibehalten).\n"
-            "  ! WARNUNG ! ----------------------------------------------------------\n"
-            "    Beide Datensaetze (Original + transformiert) tragen DIESELBE\n"
-            "    FrameOfReferenceUID, obwohl sie sich physikalisch unterscheiden.\n"
-            "    Das TPS verlinkt sie automatisch ohne Geometrievalidierung.\n"
-            "    Folgen:\n"
-            "      - Vorhandene RTPLAN/RTDOSE des Originals werden auf das\n"
-            "        transformierte CT geworfen, obwohl sie geometrisch nicht\n"
-            "        mehr dazu passen.  Dosis-Overlays sind dann irrefuehrend.\n"
-            "      - Mischen von Konturen aus Original-RS und transformiertem RS\n"
-            "        in einem Plan ergibt klinisch falsche DVHs.\n"
-            "    Verwende --new-frame-of-reference fuer eine saubere Trennung,\n"
-            "    falls die Datensaetze unabhaengig voneinander geplant werden.\n"
-            "  ----------------------------------------------------------------------"
-        )
-
-    # ── 4. CT transformieren + speichern ─────────────────────────────────────
-    if method == "metadata":
-        print("\nAktualisiere DICOM-Metadaten (HU-Werte exakt erhalten) …")
-        out_slices = mod.apply_metadata_transform(slices, T)
-        save_info  = mod.save_ct_series(
-            out_slices, str(ct_out),
-            series_description_suffix=label,
-            frame_of_reference_uid=new_for_uid,
-        )
-    elif method == "resample":
-        print(f"\nNeuabtastung (Interpolationsordnung {order}) …")
-        new_volume = mod.resample_volume(volume_hu, geom["affine"], T, order=order)
-        save_info  = mod.save_ct_series(
-            slices, str(ct_out), new_volume_hu=new_volume,
-            series_description_suffix=label,
-            frame_of_reference_uid=new_for_uid,
-        )
-    else:
-        raise ValueError(f"Unbekannte Methode: {method!r}")
-
-    # SeriesNumber-Offset auf alle CT-Slices anwenden (unabhaengig von Methode)
-    if series_number_offset:
-        for fname in sorted(os.listdir(str(ct_out))):
-            if not fname.endswith(".dcm"):
-                continue
-            fpath = os.path.join(str(ct_out), fname)
-            ds_ct = pydicom.dcmread(fpath)
-            try:
-                sn = int(getattr(ds_ct, "SeriesNumber", 0) or 0)
-                ds_ct.SeriesNumber = sn + series_number_offset
-                ds_ct.save_as(fpath)
-            except (TypeError, ValueError):
-                pass
-
-    # ── 5. RTSTRUCT transformieren (Stage 2) ─────────────────────────────────
-    # Drehpunkt-Position im transformierten Koordinatensystem.  Da die Rotation
-    # das gewaehlte Zentrum invariant laesst, gilt: T(centre) = centre + (tx,ty,tz).
-    drehpunkt_pos = center + np.array([tx, ty, tz])
-
-    print("\nTransformiere RTSTRUCT …")
-    description = build_transform_description(
-        tx, ty, tz, rx, ry, rz,
-        center_label=resolved_label, method=method, for_strategy=for_strategy,
-    )
-    new_rs = transform_rtstruct(
-        rs_ds=rs_ds,
-        T=T,
-        sop_map=save_info["sop_map"],
-        new_ct_series_uid=save_info["series_uid"],
-        new_for_uid=new_for_uid,
-        drehpunkt_position=drehpunkt_pos,
-        label_suffix=label,
-        description=description,
-        series_number_offset=series_number_offset,
-    )
-    new_rs.save_as(str(rs_out))
-    print(f"  RTSTRUCT geschrieben -> {rs_out}")
-    print(f"  Drehpunkt-Marker eingefuegt bei "
-          f"({drehpunkt_pos[0]:.2f}, {drehpunkt_pos[1]:.2f}, {drehpunkt_pos[2]:.2f}) mm")
-
-    # ── 6a. Clipping-Check (nur resample-Mode) ───────────────────────────────
-    clipping_issues = check_contour_clipping(new_rs, geom, method)
-    if clipping_issues:
-        print("\n  ! CLIPPING-WARNUNG ! Konturpunkte ausserhalb des Output-CT-Grids:")
-        print(f"  {'ROI':<28} {'aussen':>8} {'gesamt':>8} {'Anteil':>8}")
-        for roi_name, n_out, n_total, frac in sorted(
-            clipping_issues, key=lambda x: -x[3]
-        ):
-            print(f"    {roi_name:<26} {n_out:>8} {n_total:>8} {frac:>7.1%}")
-        print(
-            "    Diese Strukturen ragen aus dem aufgenommenen Bildvolumen heraus.\n"
-            "    Im TPS sind die Konturen sichtbar, aber das CT zeigt dort -1000 HU\n"
-            "    (Luft) statt Anatomie.  DVH-Auswertungen werden 'kuenstlich besser'\n"
-            "    aussehen, weil Volumenanteile schlicht fehlen.\n"
-            "    Tipp: --method metadata vermeidet das (oblique Slices, exakte\n"
-            "    Geometrie), wird aber von manchen aelteren TPS abgelehnt."
-        )
-
-    # ── 6b. Optional: Verifikation der Centroid-Linearitaet ──────────────────
-    verify_report: dict | None = None
-    if verify:
-        verify_report = _verify_rs_centroids(rs_ds, str(rs_out), T)
-
-    # ── 6c. Vorher/Nachher-Visualisierung ────────────────────────────────────
-    # Vergleicht Original-RS (rs_ds) mit transformiertem RS (new_rs) und blendet
-    # Rotationszentrum + POINT-Marker ein.  Fehler hier duerfen den bereits
-    # geschriebenen Transform nicht entwerten -> defensiv abgefangen.
-    if not no_viz:
-        try:
-            from . import visualizer as viz
-            viz.run_case_visualization(
-                orig_ds=rs_ds,
-                new_ds=new_rs,
-                center=center,
-                drehpunkt_pos=drehpunkt_pos,
-                translation=(tx, ty, tz),
-                T=T,
-                output_dir=case_out,
-                markers=find_point_markers(rs_ds),
-                geom=geom,
-                volume_hu=volume_hu,
-                ct_surface=viz_ct_surface,
-            )
-        except Exception as e:
-            print(f"\n  Hinweis: Visualisierung fehlgeschlagen ({e}). "
-                  "Transform-Dateien sind dennoch gueltig geschrieben.")
-
-    print("\nFertig.")
-    return {
-        "case_id":         case_id,
-        "output_dir":      str(case_out),
-        "ct_output_dir":   str(ct_out),
-        "rs_output_path":  str(rs_out),
-        "ct_series_uid":   save_info["series_uid"],
-        "ct_for_uid":      save_info["frame_of_reference_uid_used"],
-        "sop_map":         save_info["sop_map"],
-        "rs_sop_uid":      str(new_rs.SOPInstanceUID),
-        "rs_series_uid":   str(new_rs.SeriesInstanceUID),
-        "rotation_center": center.tolist(),
-        "rotation_center_label": resolved_label,
-        "drehpunkt_pos":   drehpunkt_pos.tolist(),
-        "verify":          verify_report,
-    }
+        return print_dry_run(pre, plan)
+    return execute_transform(pre, plan, verify=verify, no_viz=no_viz, viz_ct_surface=viz_ct_surface)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,27 +1263,9 @@ def _resolve_center_from_args(
     rs_ds: pydicom.Dataset,
     volume_center_lps: np.ndarray,
 ) -> "tuple[np.ndarray | None, str]":
-    """
-    Bestimmt aus den CLI-Argumenten + dem RS das gewuenschte Rotationszentrum.
-
-    Rueckgabe: (Position oder None fuer Volumenzentrum, Label fuer Logging).
-    """
-    if args.center is not None:
-        pos = parse_center_spec(args.center, rs_ds, volume_center_lps)
-        if args.center.lower().strip() == "volume":
-            return None, "Volumenmitte"
-        if args.center.lower().strip().startswith("marker:"):
-            return pos, f"Marker '{args.center.split(':', 1)[1].strip()}'"
-        return pos, "manuell"
-
-    # Ohne Konsole (pythonw, GUI-EXE) ist sys.stdin None -> nie interaktiv
-    if args.non_interactive or sys.stdin is None or not sys.stdin.isatty():
-        return None, "Volumenmitte"
-
-    pos = interactive_center_prompt(rs_ds, volume_center_lps)
-    if np.allclose(pos, volume_center_lps, atol=1e-9):
-        return None, "Volumenmitte"
-    return pos, "interaktiv"
+    """CLI-Huelle um ``resolve_center`` (``--center``, ``--non-interactive``)."""
+    return resolve_center(args.center, rs_ds, volume_center_lps,
+                          interactive=not args.non_interactive)
 
 
 def _run_self_test(args: argparse.Namespace) -> int:
@@ -1055,7 +1286,7 @@ def _run_self_test(args: argparse.Namespace) -> int:
     import tempfile
     from .analyzer import load_rtstruct, extract_contours, get_structure_names
 
-    _, rs_path = discover_case(args.case_dir, rs_override=args.rs_override)
+    _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override, return_siblings=True)
     orig = load_rtstruct(str(rs_path))
     names = get_structure_names(orig)
 
@@ -1175,52 +1406,27 @@ def main(argv: "list[str] | None" = None) -> int:
 
         # --list-markers: nur RS oeffnen und Marker auflisten, dann beenden.
         if args.list_markers:
-            _, rs_path = discover_case(args.case_dir, rs_override=args.rs_override)
+            _, rs_path, _ = discover_case(args.case_dir, rs_override=args.rs_override,
+                                          return_siblings=True)
             rs_ds = pydicom.dcmread(str(rs_path))
             print_marker_table(find_point_markers(rs_ds))
             return 0
 
-        # Center-Resolution braucht das RS und das Volumenzentrum.  Damit
-        # der interaktive Prompt sinnvolle Defaults zeigen kann, laden wir
-        # CT (lite, ohne Pixel) + RS bereits hier.
-        ct_dir, rs_path = discover_case(args.case_dir, rs_override=args.rs_override)
-        rs_ds = pydicom.dcmread(str(rs_path))
-
-        # CT-Metadaten ohne Pixel laden -> Volumenzentrum berechnen.
-        import glob
-        ct_files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
-        meta_slices = []
-        for f in ct_files:
-            try:
-                ds = pydicom.dcmread(f, stop_before_pixels=True)
-                if hasattr(ds, "ImagePositionPatient"):
-                    meta_slices.append(ds)
-            except Exception:
-                pass
-        if not meta_slices:
-            raise ValueError(f"Keine gueltigen CT-Slices in {ct_dir}")
-        meta_slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
-        geom_lite = mod.extract_geometry(meta_slices)
-        vol_c = mod.volume_center(geom_lite)
-
-        center, center_label = _resolve_center_from_args(args, rs_ds, vol_c)
-
-        run_case_transform(
-            case_dir=args.case_dir,
-            output_dir=args.output,
-            tx=args.tx, ty=args.ty, tz=args.tz,
-            rx=args.rx, ry=args.ry, rz=args.rz,
-            method=args.method, order=args.order,
-            label=args.label,
-            rs_override=args.rs_override,
-            center=center,
-            center_label=center_label,
+        # Stufen wie run_case_transform; das Rotationszentrum wird nach der
+        # (Header-)Pruefung gewaehlt, damit der Prompt Fall und Volumenmitte zeigt.
+        pre = preflight_case(args.case_dir, rs_override=args.rs_override, label=args.label)
+        center, center_label = _resolve_center_from_args(args, pre.rs_ds, pre.volume_center)
+        plan = plan_transform(
+            pre, args.tx, args.ty, args.tz, args.rx, args.ry, args.rz,
+            output_dir=args.output, method=args.method, order=args.order, label=args.label,
+            center=center, center_label=center_label,
             new_frame_of_reference=args.new_frame_of_reference,
-            dry_run=args.dry_run,
-            verify=args.verify,
-            no_viz=args.no_viz,
-            viz_ct_surface=args.viz_ct_surface,
         )
+        if args.dry_run:
+            print_dry_run(pre, plan)
+        else:
+            execute_transform(pre, plan, verify=args.verify, no_viz=args.no_viz,
+                              viz_ct_surface=args.viz_ct_surface)
     except (FileNotFoundError, ValueError, KeyError) as e:
         print(f"\nFehler: {e}", file=sys.stderr)
         return 2
