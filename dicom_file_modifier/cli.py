@@ -9,6 +9,7 @@ cli.py - Einstiegspunkt ``dfm`` fuer alle Werkzeuge des Pakets (Plan P0.8).
   dfm demo OUT [...]                ... demo (synthetischer Demo-Fall)
   dfm selftest                      alle Self-Tests; case_modifier auf einem frischen Demo-Fall
   dfm worker --job JOB.json         einen Job der Desktop-App ausfuehren (JSON-Lines)
+  dfm gui [FALL]                    Desktop-App starten (Extra [gui])
   dfm --version [--json]
 
 Die Werkzeug-Befehle leiten ihre Argumente unveraendert an ``main(argv)`` des
@@ -43,6 +44,7 @@ def _usage() -> str:
     lines += [f"  {cmd:<15} {desc}" for cmd, (_, desc) in TOOLS.items()]
     lines += [f"  {'selftest':<15} Alle Self-Tests (Installationspruefung)",
               f"  {'worker':<15} Job der Desktop-App ausfuehren (--job JOB.json)",
+              f"  {'gui':<15} Desktop-App starten (Extra [gui])",
               "", "  dfm <befehl> --help    Optionen des Befehls",
               "  dfm --version [--json] Versionen"]
     return "\n".join(lines)
@@ -134,6 +136,9 @@ def main(argv: Optional[list] = None) -> int:
     if cmd == "worker":
         from .api import worker
         return worker.main(rest)
+    if cmd == "gui":
+        from .gui.app import main as gui_main
+        return gui_main(rest)
     print(f"Unbekannter Befehl {cmd!r}.\n\n{_usage()}", file=sys.stderr)
     return 2
 

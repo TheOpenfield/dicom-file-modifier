@@ -36,6 +36,7 @@ dicom-file-modifier/
 │   ├── __init__.py
 │   ├── __main__.py, cli.py  # `dfm` entry point (python -m dicom_file_modifier)
 │   ├── api/                 # Interface for scripts, the worker and the desktop app (settings, inspect, preview, run)
+│   ├── gui/                 # Desktop app (PySide6; extra [gui])
 │   ├── analyzer.py          # RTSTRUCT analysis module
 │   ├── modifier.py          # CT rigid body transformer
 │   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
@@ -99,6 +100,20 @@ dfm visualize | ct-transform | case-transform | dose-indices | demo ...
 dfm selftest              # installation check: all self-tests (case modifier on a freshly generated demo case)
 dfm --version --json      # versions of the package, the tools and the libraries
 ```
+
+### Desktop app (early version)
+
+The desktop app needs the `gui` extra (`uv sync --extra gui` or `pip install -e .[gui]`). Start it with `dfm gui [CASE]` or `dicom-rt-toolkit`.
+
+To run an analysis:
+1. Open a case folder, or drag it onto the window.
+2. Pick the settings.
+3. Check the pre-start review.
+4. Start the analysis.
+
+The results appear as a gallery with the statistics. The first page is the structure analysis; the dose-index and transform pages follow.
+
+Every run happens in a separate worker process (`dfm worker`). It writes to a staging folder that becomes the result folder only when the run succeeds. A cancelled run leaves nothing behind. The results go under `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`; the toolbar changes this folder.
 
 ### Python API
 

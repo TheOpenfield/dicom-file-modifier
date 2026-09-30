@@ -20,6 +20,7 @@ One entry point `dfm` (installed by `uv sync` / `pip install -e .`, also `python
 dfm analyze|visualize|ct-transform|case-transform|dose-indices|demo ...   # = python -m dicom_file_modifier.<module> ..., argv unchanged
 dfm selftest              # installation check: all self-tests, case_modifier on a freshly generated demo case
 dfm --version [--json]    # package, tool and library versions
+dfm gui [CASE]            # desktop app (needs `uv sync --extra gui`); also `dicom-rt-toolkit`
 ```
 
 Each module is invoked as `python -m dicom_file_modifier.<module>`:
@@ -101,6 +102,10 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - error classes and exit codes;
       - the inputs stay unchanged.
     - `tests/test_worker.py` (P0.8c): JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
+    - `tests/test_gui.py` (offscreen, skipped without PySide6):
+      - the structure page end to end through the real worker;
+      - `JobRunner` cancel;
+      - the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -226,6 +231,25 @@ The layer sits above the core; the core never imports it (only `cli` does), and 
   - Exit codes are 0/2/3/1.
   - Cancel works through the file `<job>.cancel` (`cancel_file`), polled in `check_cancel`. A hard kill is also safe: the app deletes the staging folder.
   - **Never read stdin in the worker.** On Windows, a thread blocked reading a stdin pipe makes every `GetFileType(stdin)` wait. DLLs call that while loading (numpy/OpenBLAS), under the loader lock, so the worker hangs at the first import and even `os._exit` hangs. QProcess always gives the child a stdin pipe.
+
+### `gui/` — desktop app (PySide6, extra `[gui]`)
+The GUI uses only `api`. Every computation runs in the worker, and the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
+
+| Module | Role |
+|---|---|
+| `app.py` | `dfm gui [CASE]`; cleans up orphaned staging folders at start |
+| `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
+| `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints), `IssueList`, `Gallery` |
+| `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
+| `structures_page.py` | inspect in the background → ROI table → form → `preview` on every change → job → gallery and `statistics.txt` |
+
+`JobRunner` details:
+- It starts the worker through `subprocess` with `CREATE_NO_WINDOW` rather than QProcess, and turns the JSON lines into signals.
+- Cancel writes `<job>.cancel` and kills the worker after 5 s.
+- It always deletes the staging folder and the job file afterwards.
+
+New pages follow the structure page.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.

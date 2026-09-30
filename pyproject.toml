@@ -35,6 +35,9 @@ dependencies = [
 [project.scripts]
 dfm = "dicom_file_modifier.cli:main"
 
+[project.gui-scripts]
+dicom-rt-toolkit = "dicom_file_modifier.gui.app:main"
+
 [project.optional-dependencies]
 gui = [
     "PySide6-Essentials>=6.10,<6.11",
