@@ -32,10 +32,10 @@ def available_memory_bytes() -> Optional[int]:
 
 
 def format_bytes(n: Optional[float]) -> str:
-    """``1.23e9`` -> ``'1,2 GB'`` (deutsches Dezimalkomma)."""
+    """``1.23e9`` -> ``'1.2 GB'`` (Dezimalpunkt wie alle Zahlen der Texte und Berichte)."""
     if n is None:
         return "?"
     for unit, size in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
         if n >= size:
-            return f"{n / size:.1f} {unit}".replace(".", ",")
+            return f"{n / size:.1f} {unit}"
     return f"{int(n)} B"

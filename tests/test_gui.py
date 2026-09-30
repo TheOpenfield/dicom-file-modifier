@@ -18,6 +18,7 @@ import pytest
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtGui import QValidator  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from dicom_file_modifier.api import dose, jobs, selection  # noqa: E402
@@ -25,6 +26,7 @@ from dicom_file_modifier.api.outputs import OutputSpec  # noqa: E402
 from dicom_file_modifier.demo import DemoSpec, make_demo_case  # noqa: E402
 from dicom_file_modifier.gui.config import AppConfig  # noqa: E402
 from dicom_file_modifier.gui.jobs import JobRunner  # noqa: E402
+from dicom_file_modifier.gui.widgets import DecimalSpinBox, SettingsForm  # noqa: E402
 from dicom_file_modifier.gui.window import MainWindow  # noqa: E402
 
 FORBIDDEN = ("matplotlib.pyplot", "plotly", "dicom_file_modifier.visualizer", "dicom_file_modifier.dose_viz")
@@ -92,7 +94,8 @@ def test_dose_page_end_to_end(app, demo, tmp_path):
     wait_until(app, page.start_button.isEnabled)
     text = page.preview_label.text()
     assert "PTV_1" in text and "20.00 Gy (aus dem RTPLAN)" in text and "Feingitter: 0.25 mm" in text
-    assert "RD:" in page.files_label.text() and "Dmax" in page.dose_label.text()
+    assert "RD:  Plan-Summe" in page.files_label.text() and "Dmax" in page.files_label.text()
+    assert page.dose_label.text().startswith("DVH: ")
 
     # Eclipse-kompatibel sperrt die Rasterfelder und zeigt die effektiven Werte
     mode, grid = page.form.widget("eclipse_compat"), page.form.widget("grid_mm")
@@ -114,12 +117,36 @@ def test_dose_page_end_to_end(app, demo, tmp_path):
     wait_until(app, lambda: page.last_result is not None)
     res = page.last_result
     assert res["status"] in ("ok", "ok_warnings"), res["issues"]
-    assert page.metrics.rowCount() == len(res["summary"]["targets"]) == 1
+    # Kennzahlen transponiert: je Ziel Wert, Eclipse, Abweichung; CI ohne Fehlalarm (ganze Isodose wie Eclipse)
+    m = page.metrics
+    assert [m.horizontalHeaderItem(j).text() for j in range(m.columnCount())] == ["Kennzahl", "PTV_1", "Eclipse",
+                                                                                   "Abw. %"]
+    rows = {m.item(i, 0).text(): i for i in range(m.rowCount())}
     ci = res["summary"]["targets"]["PTV_1"]["ci_paddick"]
-    assert page.metrics.item(0, 0).text() == "PTV_1" and page.metrics.item(0, 4).text() == f"{ci:.3f}"
+    assert m.item(rows["CI Paddick"], 1).text() == f"{ci:.3f}" and not m.item(rows["CI Paddick"], 2).text()
+    g = rows["CI Paddick global"]                                 # PIV-Bereich component: eigene Vergleichszeile
+    assert m.item(g, 2).text() and m.item(g, 3).icon().isNull() and "TV global [cm³]" not in rows
+    assert "alle innerhalb der Toleranz" in page.metrics_note.text()
+    assert not any(i["code"] == "DOSE.ECLIPSE_TOLERANCE" for i in res["issues"])
     assert "PTV_1" in page.report.toPlainText() and not page.viz_button.isEnabled()
     assert (Path(res["output_dir"]) / "run.json").is_file()
     win.close()
+
+
+def test_decimal_spinbox_accepts_a_comma_and_shows_a_point(app):
+    w = DecimalSpinBox()
+    w.setDecimals(2)
+    w.setRange(-100.0, 100.0)
+    assert w.textFromValue(2.5) == "2.50" and w.valueFromText("2,5") == 2.5
+    assert w.validate("-2,5", 4)[0] == QValidator.State.Acceptable
+
+
+def test_cli_options_in_core_texts_become_field_names(app):
+    form = SettingsForm(dose.Settings)
+    assert form.gui_text("weitere PTVs nicht ausgewertet (--target fuer alle).") == \
+        "weitere PTVs nicht ausgewertet („Zielvolumen“ fuer alle)."
+    assert form.gui_text("mit --no-rs") == f"mit „{form.label_of('write_rs')}“ aus"
+    assert form.gui_text("mit --list anzeigen") == "mit --list anzeigen"      # keine Einstellung
 
 
 def test_job_runner_cancel_leaves_nothing(app, demo, tmp_path):

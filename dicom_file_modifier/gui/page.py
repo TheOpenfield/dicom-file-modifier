@@ -24,6 +24,7 @@ from .widgets import STATUS_DE, IssueList, StateLine, breakable, open_path
 # plus Trenner: laengere Ordnerpfade stossen an MAX_PATH (260) von Windows
 LONGEST_FILE_NAME = 100
 MAX_PATH = 259
+RESULT_LEVEL = {"ok": "ok", "ok_warnings": "warning", "failed": "error", "cancelled": "info"}
 
 
 def _value_text(v) -> str:
@@ -68,8 +69,8 @@ class WorkflowPage(QWidget):
         self.start_button.setFont(font)
         self.start_button.clicked.connect(self._start)
 
-        self.status_label = QLabel("Noch kein Ergebnis.")
-        self.status_label.setWordWrap(True)
+        self.result_state = StateLine()
+        self.result_state.set_state(None, "Noch kein Ergebnis.")
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)
         self.summary_label.hide()
@@ -90,6 +91,7 @@ class WorkflowPage(QWidget):
         """Layout: links (scrollbar) Eingaben, Einstellungen, Pruefung, Start; rechts das Ergebnis."""
         self.form = form
         form.changed.connect(self._update_preview)
+        self.issues.text_map = self.result_issues.text_map = form.gui_text
         left = QWidget()
         col = QVBoxLayout(left)
         for widget, stretch in inputs:
@@ -112,14 +114,13 @@ class WorkflowPage(QWidget):
 
         result = QGroupBox("Ergebnis")
         lay = QVBoxLayout(result)
-        head = QHBoxLayout()
-        text = QVBoxLayout()
-        text.addWidget(self.status_label)
-        text.addWidget(self.summary_label)
-        head.addLayout(text, 1)
+        lay.addWidget(self.result_state)
+        lay.addWidget(self.summary_label)
+        row = QHBoxLayout()                             # eigene Zeile: der Text behaelt die volle Breite
         for b in list(buttons) + [self.command_button, self.runjson_button, self.open_button]:
-            head.addWidget(b)
-        lay.addLayout(head)
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
         lay.addWidget(self.result_issues)
         for widget, stretch in results:
             lay.addWidget(widget, stretch)
@@ -248,7 +249,8 @@ class WorkflowPage(QWidget):
         job = api_jobs.new_job(self.api.WORKFLOW, self._job_settings, self.info.selection,
                                self.output_spec())
         self.last_result = None
-        self.status_label.setText("Läuft …")
+        self.result_state.set_state(None, "Läuft …")
+        self.result_state.setToolTip("")
         self.summary_label.hide()
         for b in (self.open_button, self.command_button, self.runjson_button):
             b.setEnabled(False)
@@ -275,8 +277,10 @@ class WorkflowPage(QWidget):
     def show_result(self, result: dict) -> None:
         self.last_result = result
         out = result.get("output_dir")
-        self.status_label.setText(STATUS_DE.get(result["status"], result["status"])
-                                  + (f":  {breakable(out)}" if out else ""))
+        status = result["status"]
+        self.result_state.set_state(RESULT_LEVEL.get(status, "error"), STATUS_DE.get(status, status)
+                                    + (f"  ·  {Path(out).name}" if out else ""))
+        self.result_state.setToolTip(str(out) if out else "")
         lines = [t for t in (self.summary_text(result) if out else "", self._run_line(result)) if t]
         self.summary_label.setText("\n".join(lines))
         self.summary_label.setVisible(bool(lines))

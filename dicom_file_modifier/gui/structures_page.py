@@ -37,6 +37,8 @@ class StructuresPage(WorkflowPage):
     def __init__(self, main):
         super().__init__(main)
         self.rs_combo = QComboBox()
+        self.rs_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.rs_combo.setMinimumContentsLength(20)              # lange UID-Dateinamen
         self.rs_combo.currentIndexChanged.connect(lambda _i: self.inspect())
         self.rs_label = QLabel()
         self.roi_table = make_table(["Name", "DICOM-Typ", "Kategorie", "Volumen [cm³]", "Rolle im Lauf"],

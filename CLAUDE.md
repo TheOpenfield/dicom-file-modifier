@@ -103,7 +103,8 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
       - the inputs stay unchanged.
     - `tests/test_worker.py` (P0.8c): JSON-lines protocol, staging and commit, collection CSV after the commit, cancel file with stdin left open, killed worker, error classes, worker = API.
     - `tests/test_gui.py` (offscreen, skipped without PySide6):
-      - the structure page end to end through the real worker;
+      - the structure page and the dose page (locked fields, error marks, metric table with Eclipse columns) end to end through the real worker;
+      - `DecimalSpinBox` and the CLI-option-to-field-name mapping;
       - `JobRunner` cancel;
       - the GUI process never loads pyplot, `visualizer`, `dose_viz` or plotly.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
@@ -240,11 +241,11 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `app.py` | `dfm gui [CASE]`; cleans up orphaned staging folders at start |
 | `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
 | `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
-| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style), `StateLine`, `IssueList` (double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
 | `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
-| `dose_page.py` | files and dose info, form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), metric table from `summary`, report, `dose_overview.png`, button for `validation.html` |
+| `dose_page.py` | inputs by label (StructureSetLabel, summation type and Dmax, RTPlanLabel; file names in the tooltip), form with an "Erweitert" section, check text from `dose.preview` (Rx, levels, fine grid with memory, RS export, Eclipse sources), "Kennzahlen" tab from the result JSON (rows = metrics; per target value, Eclipse, deviation; a separate `… global` row where the comparison used the whole isodose), report, `dose_overview.png`, button for `validation.html` |
 
 `JobRunner` details:
 - It starts the worker through `subprocess` with `CREATE_NO_WINDOW` rather than QProcess, and turns the JSON lines into signals.
@@ -255,7 +256,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 - `inspect` runs in the thread pool with a token, so stale results are dropped.
 - `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
 - The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
-- The result header has "Befehl kopieren" (`command_string`), `run.json` and the run line: duration plus the settings that differ from the defaults.
+- The result header has a state line (status and folder name, full path in the tooltip), the summary, a row of buttons with "Befehl kopieren" (`command_string`) and `run.json`, and the run line: duration plus the settings that differ from the defaults.
 - The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
 - A page supplies `selection`, `on_inspected`, `check`, `clear_outputs`, `show_outputs` and `summary_text`.
 
@@ -334,7 +335,7 @@ Key conventions:
 - `rtstruct_writer.write_isodose_rtstruct` builds a *fresh* Dataset (patient/study/FoR copied from the original RS, everything else new), one `CLOSED_PLANAR` contour per ring (holes are separate rings with negative area, Eclipse convention), `ContourImageSequence` referencing the CT slice at that z, explicit VR LE with a proper `FileMetaDataset`, written under `writing_validation_mode = RAISE`, then re-read by `verify_rtstruct`. Isodose contours come from `dose.mask_to_contours` (marching squares at 0.5) or, with `--iso-contours field` / `--eclipse-compat`, from `dose.field_to_contours` (isoline of the sampled dose; one vertex coordinate lies exactly on the grid lines, which is how Eclipse exports its "High"/"Default" resolution contours).
 - ROI names: `ISO_100%_20.0Gy`, `<Ziel>_x_ISO100`, `<Ziel>_minus_ISO100`, `ISO100_minus_<Ziel>`; `analyzer.classify_structure` files CONTROL/DOSE_REGION types and these name patterns under HELPER so they stay out of the clinical plots.
 - New-module console output is pure ASCII (`TV&PIV`, `>=`, `cm3`): the Windows console is cp1252 and `∩`/`≥` would raise `UnicodeEncodeError`. Files are UTF-8.
-- Eclipse comparison: `dose.EclipseDVH` reads the DVH bins at the **left edge** (bin 0 = total volume, last non-empty bin at `DVHMaximumDose`); a target DVH gives TV/TV∩PIV/D-values, only a body (`EXTERNAL`) DVH gives PIV/PIV50. `compare_with_eclipse` always compares against `piv_global_cm3`/`piv50_global_cm3`, appends out-of-tolerance rows to `result['warnings']` and never changes the exit code. `CSV_COLUMNS` carries the `ecl_*`/`d_*_pct` columns, so `_check_csv_header` refuses `--append-csv` onto an old collection file before anything is computed. JSON stays additive: `targets[name].eclipse`, `meta.eclipse_reference`, `outputs.viz_html_path/viz_png_path`.
+- Eclipse comparison: `dose.EclipseDVH` reads the DVH bins at the **left edge** (bin 0 = total volume, last non-empty bin at `DVHMaximumDose`); a target DVH gives TV/TV∩PIV/D-values, only a body (`EXTERNAL`) DVH gives PIV/PIV50. `compare_with_eclipse` always compares against `piv_global_cm3`/`piv50_global_cm3`; with PIV scope component it also recomputes CI and GI from those global volumes (TV∩PIV is the same in both scopes; row note `mit globalem PIV`), so a scoped tool CI never raises a false Eclipse alarm. It appends out-of-tolerance rows to `result['warnings']` and never changes the exit code. `CSV_COLUMNS` carries the `ecl_*`/`d_*_pct` columns, so `_check_csv_header` refuses `--append-csv` onto an old collection file before anything is computed. JSON stays additive: `targets[name].eclipse`, `meta.eclipse_reference`, `outputs.viz_html_path/viz_png_path`.
 - `dose_viz` reads `tm.result`, `art.eclipse` and `art.eclipse_dvh` (not `art.results`, which is only filled after the hook). It needs `ct_index['z_to_path']` (added to `build_ct_slice_index`) to load only the CT slices inside the fine grid; wash/CT are strided to ≤128 px per axis, meshes to ≤96 px in-plane, contours are never thinned; isodose meshes come from the dose field (marching cubes at the level), the target mesh from its mask. With `--no-rs` the ROI specs are still built for the view, so the report shows the would-be ROI names. Plotly's slider restyles all traces, so legend toggles do not survive a slice change (documented limitation).
 
 ### `analyzer.py` — RTSTRUCT geometric analysis

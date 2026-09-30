@@ -187,6 +187,7 @@ class DoseCaseInfo:
     targets: dict = field(default_factory=dict)     # {default, reason, ptvs, all, notes}
     prescriptions: dict = field(default_factory=dict)   # {refs, default, reason, dmax_gy}
     dose: dict = field(default_factory=dict)
+    labels: dict = field(default_factory=dict)      # {rs: StructureSetLabel, rp: RTPlanLabel}
     dvh: dict = field(default_factory=dict)         # {available, trusted, rois, body, notes}
     ct: Optional[dict] = None
     rs_export: dict = field(default_factory=dict)   # {possible, reason}
@@ -234,6 +235,9 @@ def inspect(selection: CaseSelection) -> DoseCaseInfo:
                  "spacing_mm": [float(v) for v in dose.spacing], "dmax_gy": float(dose.dmax),
                  "units": dose.units, "dose_type": dose.dose_type,
                  "summation_type": dose.summation_type}
+    rp_ds = inputs.rp_ds
+    info.labels = {"rs": str(rs_ds.get("StructureSetLabel", "") or ""),
+                   "rp": str(rp_ds.get("RTPlanLabel", "") or "") if rp_ds is not None else ""}
 
     dvh_map, dvh_notes = dm.read_dvh_sequence(inputs.rd_ds)
     rs_uid = str(rs_ds.get("SOPInstanceUID", ""))

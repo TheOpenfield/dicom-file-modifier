@@ -6,19 +6,22 @@ Befundliste, Bildansicht, Tabellen und Textbericht.
 from __future__ import annotations
 
 import os
+import re
 import types
 import typing
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QLocale, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
                                QListView, QListWidget, QListWidgetItem, QMessageBox,
-                               QPlainTextEdit, QSizePolicy, QSpinBox, QStyle, QTableWidget,
-                               QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QScrollArea, QSizePolicy, QSpinBox, QStyle,
+                               QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
 INT_MAX = 2**31 - 1
+CLI_FLAG = re.compile(r"--[a-z][a-z0-9-]*")
+LONG_WORD = re.compile(r"\S{25,}")
 ZWSP = chr(0x200B)                      # Leerzeichen der Breite null: erlaubt Umbruch in Pfaden
 STATUS_DE = {"ok": "Fertig", "ok_warnings": "Fertig, mit Hinweisen",
              "failed": "Fehlgeschlagen", "cancelled": "Abgebrochen"}
@@ -49,6 +52,11 @@ IMAGE_TITLES = {"volumes": "Volumina", "shape_metrics": "Formmetriken",
 def breakable(path) -> str:
     """Pfad fuer QLabel mit Zeilenumbruch: nach jedem Trenner darf umbrochen werden."""
     return str(path).replace(os.sep, os.sep + ZWSP).replace("/", "/" + ZWSP)
+
+
+def soft_breaks(text: str) -> str:
+    """Lange Woerter (UID-Dateinamen, Pfade) nach Punkt und Trennern umbrechbar machen."""
+    return LONG_WORD.sub(lambda m: re.sub(r"([./\\_])", "\\1" + ZWSP, m.group(0)), text)
 
 
 def open_path(path) -> None:
@@ -85,6 +93,7 @@ def make_table(headers: list, sortable: bool = False) -> QTableWidget:
     t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     t.verticalHeader().hide()
+    t.verticalHeader().setDefaultSectionSize(t.fontMetrics().height() + 8)     # kompakte Zeilen
     t.horizontalHeader().setStretchLastSection(True)
     t.setProperty("sortable", sortable)
     t.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)   # erst auf Klick sortieren
@@ -121,8 +130,24 @@ def report_view() -> QPlainTextEdit:
     v = QPlainTextEdit()
     v.setReadOnly(True)
     v.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-    v.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+    font = QFont("Consolas", 9)
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    v.setFont(font)
     return v
+
+
+class DecimalSpinBox(QDoubleSpinBox):
+    """Zahl mit Dezimalpunkt wie in Berichten, CSV und CLI; ein eingetipptes Komma gilt als Punkt."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLocale(QLocale.c())
+
+    def validate(self, text: str, pos: int):
+        return super().validate(text.replace(",", "."), pos)
+
+    def valueFromText(self, text: str) -> float:
+        return super().valueFromText(text.replace(",", "."))
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +175,12 @@ class SettingsForm(QWidget):
 
     changed = Signal()
 
-    def __init__(self, settings_cls, fields=None, advanced=None, parent=None):
-        """``fields``: sichtbare Felder (Standard: Ebene basic); ``advanced``: aufklappbar unter "Erweitert"."""
+    def __init__(self, settings_cls, fields=None, advanced=None, external=(), parent=None):
+        """
+        ``fields``: sichtbare Felder (Standard: Ebene basic); ``advanced``: aufklappbar
+        unter "Erweitert"; ``external``: Widgets entstehen hier, die Seite ordnet sie an
+        (``widget(name)``, ``add_top``).
+        """
         super().__init__(parent)
         self.cls = settings_cls
         metas = settings_cls.field_meta()
@@ -161,9 +190,13 @@ class SettingsForm(QWidget):
         self._error_actions: dict = {}
         self._disabled: dict = {}
         self._errors: dict = {}
+        # CLI-Optionen in Kern-Texten ("--target fuer alle") -> Feldname
+        self._flags = {m.cli_flag: f"„{m.label}“" + (" aus" if m.cli_invert else "")
+                       for m in metas.values() if m.cli_flag}
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         basic = QFormLayout()
+        basic.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         outer.addLayout(basic)
         sections = [(basic, fields or [n for n, m in metas.items() if m.level == "basic"])]
         self.advanced_button = self.advanced_box = None
@@ -178,19 +211,31 @@ class SettingsForm(QWidget):
             self.advanced_box.hide()
             outer.addWidget(self.advanced_button)
             outer.addWidget(self.advanced_box)
-            sections.append((QFormLayout(self.advanced_box), advanced))
+            more = QFormLayout(self.advanced_box)
+            more.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            sections.append((more, advanced))
         for layout, names in sections:
             for name in names:
                 meta = metas[name]
                 typ, optional = _unwrap(hints[name])
                 kind, w = self._widget(name, meta, typ, optional)
                 self._rows[name] = (kind, w, typ, optional, meta)
-                label = QLabel("" if kind == "bool" else meta.label + (f" [{meta.unit}]" if meta.unit else ""))
+                unit = f" [{meta.unit}]" if meta.unit and meta.unit not in meta.label else ""
+                label = QLabel("" if kind == "bool" else meta.label + unit)
                 self._labels[name] = label
                 layout.addRow(label, self._with_browse(name, w) if meta.kind == "path" else w)
                 self._update_row(name)
+        for name in external:
+            typ, optional = _unwrap(hints[name])
+            kind, w = self._widget(name, metas[name], typ, optional)
+            self._rows[name] = (kind, w, typ, optional, metas[name])
+            self._update_row(name)
         self._base = settings_cls()
         self.set_settings(self._base)
+
+    def add_top(self, widget: QWidget) -> None:
+        """Widget ueber den Formularzeilen (z.B. mit ``external``-Feldern)."""
+        self.layout().insertWidget(0, widget)
 
     def _toggle_advanced(self, on: bool) -> None:
         self.advanced_box.setVisible(on)
@@ -200,6 +245,9 @@ class SettingsForm(QWidget):
         emit = lambda *_: self.changed.emit()   # noqa: E731
         if meta.choices:
             w = QComboBox()
+            # lange Texte ("component – nur Isodosen-Anteile am Ziel") duerfen das Formular nicht verbreitern
+            w.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            w.setMinimumContentsLength(12)
             if optional:
                 w.addItem("aus", None)
             labels = CHOICE_LABELS.get(name, {})
@@ -212,7 +260,7 @@ class SettingsForm(QWidget):
             w.toggled.connect(emit)
             return "bool", w
         if typ in (int, float) and not optional:
-            w = QSpinBox() if typ is int else QDoubleSpinBox()
+            w = QSpinBox() if typ is int else DecimalSpinBox()
             lo = meta.min if meta.min is not None else -INT_MAX
             hi = meta.max if meta.max is not None else INT_MAX
             if typ is float:
@@ -223,6 +271,7 @@ class SettingsForm(QWidget):
             w.valueChanged.connect(emit)
             return "number", w
         w = QLineEdit()
+        w.setMinimumWidth(120)
         if name in SPEC_EXAMPLES:
             w.setPlaceholderText(SPEC_EXAMPLES[name])
         elif optional:
@@ -344,6 +393,10 @@ class SettingsForm(QWidget):
     def label_of(self, name: str) -> str:
         return self.cls.field_meta()[name].label
 
+    def gui_text(self, text: str) -> str:
+        """Kern-Text fuer die Oberflaeche: CLI-Optionen (``--target``) werden zu Feldnamen."""
+        return CLI_FLAG.sub(lambda m: self._flags.get(m.group(0), m.group(0)), text)
+
 
 # ---------------------------------------------------------------------------
 # Statuszeile, Befunde, Bilder
@@ -373,36 +426,82 @@ class StateLine(QWidget):
         self.icon.setPixmap(std_icon(self, _LEVEL_ICONS[level]).pixmap(16, 16) if level else QPixmap())
 
 
-class IssueList(QListWidget):
-    """Befunde (``Issue`` oder dict) mit Symbol je Stufe; Hinweis in der zweiten Zeile, Doppelklick: Details."""
+class _Row(QWidget):
+    double_clicked = Signal()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.double_clicked.emit()
+
+
+class IssueList(QScrollArea):
+    """
+    Befunde (``Issue`` oder dict) mit Symbol je Stufe, umbrochen; Hinweis in der
+    zweiten Zeile, Doppelklick: Details.  So hoch wie der Inhalt, hoechstens
+    ``max_height``.  ``text_map`` bereitet die Texte fuer die Anzeige auf.
+    """
 
     max_height = 160
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.itemDoubleClicked.connect(self._details)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._box = QWidget()
+        self._box.setBackgroundRole(QPalette.ColorRole.Base)
+        self._lay = QVBoxLayout(self._box)
+        self._lay.setContentsMargins(4, 3, 4, 3)
+        self._lay.setSpacing(4)
+        self.setWidget(self._box)
+        self.text_map = None
+        self._issues: list = []
+
+    def count(self) -> int:
+        return len(self._issues)
 
     def set_issues(self, issues) -> None:
-        self.clear()
-        for issue in issues:
-            d = issue if isinstance(issue, dict) else issue.to_dict()
-            text = d["message_de"] + (f"\n→ {d['hint_de']}" if d.get("hint_de") else "")
-            item = QListWidgetItem(std_icon(self, _LEVEL_ICONS[d["level"]]), text)
-            item.setData(Qt.ItemDataRole.UserRole, d)
-            item.setToolTip("Doppelklick: Details")
-            self.addItem(item)
-        self.setVisible(bool(issues))
-        rows = sum(self.sizeHintForRow(i) for i in range(self.count()))
-        self.setFixedHeight(min(rows + 2 * self.frameWidth() + 6, self.max_height))
+        while self._lay.count():
+            w = self._lay.takeAt(0).widget()
+            if w is not None:
+                w.hide()                                # sonst bis zum Loeschen unter den neuen Zeilen sichtbar
+                w.deleteLater()
+        self._issues = [i if isinstance(i, dict) else i.to_dict() for i in issues]
+        show = self.text_map or str
+        for d in self._issues:
+            row = _Row()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(0, 0, 0, 0)
+            icon = QLabel()
+            icon.setPixmap(std_icon(self, _LEVEL_ICONS[d["level"]]).pixmap(16, 16))
+            icon.setAlignment(Qt.AlignmentFlag.AlignTop)
+            text = QLabel(soft_breaks(show(d["message_de"]) + (f"\n→ {show(d['hint_de'])}" if d.get("hint_de") else "")))
+            text.setTextFormat(Qt.TextFormat.PlainText)
+            text.setWordWrap(True)
+            lay.addWidget(icon)
+            lay.addWidget(text, 1)
+            row.setToolTip("Doppelklick: Details")
+            row.double_clicked.connect(lambda d=d: self._details(d))
+            self._lay.addWidget(row)
+        self.setVisible(bool(self._issues))
+        self._fit()
 
-    def _details(self, item: QListWidgetItem) -> None:
-        d = item.data(Qt.ItemDataRole.UserRole)
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()                                     # Hoehe nach dem Umbruch in der neuen Breite
+
+    def _fit(self) -> None:
+        h = self._box.heightForWidth(self.viewport().width()) if self._box.hasHeightForWidth() else -1
+        h = h if h > 0 else self._box.sizeHint().height()
+        self.setFixedHeight(min(h + 2 * self.frameWidth(), self.max_height))
+
+    def _details(self, d: dict) -> None:
         box = QMessageBox(self)
         box.setIcon({"error": QMessageBox.Icon.Critical, "warning": QMessageBox.Icon.Warning}
                     .get(d["level"], QMessageBox.Icon.Information))
         box.setWindowTitle("Befund")
-        box.setText(d["message_de"])
-        box.setInformativeText("\n".join(t for t in (d.get("hint_de"), f"Code: {d.get('code', '')}") if t))
+        show = self.text_map or str
+        box.setText(show(d["message_de"]))
+        box.setInformativeText("\n".join(t for t in (d.get("hint_de") and show(d["hint_de"]),
+                                                     f"Code: {d.get('code', '')}") if t))
         if d.get("detail"):
             box.setDetailedText(d["detail"])
         box.exec()
@@ -427,6 +526,7 @@ class ImageViewer(QWidget):
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.view.setMinimumSize(200, 150)
         self.view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.view.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self.view.setToolTip("Doppelklick: in der Bildanzeige öffnen")
         self.view.double_clicked.connect(lambda: self._path and open_path(self._path))
         self.strip = QListWidget()
@@ -435,8 +535,10 @@ class ImageViewer(QWidget):
         self.strip.setWrapping(False)
         self.strip.setMovement(QListView.Movement.Static)
         self.strip.setIconSize(QSize(120, 85))
-        self.strip.setSpacing(4)
-        self.strip.setFixedHeight(140)
+        self.strip.setWordWrap(True)                        # Titel zweizeilig statt abgeschnitten
+        self.strip.setGridSize(QSize(150, 126))
+        self.strip.setFixedHeight(126 + self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+                                  + 2 * self.strip.frameWidth() + 2)
         self.strip.currentItemChanged.connect(self._select)
         self.strip.itemActivated.connect(lambda item: open_path(item.data(Qt.ItemDataRole.UserRole)))
         lay = QVBoxLayout(self)
@@ -444,17 +546,20 @@ class ImageViewer(QWidget):
         lay.addWidget(self.view, 1)
         lay.addWidget(self.strip)
         self._pix = self._path = None
+        self.clear()
 
     def count(self) -> int:
         return self.strip.count()
 
-    def clear(self) -> None:
+    def clear(self, text: str = "Noch kein Ergebnis") -> None:
         self.strip.clear()
+        self.strip.hide()
         self.view.clear()
+        self.view.setText(text)
         self._pix = self._path = None
 
     def set_images(self, paths) -> None:
-        self.clear()
+        self.clear("Keine Bilder in diesem Ergebnis")
         for p in paths:
             pix = QPixmap(str(p))
             if pix.isNull():

@@ -103,7 +103,7 @@ def test_worker_protocol_commit_and_collection_csv(demo, tmp_path):
     hello, result = events[0], events[-1]
     assert hello["type"] == "hello" and hello["v"] == worker.PROTOCOL_VERSION and hello["pid"] > 0
     assert hello["versions"]["dfm"] and all(hello["threads"].values())
-    assert result["type"] == "result" and result["status"] == "ok_warnings"
+    assert result["type"] == "result" and result["status"] == "ok"      # Eclipse-Abgleich ohne Fehlalarm
     stages = [(e["key"], e["i"], e["n"]) for e in events if e["type"] == "stage"]
     assert stages == [("prepare", 1, 4), ("compute", 2, 4), ("rs_export", 3, 4), ("reports", 4, 4)]
     assert any(e["type"] == "log" and "Dosisindex-Berechnung" in e["msg"] for e in events)
@@ -117,7 +117,7 @@ def test_worker_protocol_commit_and_collection_csv(demo, tmp_path):
     assert {m["path"] for m in res["manifest"]} == {p.name for p in final.iterdir()} - {"run.json", "run.log"}
 
     run = json.loads((final / "run.json").read_text(encoding="utf-8"))
-    assert run["job_id"] == job.job_id and run["result"]["status"] == "ok_warnings"
+    assert run["job_id"] == job.job_id and run["result"]["status"] == "ok"
     assert run["command"] == res["command"] and "--append-csv" in run["command_text"]
     assert {i["role"] for i in run["inputs"]} == {"rs", "rd", "rp", "ct"}
     assert all(i.get("sop_instance_uid") for i in run["inputs"] if i["role"] != "ct")

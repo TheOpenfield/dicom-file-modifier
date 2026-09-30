@@ -736,7 +736,8 @@ def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
     Je Ziel mit Referenzwerten: Zeilen ``{key, label, tool, tool_key, eclipse,
     diff_abs, diff_pct, source, within_tol, note}`` in ``ECLIPSE_KEYS``-
     Reihenfolge (``diff = tool - eclipse``).  PIV/PIV50 werden immer gegen die
-    globalen Isodosenvolumina verglichen (Eclipse-PIV = ganze Isodose).
+    globalen Isodosenvolumina verglichen (Eclipse-PIV = ganze Isodose), bei
+    PIV-Scope component auch CI und GI (TV&PIV ist in beiden Scopes gleich).
     Zeilen ausserhalb der Toleranz werden in ``result['warnings']`` des Ziels
     eingetragen (Exit-Code bleibt unveraendert).
     """
@@ -747,13 +748,19 @@ def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
             continue
         r = tm.result
         c, ix, dv = r["components"], r["indices"], r["dvh_stats"]
+        piv_scoped = abs(c["piv_cm3"] - c["piv_global_cm3"]) > 1e-9
+        piv50_scoped = abs(c["piv50_cm3"] - c["piv50_global_cm3"]) > 1e-9
+        ci = (("tv_piv^2/(tv*piv_global)", paddick_ci(c["tv_cm3"], c["piv_global_cm3"], c["tv_piv_cm3"]))
+              if piv_scoped else ("indices.ci_paddick", ix["ci_paddick"]))
+        gi = (("piv50_global/piv_global", gradient_index(c["piv50_global_cm3"], c["piv_global_cm3"]))
+              if piv_scoped or piv50_scoped else ("indices.gi", ix["gi"]))
         tool = {
             "tv_cm3": ("components.tv_cm3", c["tv_cm3"]),
             "tv_piv_cm3": ("components.tv_piv_cm3", c["tv_piv_cm3"]),
             "piv_cm3": ("components.piv_global_cm3", c["piv_global_cm3"]),
             "piv50_cm3": ("components.piv50_global_cm3", c["piv50_global_cm3"]),
-            "ci_paddick": ("indices.ci_paddick", ix["ci_paddick"]),
-            "gi": ("indices.gi", ix["gi"]),
+            "ci_paddick": ci,
+            "gi": gi,
             "hi_icru83": ("indices.hi_icru83", ix["hi_icru83"]),
             "d98_gy": ("dvh_stats.d98_gy", dv["d98_gy"]),
             "d50_gy": ("dvh_stats.d50_gy", dv["d50_gy"]),
@@ -771,6 +778,8 @@ def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
             note = ""
             if ev is None and key in ("piv_cm3", "piv50_cm3"):
                 note = "kein Body-DVH; manuell angeben"
+            elif not tool_key.startswith("indices.") and key in ("ci_paddick", "gi"):
+                note = "mit globalem PIV"
             diff = diff_pct = within = None
             if ev is not None and not _isnan(tool_v):
                 diff = float(tool_v) - ev
@@ -788,9 +797,9 @@ def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
                     f"({diff_pct:+.1f} %, Toleranz {tol_pct:g} %)"
                 )
         scope_note = None
-        if r["piv"].get("scope") == "component" and abs(c["piv_cm3"] - c["piv_global_cm3"]) > 1e-9:
-            scope_note = ("Tool-CI/GI mit PIV-Scope component (PIV-Zeile zeigt das globale PIV); "
-                          "fuer den Abgleich --piv-scope global oder --eclipse-compat")
+        if piv_scoped or piv50_scoped:
+            scope_note = ("Tool-CI/GI mit PIV-Scope component; PIV, PIV50, CI und GI werden wie in "
+                          "Eclipse mit der ganzen Isodose (global) verglichen")
         out[name] = {
             "rows": rows, "tol_pct": float(tol_pct),
             "n_compared": sum(1 for row in rows if row["diff_abs"] is not None),

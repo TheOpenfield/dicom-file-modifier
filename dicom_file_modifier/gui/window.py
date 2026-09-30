@@ -17,6 +17,7 @@ from .config import APP_NAME, AppConfig
 from .jobs import JobRunner
 from .widgets import STATUS_DE
 
+ROOT_LABEL_PX = 300                     # Ergebnis-Stammordner in der Statusleiste (Mitte gekuerzt)
 ABOUT_HTML = (
     "<b>{app} {version}</b><br>Strukturanalyse, Dosisindizes und starre Transformation "
     "von DICOM-RT-Daten.<br><br>"
@@ -179,8 +180,11 @@ class MainWindow(QMainWindow):
                 page.refresh()
 
     def _update_root_tooltip(self) -> None:
-        self.root_action.setToolTip(f"Ergebnisse unter: {self.config.results_root}")
-        self.root_label.setText(f"Ergebnisse: {self.config.results_root}")
+        root = str(self.config.results_root)
+        self.root_action.setToolTip(f"Ergebnisse unter: {root}")
+        short = self.root_label.fontMetrics().elidedText(root, Qt.TextElideMode.ElideMiddle, ROOT_LABEL_PX)
+        self.root_label.setText(f"Ergebnisse: {short}")
+        self.root_label.setToolTip(root)
 
     # -- Jobs ----------------------------------------------------------------------------
     def start_job(self, page, job, title: str) -> None:

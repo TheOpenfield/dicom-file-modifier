@@ -132,6 +132,21 @@ def test_dvh_of_another_structure_set_is_not_shown(demo, tmp_path):
     assert any("anderes Structure Set" in n for n in report["meta"]["notes"])
 
 
+def test_eclipse_ci_and_gi_use_the_whole_isodose_in_component_scope(demo, tmp_path):
+    """Eclipse bezieht CI/GI auf die ganze Isodose: bei PIV-Scope component kein Fehlalarm."""
+    _report, art = _run(demo.root, tmp_path)
+    r, ec = art.targets["PTV_1"].result, art.eclipse["PTV_1"]
+    c = r["components"]
+    assert c["piv_cm3"] < c["piv_global_cm3"]                     # Teil der Rx-Isodose am PTV_2
+    rows = {row["key"]: row for row in ec["rows"]}
+    assert rows["ci_paddick"]["tool"] == pytest.approx(c["tv_piv_cm3"] ** 2 / (c["tv_cm3"] * c["piv_global_cm3"]))
+    assert rows["gi"]["tool"] == pytest.approx(c["piv50_global_cm3"] / c["piv_global_cm3"])
+    assert rows["ci_paddick"]["note"] == "mit globalem PIV" and ec["piv_scope_note"]
+    assert r["indices"]["ci_paddick"] > rows["ci_paddick"]["tool"]    # das Tool-Ergebnis bleibt component
+    assert not {"ci_paddick", "gi"} & set(ec["flagged"])
+    assert not any("CI Paddick" in w or "GI " in w for w in r["warnings"])
+
+
 # -- --list, --no-rs ---------------------------------------------------------
 
 def test_list_works_without_rtdose(demo, tmp_path, capsys):
