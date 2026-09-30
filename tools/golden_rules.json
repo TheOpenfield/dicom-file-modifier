@@ -41,7 +41,6 @@
     ]
   },
   "expected_changes": {
-    "_doc": "Szenario-Muster -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet. Wert: Text (das ganze Szenario darf abweichen) oder {reason, only: [Muster der Abweichungsmeldungen]} (nur diese Abweichungen sind erwartet, jede andere bleibt FAIL). Erstes passendes Muster gewinnt, daher spezielle Eintraege zuerst. Achtung fnmatch: [..] ist eine Zeichenklasse, also 'stdout* Z.1 ...' statt 'stdout[*] ...'. Eintrag mit dem jeweiligen PR aktivieren und nach dem Re-Baseline wieder entfernen.",
-    "cli_surface": {"reason": "demo: --no-empty-roi entfernt (ungenutzt)", "only": ["out/cli_surface.json: demo.options Laenge 12 vs 11"]}
+    "_doc": "Szenario-Muster -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet. Wert: Text (das ganze Szenario darf abweichen) oder {reason, only: [Muster der Abweichungsmeldungen]} (nur diese Abweichungen sind erwartet, jede andere bleibt FAIL). Erstes passendes Muster gewinnt, daher spezielle Eintraege zuerst. Achtung fnmatch: [..] ist eine Zeichenklasse, also 'stdout* Z.1 ...' statt 'stdout[*] ...'. Eintrag mit dem jeweiligen PR aktivieren und nach dem Re-Baseline wieder entfernen."
   }
 }
