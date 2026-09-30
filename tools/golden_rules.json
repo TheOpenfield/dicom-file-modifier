@@ -42,9 +42,6 @@
   },
   "expected_changes": {
     "_doc": "Szenario-Muster -> geplante, bewusste Aenderung (Plan-Schritt). Mit 'compare --expected' als EXPECTED statt FAIL gewertet. Wert: Text (das ganze Szenario darf abweichen) oder {reason, only: [Muster der Abweichungsmeldungen]} (nur diese Abweichungen sind erwartet, jede andere bleibt FAIL). Erstes passendes Muster gewinnt, daher spezielle Eintraege zuerst. Achtung fnmatch: [..] ist eine Zeichenklasse, also 'stdout* Z.1 ...' statt 'stdout[*] ...'. Eintrag mit dem jeweiligen PR aktivieren und nach dem Re-Baseline wieder entfernen (P0.2: docs/migration-py314.md).",
-    "cm_*": {"reason": "P0.5: RP/RD-Hinweis nur noch einmal (nach 'Lade Case' bzw. gar nicht bei --list-markers/--self-test)",
-             "only": ["stdout* Z.1 nur in A*"]},
-    "real*_cm_*": {"reason": "P0.5: RP/RD-Hinweis nur noch einmal (nach 'Lade Case')",
-                   "only": ["stdout* Z.1 nur in A*"]}
+    "mod_flat": "P0.6: flacher Export -> nur die CT-Serie wird geladen (vorher RD als Schicht, Absturz)"
   }
 }

@@ -43,9 +43,11 @@ from pydicom.uid import generate_uid
 from scipy.ndimage import map_coordinates, spline_filter
 from scipy.spatial.transform import Rotation
 
+from . import _runtime
 from ._compat import replace_pixel_data
 # Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
 from .dicom_utils import set_sop_instance_uid
+from .issues import Issue, UserInputError
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,6 +75,148 @@ def load_ct_series(ct_dir: str) -> list:
     # Nach Z-Koordinate der Slice-Normalenkomponente sortieren
     slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
     return slices
+
+
+def ct_dir_files(ct_dir) -> list:
+    """``*.dcm`` in ``ct_dir`` (sortiert; Klammern im Pfad sind kein Glob-Muster)."""
+    return sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
+
+
+def _select_ct(datasets: list, series_uid: "str | None", where: str) -> list:
+    """Nur CT-Schichten (Modality CT, IPP), genau eine Serie, keine doppelten SOPs; nach z sortiert."""
+    cts = [ds for ds in datasets
+           if str(ds.get("Modality", "")).upper() == "CT" and "ImagePositionPatient" in ds]
+    if series_uid is not None:
+        cts = [ds for ds in cts if str(ds.get("SeriesInstanceUID", "")) == str(series_uid)]
+    if not cts:
+        raise ValueError(f"Keine CT-Schichten in {where} gefunden.")
+    series: dict = {}
+    for ds in cts:
+        series.setdefault(str(ds.get("SeriesInstanceUID", "")), []).append(ds)
+    if len(series) > 1:
+        raise UserInputError(Issue(
+            "error", "CT.MULTIPLE_SERIES", f"{where} enthaelt {len(series)} CT-Serien; genau eine erwartet.",
+            hint_de="Die gewuenschte Serie auswaehlen (series_uid) oder nur eine Serie in den Ordner legen.",
+            detail="\n".join(f"{uid}: {len(v)} Schichten, {v[0].get('SeriesDescription', '')}"
+                             for uid, v in series.items())))
+    cts.sort(key=lambda s: float(s.ImagePositionPatient[2]))
+    sops = [str(getattr(s, "SOPInstanceUID", "")) for s in cts]
+    dup = len(sops) - len(set(sops))
+    if dup:
+        raise UserInputError(Issue(
+            "error", "CT.DUPLICATE_SOP", f"{where} enthaelt {dup} doppelte SOPInstanceUID(s).",
+            hint_de="Jede CT-Schicht darf nur einmal vorkommen (Doppelexport?)."))
+    return cts
+
+
+def load_ct_headers(ct_dir_or_files, series_uid: "str | None" = None,
+                    where: "str | None" = None) -> list:
+    """
+    CT-Header ohne Pixeldaten (``stop_before_pixels``), nach z sortiert: aus
+    einem Ordner (``*.dcm``) oder einer Dateiliste.  Filter wie
+    ``load_ct_series_files``; nicht lesbare und andere Objekte (RS, RD, RP)
+    werden uebergangen.  Jeder Header kennt seinen Pfad (``.filename``).
+    ``where`` benennt die Quelle in Fehlermeldungen.
+    """
+    if isinstance(ct_dir_or_files, (str, os.PathLike)):
+        files = ct_dir_files(ct_dir_or_files)
+        where = where or repr(str(ct_dir_or_files))
+    else:
+        files = [str(f) for f in ct_dir_or_files]
+        where = where or f"den {len(files)} Dateien"
+    if not files:
+        raise FileNotFoundError(f"Keine DICOM-Dateien in {where}")
+    headers = []
+    for f in files:
+        try:
+            headers.append(pydicom.dcmread(f, stop_before_pixels=True))
+        except Exception:
+            continue
+    return _select_ct(headers, series_uid, where)
+
+
+def load_ct_series_files(files, series_uid: "str | None" = None,
+                         where: "str | None" = None) -> list:
+    """
+    CT-Schichten mit Pixeldaten aus einer Dateiliste, nach z sortiert.  Anders
+    als ``load_ct_series`` nur Modality CT und genau eine Serie (``series_uid``
+    waehlt bei mehreren); RTDOSE, RTSTRUCT & Co. in einem flachen
+    Eclipse-Export werden uebergangen.  Gefiltert wird ueber die Header, erst
+    dann werden die gewaehlten Dateien komplett gelesen.
+    """
+    headers = load_ct_headers(files, series_uid, where=where)
+    slices = [pydicom.dcmread(h.filename) for h in headers]
+    no_pixels = [s.filename for s in slices if "PixelData" not in s]
+    if no_pixels:
+        raise ValueError(f"CT-Schicht ohne Pixeldaten: {no_pixels[0]!r}")
+    return slices
+
+
+def validate_ct_geometry(slices: list, atol_iop: float = 1e-3,
+                         rel_tol_spacing: float = 0.01) -> None:
+    """
+    Pre-Flight-Check der CT-Geometrie (nach z sortierte Slices, Header genuegen).
+    Wirft ``ValueError`` wenn:
+      - weniger als 2 Slices
+      - ImageOrientationPatient variiert ueber Slices (>= ``atol_iop``)
+      - PixelSpacing nicht einheitlich
+      - Slice-Spacing nicht uniform (relative Abweichung >= ``rel_tol_spacing``)
+      - die Lagerung nicht Head-First ist oder das CT gekippt ist: der
+        Schichtschritt zeigt nicht entlang ``cross(row, col)``
+        (``UserInputError`` mit Code ``CT.ORIENTATION_UNSUPPORTED``; HFS/HFP
+        passieren, FFS/FFP und Gantry-Kippung > ~2.6 Grad nicht)
+    """
+    if len(slices) < 2:
+        raise ValueError(
+            f"Mindestens 2 CT-Slices benoetigt fuer Geometrie-Berechnung "
+            f"(gefunden: {len(slices)})."
+        )
+
+    iop_ref = np.array([float(x) for x in slices[0].ImageOrientationPatient])
+    ps_ref  = [float(x) for x in slices[0].PixelSpacing]
+    for i, s in enumerate(slices[1:], 1):
+        iop = np.array([float(x) for x in s.ImageOrientationPatient])
+        if not np.allclose(iop, iop_ref, atol=atol_iop):
+            raise ValueError(
+                f"ImageOrientationPatient variiert ueber Slices.\n"
+                f"  Slice 0: {iop_ref.tolist()}\n  Slice {i}: {iop.tolist()}"
+            )
+        ps = [float(x) for x in s.PixelSpacing]
+        if not np.allclose(ps, ps_ref, atol=1e-4):
+            raise ValueError(
+                f"PixelSpacing variiert ueber Slices.\n"
+                f"  Slice 0: {ps_ref}\n  Slice {i}: {ps}"
+            )
+
+    # Slice-Spacing (Distanzen zwischen aufeinanderfolgenden IPPs)
+    ipps = np.array([[float(x) for x in s.ImagePositionPatient] for s in slices])
+    diffs = np.linalg.norm(np.diff(ipps, axis=0), axis=1)
+    mean = float(np.mean(diffs))
+    if mean <= 0:
+        raise ValueError("Slice-Spacing-Mittelwert ist 0  Slices ueberlagern sich?")
+    rel_dev = float(np.max(np.abs(diffs - mean) / mean))
+    if rel_dev > rel_tol_spacing:
+        raise ValueError(
+            f"Slice-Spacing nicht uniform (relative Abweichung {rel_dev:.2%} "
+            f"> {rel_tol_spacing:.0%}).\n"
+            f"  min={diffs.min():.3f} mm, max={diffs.max():.3f} mm, "
+            f"mean={mean:.3f} mm"
+        )
+
+    # Orientierungs-Guard (Plan: Feet-First wird nicht unterstuetzt)
+    normal = np.cross(iop_ref[:3], iop_ref[3:])
+    step = ipps[1] - ipps[0]
+    cos_step = float(step @ normal / (np.linalg.norm(step) * np.linalg.norm(normal)))
+    if cos_step < 0.999:
+        kind = ("Feet-First-Lagerung (Schichtnormale zeigt nach inferior)" if cos_step < 0
+                else f"gekipptes CT (Schichtschritt {np.degrees(np.arccos(min(cos_step, 1.0))):.1f} Grad "
+                     "zur Schichtnormalen)")
+        raise UserInputError(Issue(
+            "error", "CT.ORIENTATION_UNSUPPORTED",
+            f"CT-Orientierung nicht unterstuetzt: {kind}.",
+            hint_de="Unterstuetzt werden Head-First-Lagerungen (HFS, HFP) ohne Gantry-Kippung.",
+            detail=f"ImageOrientationPatient {iop_ref.tolist()}, Schichtschritt {step.round(4).tolist()} mm",
+        ))
 
 
 def slices_to_hu(slices: list) -> np.ndarray:
@@ -201,7 +345,11 @@ def resample_volume(
 
     output = np.full((nz, ny, nx), -1000.0, dtype=np.float32)
 
-    for k0 in range(0, nz, chunk_slices):
+    ctx = _runtime.current()
+    n_chunks = (nz + chunk_slices - 1) // chunk_slices
+    for ci, k0 in enumerate(range(0, nz, chunk_slices)):
+        ctx.check_cancel()
+        ctx.progress(ci, n_chunks, "CT neu abtasten")
         k1 = min(k0 + chunk_slices, nz)
         nk = k1 - k0
         n  = nk * ny * nx
@@ -226,6 +374,7 @@ def resample_volume(
         )
         output[k0:k1] = vals.reshape(nk, ny, nx)
 
+    ctx.progress(n_chunks, n_chunks, "CT neu abtasten")
     return output
 
 
@@ -410,7 +559,8 @@ def visualize_3d(
     T: np.ndarray,
     method: str = "resample",
     output_html: "str | None" = None,
-) -> None:
+    show: bool = False,
+):
     """
     Interaktiver 3D-Plot: Original (blau, halbtransparent) vs. Transformiert (rot).
     Zeigt Körperoberfläche (HU > −300) und optional Knochen (HU > 400).
@@ -418,6 +568,9 @@ def visualize_3d(
     Für die metadata-Methode: Vertices werden mit der Vorwärts-Transformation T
     in die neue Position verschoben (Pixeldaten identisch, daher kein Resampling
     sichtbar).
+
+    Mit ``output_html`` wird die Seite geschrieben; ein Browserfenster öffnet
+    sich nur mit ``show=True`` (nie im Worker/GUI-Pfad).  Gibt die Figur zurück.
     """
     try:
         import plotly.graph_objects as go
@@ -548,13 +701,109 @@ def visualize_3d(
     if output_html:
         fig.write_html(output_html)
         print(f"  Visualisierung gespeichert -> {output_html}")
-    else:
+    elif show:
         fig.show()
+    return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Hauptprogramm
 # ─────────────────────────────────────────────────────────────────────────────
+
+def run_ct_transform(
+    ct_dir,
+    output_dir,
+    tx: float = 0.0, ty: float = 0.0, tz: float = 0.0,
+    rx: float = 0.0, ry: float = 0.0, rz: float = 0.0,
+    *,
+    method: str = "resample",
+    order: int = 1,
+    viz: bool = True,
+    viz_html: "str | None" = None,
+    series_uid: "str | None" = None,
+) -> dict:
+    """
+    CT-only-Lauf wie die CLI: CT laden (nur Modality CT, genau eine Serie),
+    Geometrie inkl. Orientierung pruefen, transformieren, als neue Serie
+    speichern, optional die 3D-Ansicht als HTML schreiben (nie ein
+    Browserfenster).  Rotation intrinsisch XYZ um die Volumenmitte.
+    Eingabefehler -> ``ValueError``/``FileNotFoundError`` (CLI-Exit 2).
+    """
+    if method not in ("resample", "metadata"):
+        raise ValueError(f"Unbekannte Methode: {method!r}")
+    ctx = _runtime.current()
+    ctx.stage("load", "CT laden und pruefen")
+    print(f"\nLade CT-Serie aus {str(ct_dir)!r} …")
+    slices = load_ct_series_files(ct_dir_files(ct_dir), series_uid=series_uid, where=repr(str(ct_dir)))
+    print(f"  {len(slices)} Slices geladen")
+    validate_ct_geometry(slices)
+
+    volume_hu = slices_to_hu(slices)
+    geom      = extract_geometry(slices)
+    center    = volume_center(geom)
+
+    nz, ny, nx = geom["shape"]
+    print(f"  Volumengröße : {nz} × {ny} × {nx}  Voxel")
+    print(f"  Voxelabstand : dz={geom['dz']:.2f} mm  |  "
+          f"dr={geom['dr']:.2f} mm  |  dc={geom['dc']:.2f} mm")
+    print(f"  Volumen-Mitte: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}) mm")
+
+    # ── Transformationsmatrix ───────────────────────────────────────────────
+    print(f"\nTransformation:")
+    print(f"  Translation  : tx={tx} mm,  ty={ty} mm,  tz={tz} mm")
+    print(f"  Rotation     : rx={rx}°,  ry={ry}°,  rz={rz}°  [intrinsisch XYZ]")
+    print(f"  Methode      : {method}")
+
+    T = build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
+    print(f"  T =\n{np.array2string(T, precision=4, suppress_small=True)}")
+
+    # ── Transformation anwenden ─────────────────────────────────────────────
+    ctx.check_cancel()
+    ctx.stage("transform", "CT transformieren und speichern")
+    if method == "metadata":
+        print("\nAktualisiere DICOM-Metadaten (HU-Werte exakt erhalten) …")
+        transformed_slices = apply_metadata_transform(slices, T)
+        save_info = save_ct_series(transformed_slices, str(output_dir))
+        volume_transformed = volume_hu   # identische Pixeldaten für Viz
+    else:
+        print(f"\nNeuabtastung (Interpolationsordnung {order}) …")
+        volume_transformed = resample_volume(volume_hu, geom["affine"], T, order=order)
+
+        # Sanity-Check: HU-Wertebereich muss im Original und Ergebnis gleich sein
+        # (Vergleich voxelweise ist sinnlos, da der Körper seine Position gewechselt hat)
+        print(f"  HU-Bereich Original    : [{volume_hu.min():.0f}, {volume_hu.max():.0f}] HU")
+        print(f"  HU-Bereich Transformiert: [{volume_transformed.min():.0f}, {volume_transformed.max():.0f}] HU")
+
+        save_info = save_ct_series(slices, str(output_dir), new_volume_hu=volume_transformed)
+
+    # ── Visualisierung ──────────────────────────────────────────────────────
+    html_out = None
+    if viz:
+        ctx.check_cancel()
+        ctx.stage("viz", "3D-Ansicht erstellen")
+        print("\nErstelle 3D-Visualisierung …")
+        html_out = viz_html or os.path.join(str(output_dir), "visualization_3d.html")
+        visualize_3d(
+            volume_original=volume_hu,
+            volume_transformed=volume_transformed,
+            geom=geom,
+            T=T,
+            method=method,
+            output_html=html_out,
+        )
+
+    print("\nFertig!")
+    return {
+        "output_dir": str(output_dir),
+        "n_slices": len(slices),
+        "series_uid": save_info["series_uid"],
+        "sop_map": save_info["sop_map"],
+        "T": T.tolist(),
+        "rotation_center": center.tolist(),
+        "method": method,
+        "viz_html_path": html_out,
+    }
+
 
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
@@ -570,7 +819,7 @@ def main(argv: "list[str] | None" = None) -> int:
         ),
     )
     parser.add_argument("ct_dir",
-                        help="Verzeichnis mit CT-DICOM-Dateien")
+                        help="Verzeichnis mit CT-DICOM-Dateien (andere Objekte wie RTDOSE werden uebergangen)")
     parser.add_argument("--output", "-o", default="output/ct_transformed",
                         metavar="DIR",
                         help="Ausgabeverzeichnis  (Standard: output/ct_transformed)")
@@ -583,13 +832,14 @@ def main(argv: "list[str] | None" = None) -> int:
     grp_t.add_argument("--tz", type=float, default=0.0, metavar="mm",
                        help="Verschiebung in Z-Richtung (Superior+)")
 
-    grp_r = parser.add_argument_group("Rotation [°]  –  intrinsisch XYZ um Volumenmitte")
+    grp_r = parser.add_argument_group(
+        "Rotation [°]  –  intrinsisch XYZ um Volumenmitte (Bezeichnungen fuer Rueckenlage)")
     grp_r.add_argument("--rx", type=float, default=0.0, metavar="deg",
-                       help="Rotation um X-Achse (Pitch)")
+                       help="Rotation um die X-Achse, links-rechts (Pitch)")
     grp_r.add_argument("--ry", type=float, default=0.0, metavar="deg",
-                       help="Rotation um Y-Achse (Roll)")
+                       help="Rotation um die Y-Achse, anterior-posterior (Yaw)")
     grp_r.add_argument("--rz", type=float, default=0.0, metavar="deg",
-                       help="Rotation um Z-Achse (Yaw)")
+                       help="Rotation um die Z-Achse, Kopf-Fuss (Roll)")
 
     grp_m = parser.add_argument_group("Methode und Qualität")
     grp_m.add_argument("--method", choices=["resample", "metadata"],
@@ -617,69 +867,16 @@ def main(argv: "list[str] | None" = None) -> int:
                        help="Visualisierung überspringen")
 
     args = parser.parse_args(argv)
-
-    # ── Laden ──────────────────────────────────────────────────────────────
-    print(f"\nLade CT-Serie aus {args.ct_dir!r} …")
-    slices   = load_ct_series(args.ct_dir)
-    print(f"  {len(slices)} Slices geladen")
-
-    volume_hu = slices_to_hu(slices)
-    geom      = extract_geometry(slices)
-    center    = volume_center(geom)
-
-    nz, ny, nx = geom["shape"]
-    print(f"  Volumengröße : {nz} × {ny} × {nx}  Voxel")
-    print(f"  Voxelabstand : dz={geom['dz']:.2f} mm  |  "
-          f"dr={geom['dr']:.2f} mm  |  dc={geom['dc']:.2f} mm")
-    print(f"  Volumen-Mitte: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}) mm")
-
-    # ── Transformationsmatrix ───────────────────────────────────────────────
-    print(f"\nTransformation:")
-    print(f"  Translation  : tx={args.tx} mm,  ty={args.ty} mm,  tz={args.tz} mm")
-    print(f"  Rotation     : rx={args.rx}°,  ry={args.ry}°,  rz={args.rz}°  [intrinsisch XYZ]")
-    print(f"  Methode      : {args.method}")
-
-    T = build_rigid_transform(
-        args.rx, args.ry, args.rz,
-        args.tx, args.ty, args.tz,
-        center,
-    )
-    print(f"  T =\n{np.array2string(T, precision=4, suppress_small=True)}")
-
-    # ── Transformation anwenden ─────────────────────────────────────────────
-    if args.method == "metadata":
-        print("\nAktualisiere DICOM-Metadaten (HU-Werte exakt erhalten) …")
-        transformed_slices = apply_metadata_transform(slices, T)
-        save_ct_series(transformed_slices, args.output)
-        volume_transformed = volume_hu   # identische Pixeldaten für Viz
-
-    else:
-        print(f"\nNeuabtastung (Interpolationsordnung {args.order}) …")
-        volume_transformed = resample_volume(
-            volume_hu, geom["affine"], T, order=args.order
+    try:
+        run_ct_transform(
+            args.ct_dir, args.output,
+            args.tx, args.ty, args.tz, args.rx, args.ry, args.rz,
+            method=args.method, order=args.order,
+            viz=not args.no_viz, viz_html=args.save_viz,
         )
-
-        # Sanity-Check: HU-Wertebereich muss im Original und Ergebnis gleich sein
-        # (Vergleich voxelweise ist sinnlos, da der Körper seine Position gewechselt hat)
-        print(f"  HU-Bereich Original    : [{volume_hu.min():.0f}, {volume_hu.max():.0f}] HU")
-        print(f"  HU-Bereich Transformiert: [{volume_transformed.min():.0f}, {volume_transformed.max():.0f}] HU")
-
-        save_ct_series(slices, args.output, new_volume_hu=volume_transformed)
-
-    # ── Visualisierung ──────────────────────────────────────────────────────
-    if not args.no_viz:
-        print("\nErstelle 3D-Visualisierung …")
-        html_out = args.save_viz or os.path.join(args.output, "visualization_3d.html")
-        visualize_3d(
-            volume_original=volume_hu,
-            volume_transformed=volume_transformed,
-            geom=geom,
-            T=T,
-            method=args.method,
-            output_html=html_out,
-        )
-
-    print("\nFertig!")
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        print(f"\nFehler: {e}", file=sys.stderr)
+        return 2
     return 0
 
 

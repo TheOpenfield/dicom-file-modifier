@@ -91,8 +91,7 @@ SCENARIOS = [
     _sc("mod_meta", "modifier", ["{ct}"] + T6 + ["--method", "metadata", "--no-viz", "--output", "{out}"],
         case="std"),
     _sc("mod_viz", "modifier", ["{ct}", "--tx", "5", "--rz", "10", "--output", "{out}"], case="std"),
-    _sc("mod_flat", "modifier", ["{case}", "--tx", "3", "--no-viz", "--output", "{out}"], case="flat",
-        tags=["known_bug"]),
+    _sc("mod_flat", "modifier", ["{case}", "--tx", "3", "--no-viz", "--output", "{out}"], case="flat"),
     _sc("mod_rle", "modifier", ["{ct}", "--tx", "3", "--no-viz", "--output", "{out}"], case="rle"),
     # case_modifier
     _sc("cm_list_markers", "case_modifier", ["{case}", "--list-markers"], case="std"),

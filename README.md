@@ -133,6 +133,13 @@ This produces:
 - `CT_0000.dcm … CT_NNNN.dcm`: Transformed CT series on the original axial grid (with `--method metadata` the pixels are unchanged and the slices become oblique instead)
 - `visualization_3d.html`: Interactive 3D comparison (original vs. transformed)
 
+**Input and checks:**
+- The input folder may also be a flat export: only files with `Modality` CT are read, and RTSTRUCT, RTPLAN and RTDOSE next to them are skipped.
+- The folder must hold exactly one CT series, and every slice exactly once.
+- The CT geometry is checked like in the case modifier (see *Pre-Flight Validation*). Feet-first and tilted series are rejected.
+- Input errors end with exit code 2 and a message.
+- For a supine patient, `--rx` is pitch, `--ry` yaw and `--rz` roll.
+
 **All CLI options:**
 
 | Option | Default | Description |

@@ -45,8 +45,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import glob
-import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -60,6 +58,8 @@ from pydicom.uid import generate_uid
 
 from . import _runtime
 from . import modifier as mod
+# Seit P0.6 in modifier; hier weiter importierbar (alte Importpfade)
+from .modifier import load_ct_headers, validate_ct_geometry
 # Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
 from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references
 from .issues import Issue, UserInputError
@@ -287,102 +287,6 @@ def _verify_rs_centroids(orig_ds: pydicom.Dataset,
         print(f"  ! WARNUNG ! Centroid-Abweichung ueber der Schwelle {threshold_mm:g} mm -> FAIL")
     return {"max_err_mm": max_err, "checked": checked, "worst_roi": worst,
             "threshold_mm": float(threshold_mm), "passed": passed}
-
-
-def validate_ct_geometry(slices: list, atol_iop: float = 1e-3,
-                        rel_tol_spacing: float = 0.01) -> None:
-    """
-    Pre-Flight-Check der CT-Geometrie (nach z sortierte Slices, Header genuegen).
-    Wirft ``ValueError`` wenn:
-      - weniger als 2 Slices
-      - ImageOrientationPatient variiert ueber Slices (>= ``atol_iop``)
-      - PixelSpacing nicht einheitlich
-      - Slice-Spacing nicht uniform (relative Abweichung >= ``rel_tol_spacing``)
-      - die Lagerung nicht Head-First ist oder das CT gekippt ist: der
-        Schichtschritt zeigt nicht entlang ``cross(row, col)``
-        (``UserInputError`` mit Code ``CT.ORIENTATION_UNSUPPORTED``; HFS/HFP
-        passieren, FFS/FFP und Gantry-Kippung > ~2.6 Grad nicht)
-    """
-    if len(slices) < 2:
-        raise ValueError(
-            f"Mindestens 2 CT-Slices benoetigt fuer Geometrie-Berechnung "
-            f"(gefunden: {len(slices)})."
-        )
-
-    iop_ref = np.array([float(x) for x in slices[0].ImageOrientationPatient])
-    ps_ref  = [float(x) for x in slices[0].PixelSpacing]
-    for i, s in enumerate(slices[1:], 1):
-        iop = np.array([float(x) for x in s.ImageOrientationPatient])
-        if not np.allclose(iop, iop_ref, atol=atol_iop):
-            raise ValueError(
-                f"ImageOrientationPatient variiert ueber Slices.\n"
-                f"  Slice 0: {iop_ref.tolist()}\n  Slice {i}: {iop.tolist()}"
-            )
-        ps = [float(x) for x in s.PixelSpacing]
-        if not np.allclose(ps, ps_ref, atol=1e-4):
-            raise ValueError(
-                f"PixelSpacing variiert ueber Slices.\n"
-                f"  Slice 0: {ps_ref}\n  Slice {i}: {ps}"
-            )
-
-    # Slice-Spacing (Distanzen zwischen aufeinanderfolgenden IPPs)
-    ipps = np.array([[float(x) for x in s.ImagePositionPatient] for s in slices])
-    diffs = np.linalg.norm(np.diff(ipps, axis=0), axis=1)
-    mean = float(np.mean(diffs))
-    if mean <= 0:
-        raise ValueError("Slice-Spacing-Mittelwert ist 0  Slices ueberlagern sich?")
-    rel_dev = float(np.max(np.abs(diffs - mean) / mean))
-    if rel_dev > rel_tol_spacing:
-        raise ValueError(
-            f"Slice-Spacing nicht uniform (relative Abweichung {rel_dev:.2%} "
-            f"> {rel_tol_spacing:.0%}).\n"
-            f"  min={diffs.min():.3f} mm, max={diffs.max():.3f} mm, "
-            f"mean={mean:.3f} mm"
-        )
-
-    # Orientierungs-Guard (Plan: Feet-First wird nicht unterstuetzt)
-    normal = np.cross(iop_ref[:3], iop_ref[3:])
-    step = ipps[1] - ipps[0]
-    cos_step = float(step @ normal / (np.linalg.norm(step) * np.linalg.norm(normal)))
-    if cos_step < 0.999:
-        kind = ("Feet-First-Lagerung (Schichtnormale zeigt nach inferior)" if cos_step < 0
-                else f"gekipptes CT (Schichtschritt {np.degrees(np.arccos(min(cos_step, 1.0))):.1f} Grad "
-                     "zur Schichtnormalen)")
-        raise UserInputError(Issue(
-            "error", "CT.ORIENTATION_UNSUPPORTED",
-            f"CT-Orientierung nicht unterstuetzt: {kind}.",
-            hint_de="Unterstuetzt werden Head-First-Lagerungen (HFS, HFP) ohne Gantry-Kippung.",
-            detail=f"ImageOrientationPatient {iop_ref.tolist()}, Schichtschritt {step.round(4).tolist()} mm",
-        ))
-
-
-def load_ct_headers(ct_dir) -> list:
-    """
-    CT-Header ohne Pixeldaten (``stop_before_pixels``), nach z sortiert.  Fuer
-    Pruefung, Geometrie und Planung; ``modifier.load_ct_series`` laedt die
-    Pixel erst beim Ausfuehren.
-    """
-    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
-    if not files:
-        raise FileNotFoundError(f"Keine DICOM-Dateien in {str(ct_dir)!r}")
-    headers = []
-    for f in files:
-        try:
-            ds = pydicom.dcmread(f, stop_before_pixels=True)
-        except Exception:
-            continue
-        if hasattr(ds, "ImagePositionPatient"):
-            headers.append(ds)
-    if not headers:
-        raise ValueError(f"Keine gueltigen CT-Slices in {str(ct_dir)!r}")
-    headers.sort(key=lambda s: float(s.ImagePositionPatient[2]))
-    sops = [str(getattr(s, "SOPInstanceUID", "")) for s in headers]
-    dup = len(sops) - len(set(sops))
-    if dup:
-        raise UserInputError(Issue(
-            "error", "CT.DUPLICATE_SOP", f"CT-Ordner enthaelt {dup} doppelte SOPInstanceUID(s).",
-            hint_de="Jede CT-Schicht darf nur einmal im Ordner liegen (Doppelexport?)."))
-    return headers
 
 
 # Unter Windows in Datei-/Ordnernamen verboten
@@ -1011,9 +915,10 @@ def _clipping_dicts(clipping: list) -> list:
 def execute_transform(pre: CasePreflight, plan: TransformPlan, *, verify: bool = False,
                       no_viz: bool = False, viz_ct_surface: bool = False) -> dict:
     """
-    Stufe 3: CT-Pixel laden, transformieren und in einem Durchgang schreiben
-    (SeriesNumber-Offset und vorab vergebene UIDs), danach das fertige
-    RTSTRUCT; optional ``--verify`` und die Vorher/Nachher-Ansicht.
+    Stufe 3: die geprueften CT-Dateien mit Pixeln laden, transformieren und in
+    einem Durchgang schreiben (SeriesNumber-Offset und vorab vergebene UIDs),
+    danach das fertige RTSTRUCT; optional ``--verify`` und die
+    Vorher/Nachher-Ansicht.
     """
     ctx = _runtime.current()
     ctx.check_cancel()
@@ -1038,7 +943,8 @@ def execute_transform(pre: CasePreflight, plan: TransformPlan, *, verify: bool =
             "  ----------------------------------------------------------------------"
         )
 
-    slices = mod.load_ct_series(str(pre.ct_dir))
+    # genau die geprueften Dateien, jetzt mit Pixeln
+    slices = mod.load_ct_series_files([h.filename for h in pre.ct_headers])
     if [str(getattr(s, "SOPInstanceUID", "")) for s in slices] != \
             [str(getattr(h, "SOPInstanceUID", "")) for h in pre.ct_headers]:
         raise ValueError(f"CT-Ordner {str(pre.ct_dir)!r} hat sich seit der Pruefung geaendert; "

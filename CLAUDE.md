@@ -203,19 +203,30 @@ Two transform paths sharing the same affine math:
 
 Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` — in SciPy uppercase = intrinsic; the same matrix as an extrinsic ZYX rotation) about the volume's geometric centre; the offset is folded into `T` so a single 4×4 matrix represents the whole transform. All output series get fresh `SeriesInstanceUID` and per-slice `SOPInstanceUID`s. Optional Plotly HTML viz extracts surfaces with marching cubes (`skimage.measure.marching_cubes`).
 
+**Loading, checks and API (P0.6):**
+- `load_ct_headers(dir_or_files, series_uid=None)` and `load_ct_series_files(files, series_uid=None)` keep only `Modality` CT with IPP. They require exactly one series (`series_uid` chooses; otherwise `UserInputError` `CT.MULTIPLE_SERIES`) and reject duplicate SOPs. The header loader filters first; then only the chosen files are read in full. So a flat Eclipse export, with RS/RP/RD next to the CT, works.
+- `load_ct_series(dir)` stays unchanged for old callers.
+- `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` re-exports it.
+- `run_ct_transform(ct_dir, output_dir, tx..rz, method=, order=, viz=, viz_html=, series_uid=)` is the CLI run as a function and returns a dict (`n_slices`, `series_uid`, `sop_map`, `T`, `rotation_center`, `viz_html_path`).
+- `main` catches input errors: exit 2 instead of a traceback.
+- `resample_volume` reports progress and checks for cancel per 20-slice chunk. Stages are `load` / `transform` / `viz`.
+- `visualize_3d` writes the HTML and returns the figure. It opens a browser only with `show=True`.
+- `save_ct_series` takes pre-assigned `series_uid` / `sop_map` and a `series_number_offset`.
+- Help texts for a supine patient: `--rx` pitch, `--ry` yaw, `--rz` roll.
+
 ### `case_modifier.py` — case-level lockstep transform of CT + RTSTRUCT
 Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<id>/RS*.dcm` and applies the same rigid `T` to both.
 
 **Stages (P0.5).** `run_case_transform` keeps its signature and runs `preflight_case` → `plan_transform` → `execute_transform` (or `print_dry_run`); `main` calls the stages itself.
 - **`preflight_case` → `CasePreflight`** reads headers only:
   - `discover_case(..., return_siblings=True)` finds `CT/`, the unique `RS*.dcm` (override `--rs`) and sibling `RP*`/`RD*`. Called the old way, it still prints the sibling note and returns `(ct_dir, rs_path)`.
-  - `load_ct_headers` reads the CT headers (`stop_before_pixels`, sorted by z) and rejects duplicate SOP UIDs.
+  - `modifier.load_ct_headers` reads the CT headers (`stop_before_pixels`, CT only, one series, sorted by z) and rejects duplicate SOP UIDs.
   - `validate_ct_geometry` checks for uniform IOP/`PixelSpacing`, slice spacing within 1 %, and the **orientation guard** `unit(IPP₁−IPP₀)·cross(row, col) ≥ 0.999`. It rejects feet-first and gantry tilt with `UserInputError` `CT.ORIENTATION_UNSUPPORTED`; HFS/HFP pass.
   - `validate_for_consistency` checks that the RS references the CT's FoR.
   - `validate_label` rejects `--label` values that Windows forbids in the output dir name or `RS<label>.dcm`: characters `<>:"/\|?*`, reserved names, a trailing dot or space.
 - **`resolve_center`** takes `volume`, `marker:NAME` or `x,y,z`. The prompt appears only if interactive and stdin is a TTY; stdin may be `None` under pythonw/GUI.
 - **`plan_transform` → `TransformPlan`** builds `T` and the paths, and pre-assigns all UIDs: CT series, `sop_map` old→new, optional FoR. It already runs `transform_rtstruct` and `check_contour_clipping`, so a bad RS reference (`KeyError`) fails before anything is written. The dry run stops here and loads no pixels.
-- **`execute_transform`** loads pixels (`modifier.load_ct_series`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
+- **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
 - The result dict adds `issues` (`issues.Issue.to_dict()`: `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`), `clipping`, `method` and `for_strategy`.
 - Console output is unchanged, except that the sibling note appears once instead of twice.
 - Stages reported to `_runtime`: `preflight` / `plan` / `ct_transform` / `rs_write` / `verify` / `viz`, with a cancel check between them.

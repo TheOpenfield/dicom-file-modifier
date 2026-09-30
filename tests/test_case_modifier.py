@@ -96,6 +96,7 @@ def test_dry_run_reads_no_pixels(demo, tmp_path, monkeypatch):
         raise AssertionError("Dry-Run darf keine Pixel laden")
 
     monkeypatch.setattr(mod, "load_ct_series", forbidden)
+    monkeypatch.setattr(mod, "load_ct_series_files", forbidden)
     monkeypatch.setattr(mod, "slices_to_hu", forbidden)
     res = _run(demo.root, tmp_path / "out", dry_run=True)
     assert res["dry_run"] and res["planned_rs_output_path"].endswith("RS_RB.dcm")
