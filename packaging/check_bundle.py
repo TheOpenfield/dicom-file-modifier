@@ -1,12 +1,13 @@
 """
 Pruefung des onedir-Bundles (Standard ``dist/DICOM-RT-Toolkit``); Exit 0 = ok.
 
-  - Groesse unter MAX_MB, keine DICOM-Dateien im Bundle
+  - Groesse unter MAX_MB, keine DICOM-Dateien im Bundle, App-Icon in beiden EXEs
   - dfm.exe: Versionen (alle Bibliotheken gefunden), alle Self-Tests,
     Demo-Fall, Dosisindizes mit Validierungsansicht (plotly, matplotlib),
     Transformation mit Vorher/Nachher-Ansichten
-  - DICOM-RT-Toolkit.exe --smoke-test: alle Seiten pruefen den Demo-Fall,
-    dann Strukturanalyse ueber den gefrorenen Worker (offscreen)
+  - DICOM-RT-Toolkit.exe --smoke-test: Symbole werden gerendert (Qt6Svg im Bundle),
+    alle Seiten pruefen den Demo-Fall, dann Strukturanalyse ueber den gefrorenen
+    Worker (offscreen)
 
   python packaging/check_bundle.py [BUNDLE_DIR] [--zip]
 
@@ -45,6 +46,12 @@ def dicom_files(bundle: Path) -> list:
     return found
 
 
+def exe_icon_count(path: Path) -> int:
+    """Anzahl der Icon-Ressourcen einer EXE (Windows-Shell)."""
+    import ctypes
+    return int(ctypes.windll.shell32.ExtractIconExW(str(path), -1, None, None, 0))
+
+
 def run(step: str, cmd: list, env=None, timeout: float = 900) -> subprocess.CompletedProcess:
     t0 = time.monotonic()
     proc = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, encoding="utf-8",
@@ -73,6 +80,9 @@ def main(argv=None) -> int:
     print(f"Groesse {size_mb:.0f} MB")
     if size_mb > MAX_MB:
         errors.append(f"Bundle groesser als {MAX_MB} MB")
+    for exe in (dfm, gui):
+        if exe_icon_count(exe) < 1:
+            errors.append(f"kein App-Icon in {exe.name}")
     bad = dicom_files(bundle)
     if bad:
         errors.append("DICOM-Dateien im Bundle: " + ", ".join(str(p.relative_to(bundle)) for p in bad[:10]))

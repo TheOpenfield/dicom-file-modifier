@@ -17,8 +17,9 @@ from ..api import jobs as api_jobs
 from ..api.fields import command_string
 from ..api.issues import Issue, has_errors, issue_from_exception
 from ..api.outputs import OutputSpec
+from .icons import page_icon
 from .jobs import run_in_background
-from .widgets import STATUS_DE, IssueList, StateLine, breakable, open_path
+from .widgets import ImageViewer, STATUS_DE, IssueList, StateLine, breakable, open_path
 
 # Laengster Dateiname unter dem Ergebnisordner (z.B. RS.<64-Zeichen-UID>_analysis.json)
 # plus Trenner: laengere Ordnerpfade stossen an MAX_PATH (260) von Windows
@@ -154,6 +155,8 @@ class WorkflowPage(QWidget):
         outer.setStretchFactor(1, 1)
         outer.setSizes([580, 740])
         QVBoxLayout(self).addWidget(outer)
+        for viewer in self.findChildren(ImageViewer):          # Leerzustand mit dem Symbol der Seite
+            viewer.set_placeholder_icon(page_icon(self.api.WORKFLOW))
 
     # -- von der Seite -----------------------------------------------------------------
     def selection(self, case):

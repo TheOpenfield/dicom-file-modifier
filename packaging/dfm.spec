@@ -21,6 +21,8 @@ EXCLUDES = ["tkinter", "IPython", "pandas", "pytest", "PyInstaller",
             "PySide6.QtPdf", "pyqtgraph", "OpenGL"]
 QT = ["PySide6", "shiboken6"]
 metadata = [d for lib in LIBS for d in copy_metadata(lib)]
+ASSETS = [(str(ROOT / PKG / "gui" / "assets"), f"{PKG}/gui/assets")]   # App-Icon und SVG-Symbole
+ICON = str(ROOT / PKG / "gui" / "assets" / "app.ico")
 
 # cli.py und api.workflow() importieren die Werkzeuge per importlib
 cli = Analysis([str(ROOT / "packaging" / "entry_dfm.py")], pathex=[str(ROOT)],
@@ -29,7 +31,7 @@ cli = Analysis([str(ROOT / "packaging" / "entry_dfm.py")], pathex=[str(ROOT)],
                datas=metadata, excludes=EXCLUDES + QT)
 gui = Analysis([str(ROOT / "packaging" / "entry_gui.py")], pathex=[str(ROOT)],
                hiddenimports=collect_submodules(f"{PKG}.gui") + collect_submodules(f"{PKG}.api"),
-               datas=metadata, excludes=EXCLUDES)
+               datas=metadata + ASSETS, excludes=EXCLUDES)
 
 # Keine DICOM-Dateien im Bundle (check_bundle.py prueft das).  pydicom bringt Testdateien
 # mit; von pydicom/data/ bleiben nur die JSON-Dateien: pydicom.examples sucht seine
@@ -45,8 +47,8 @@ for a in (cli, gui):
     a.datas = [d for d in a.datas if _keep(d[0])]
 
 cli_exe = EXE(PYZ(cli.pure), cli.scripts, [], exclude_binaries=True, name="dfm",
-              console=True, upx=False)
+              console=True, upx=False, icon=ICON)
 gui_exe = EXE(PYZ(gui.pure), gui.scripts, [], exclude_binaries=True, name="DICOM-RT-Toolkit",
-              console=False, upx=False)
+              console=False, upx=False, icon=ICON)
 COLLECT(gui_exe, gui.binaries, gui.datas, cli_exe, cli.binaries, cli.datas,
         name="DICOM-RT-Toolkit", upx=False)

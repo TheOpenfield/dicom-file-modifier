@@ -12,15 +12,19 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("case", nargs="?", metavar="DATENSATZ", help="Datensatz-Ordner direkt öffnen")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if sys.platform == "win32":
+        _set_app_user_model_id()
 
     from PySide6.QtWidgets import QApplication
 
     from ..api.jobs import cleanup_staging
     from .config import APP_NAME, AppConfig
+    from .icons import app_icon
     from .window import MainWindow
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())                    # Dialoge, Taskleiste, Alt-Tab
     if args.smoke_test:
         return _smoke_test(app, args.case)
     config = AppConfig.load()
@@ -32,12 +36,22 @@ def main(argv: Optional[list] = None) -> int:
     return app.exec()
 
 
+def _set_app_user_model_id() -> None:
+    """Beim Start aus Python zeigt die Taskleiste sonst das Python-Symbol (die EXE braucht das nicht)."""
+    import ctypes
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DicomRtToolkit.App")
+    except (AttributeError, OSError):
+        pass
+
+
 def _smoke_test(app, case) -> int:
     """
     Pruefung einer Installation (auch der gefrorenen App): Datensatz oeffnen, alle
     Seiten pruefen lassen und die Strukturanalyse ueber den Worker rechnen,
     Ergebnisse in einem Temp-Ordner.
-    Exit 0 ok, 1 Lauf fehlgeschlagen, 2 kein Datensatz, 3 Pruefung nicht bestanden, 4 Zeitueberschreitung.
+    Exit 0 ok, 1 Lauf fehlgeschlagen, 2 kein Datensatz, 3 Pruefung nicht bestanden, 4 Zeitueberschreitung,
+    5 Symbole fehlen (Assets oder Qt6Svg nicht im Bundle).
     """
     import shutil
     import tempfile
@@ -64,6 +78,9 @@ def _smoke_test(app, case) -> int:
 
     try:
         win.show()
+        if win.windowIcon().isNull() or any(win.nav.item(i).icon().pixmap(22, 22).isNull()
+                                            for i in range(win.nav.count())):
+            return 5
         win.open_case(case)
         if not wait(lambda: all(p.start_button.isEnabled() for p in win.pages), 120):
             return 3

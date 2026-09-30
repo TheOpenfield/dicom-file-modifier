@@ -10,14 +10,22 @@ from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem,
                                QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSizePolicy, QStackedWidget, QStyle, QToolBar,
+                               QPushButton, QSizePolicy, QStackedWidget, QToolBar,
                                QWidget)
 
 from .config import APP_NAME, AppConfig
+from .icons import NAVY, app_icon, icon, page_icon
 from .jobs import JobRunner
 from .widgets import STATUS_DE
 
 ROOT_LABEL_PX = 300                     # Ergebnis-Stammordner in der Statusleiste (Mitte gekuerzt)
+# Seitenleiste: gewaehlte Seite in der Kachelfarbe des App-Icons (Stylesheet nur auf der Liste,
+# Eingabefelder behalten den nativen Stil)
+NAV_STYLE = (
+    "QListWidget { outline: 0; }"
+    "QListWidget::item { padding-left: 6px; margin: 1px 4px; border-radius: 4px; }"
+    f"QListWidget::item:selected {{ background: {NAVY}; color: white; }}"
+    "QListWidget::item:hover:!selected { background: palette(midlight); }")
 ABOUT_HTML = (
     "<b>{app} {version}</b><br>Strukturanalyse, Dosisindizes und starre Transformation "
     "von DICOM-RT-Daten.<br><br>"
@@ -68,14 +76,16 @@ class MainWindow(QMainWindow):
         self.runner = JobRunner(config.jobs_dir, self)
         self._job_page = None
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(app_icon())
         self.setAcceptDrops(True)
         self.resize(1320, 860)
 
         bar = QToolBar("Datensatz", self)
         bar.setMovable(False)
+        bar.setIconSize(QSize(20, 20))
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(bar)
-        self.open_case_button = QPushButton(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon), "Datensatz öffnen …")
+        self.open_case_button = QPushButton(icon("open"), "Datensatz öffnen …")
         self.open_case_button.clicked.connect(self.choose_case)
         bar.addWidget(self.open_case_button)
         self.case_label = QLabel("  Kein Datensatz geöffnet: Ordner wählen oder hierher ziehen")
@@ -83,7 +93,7 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.addWidget(spacer)
-        self.root_action = bar.addAction("Ergebnisordner …", self.choose_results_root)
+        self.root_action = bar.addAction(icon("results"), "Ergebnisordner …", self.choose_results_root)
 
         self.structures = StructuresPage(self)
         self.dose = DosePage(self)
@@ -95,9 +105,11 @@ class MainWindow(QMainWindow):
         palette = self.nav.palette()
         palette.setColor(QPalette.ColorRole.Base, palette.color(QPalette.ColorRole.Window))
         self.nav.setPalette(palette)
+        self.nav.setIconSize(QSize(22, 22))
+        self.nav.setStyleSheet(NAV_STYLE)
         self.stack = QStackedWidget()
         for page in self.pages:
-            item = QListWidgetItem(page.title)
+            item = QListWidgetItem(page_icon(page.api.WORKFLOW), page.title)
             item.setSizeHint(QSize(0, 34))
             self.nav.addItem(item)
             self.stack.addWidget(page)
@@ -131,8 +143,10 @@ class MainWindow(QMainWindow):
         dock.setWidget(self.log)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
         dock.hide()
-        bar.addAction(dock.toggleViewAction())
-        bar.addAction("Info", self.show_about)
+        log_action = dock.toggleViewAction()
+        log_action.setIcon(icon("log"))
+        bar.addAction(log_action)
+        bar.addAction(icon("info"), "Info", self.show_about)
 
         self.runner.event.connect(self._on_event)
         self.runner.finished.connect(self._on_finished)

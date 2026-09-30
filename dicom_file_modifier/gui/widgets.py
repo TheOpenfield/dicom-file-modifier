@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
                                QPlainTextEdit, QScrollArea, QSizePolicy, QSpinBox, QStyle,
                                QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
+from .icons import placeholder_pixmap
+
 INT_MAX = 2**31 - 1
 CLI_FLAG = re.compile(r"--[a-z][a-z0-9-]*")
 LONG_WORD = re.compile(r"\S{25,}")
@@ -547,6 +549,8 @@ class ImageViewer(QWidget):
         lay.addWidget(self.view, 1)
         lay.addWidget(self.strip)
         self._pix = self._path = None
+        self._placeholder_icon = None
+        self._placeholder_text = ""
         self.clear()
 
     def count(self) -> int:
@@ -556,8 +560,23 @@ class ImageViewer(QWidget):
         self.strip.clear()
         self.strip.hide()
         self.view.clear()
-        self.view.setText(text)
         self._pix = self._path = None
+        self._placeholder_text = text
+        self._show_placeholder()
+
+    def set_placeholder_icon(self, symbol: QIcon) -> None:
+        """Blasses Symbol ueber dem Hinweistext im Leerzustand (die Seite gibt ihres)."""
+        self._placeholder_icon = symbol
+        if self._pix is None:
+            self._show_placeholder()
+
+    def _show_placeholder(self) -> None:
+        if self._placeholder_icon is None:
+            self.view.setText(self._placeholder_text)
+            return
+        color = self.view.palette().color(self.view.foregroundRole())
+        self.view.setPixmap(placeholder_pixmap(self._placeholder_icon, self._placeholder_text,
+                                               self.view.font(), color, self.view.devicePixelRatioF()))
 
     def set_images(self, paths) -> None:
         self.clear("Keine Bilder in diesem Ergebnis")

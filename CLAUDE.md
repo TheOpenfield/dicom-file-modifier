@@ -238,11 +238,12 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 
 | Module | Role |
 |---|---|
-| `app.py` | `dfm gui [CASE]`; cleans up orphaned staging folders at start |
+| `app.py` | `dfm gui [CASE]`; sets the window icon and, on Windows, the AppUserModelID (own taskbar icon when started from Python); cleans up orphaned staging folders at start; `--smoke-test` exit 5 = icons do not render |
+| `icons.py` | `assets/`: `app.png`/`app.ico` (window, taskbar, both EXEs) and SVG symbols for the sidebar pages and the toolbar (`page_icon`, `icon`); the brand colours of the app icon (`NAVY`, `TEAL`, `CORAL`, …); `placeholder_pixmap` for the empty state of an `ImageViewer`. It imports `PySide6.QtSvg` so PyInstaller bundles Qt6Svg |
 | `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
 | `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
-| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
-| `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (case bar, sidebar pages, progress with cancel, log dock) |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`; `set_placeholder_icon` shows the page symbol over "Noch kein Ergebnis", `WorkflowPage.build` sets it), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
+| `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (toolbar with SVG icons, sidebar with page icons and the selection in the icon's navy via a stylesheet on the list only, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
 | `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
 | `transform_page.py` | RS combo or "Nur das CT transformieren" (`selection.from_ct_dir`; the centre is kept and restored, the label still names the folder); motion grid on patient axes (X + links, Y + posterior, Z + superior; mm/° suffixes) built from `external` form fields; centre combo (Volumenmitte, markers, Koordinate) that writes the `center` spec; check with `describe_motion` (rotation order for two or more angles), centre, the new `Drehpunkt` marker, method and FoR choice, the largest clipping, planned files and memory; result tabs "Vorher/Nachher", "Verschiebung je ROI" and "Bericht" (matrix T, clipping table, centroid check from the run summary), button for the 3D HTML |
@@ -274,7 +275,8 @@ The GUI calls the opened folder a "Datensatz", while CLI and API texts keep "Fal
 - `check_bundle.py` checks the build:
   - the size and that it holds no DICOM files;
   - the versions, `dfm selftest`, the demo case, dose indices with viz and a case transform with its before/after views;
-  - `DICOM-RT-Toolkit.exe --smoke-test CASE`: every page inspects the case, then the structure page runs through the frozen worker, offscreen.
+  - `DICOM-RT-Toolkit.exe --smoke-test CASE`: the window and sidebar icons render (Qt6Svg in the bundle), every page inspects the case, then the structure page runs through the frozen worker, offscreen;
+  - both EXEs carry the app icon (`app.ico`).
 - Build with `.venv\Scripts\python -m PyInstaller packaging/dfm.spec --noconfirm`. A plain `uv sync` removes the `gui` extra and the `build` group again (exact sync); `uv run` keeps them.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case

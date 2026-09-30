@@ -247,3 +247,15 @@ def test_smoke_test_option_runs_the_structure_page(demo):
     out = subprocess.run([sys.executable, "-m", "dicom_file_modifier", "gui", "--smoke-test", str(demo.root)],
                          capture_output=True, text=True, timeout=300, env=env, stdin=subprocess.DEVNULL)
     assert out.returncode == 0, out.stderr
+
+
+def test_icons_and_placeholders_render(app, tmp_path):
+    """App-Icon am Fenster, SVG-Symbole in Seitenleiste und Werkzeugleiste, Leerzustand mit Symbol."""
+    win = MainWindow(AppConfig(results_root=tmp_path / "results", jobs_dir=tmp_path / "jobs"))
+    assert not win.windowIcon().pixmap(32, 32).isNull()
+    assert all(not win.nav.item(i).icon().pixmap(22, 22).isNull() for i in range(win.nav.count()))
+    assert not win.open_case_button.icon().pixmap(20, 20).isNull()
+    assert not win.root_action.icon().pixmap(20, 20).isNull()
+    for viewer in (win.structures.gallery, win.dose.gallery, win.transform.overview):
+        assert not viewer.view.pixmap().isNull()                  # Symbol der Seite ueber "Noch kein Ergebnis"
+    win.close()
