@@ -26,6 +26,7 @@ MAX_SHIFT_MM = 1000.0
 METHOD_DE = {"resample": "Neuabtastung", "metadata": "nur Lage-Tags (Pixel unverändert)"}
 ORDER_DE = {0: "nächster Nachbar", 1: "linear", 3: "kubisch"}
 FOR_DE = {"keep": "FoR beibehalten", "new": "neue FoR"}
+FOR_SHORT = {"keep": "beibehalten", "new": "neu"}
 FOR_KEPT_DE = "beibehalten (das TPS legt vorhandene Pläne und Dosen darüber)"
 
 
@@ -124,6 +125,11 @@ class TransformPage(WorkflowPage):
         return next((k for k in range(self.center_combo.count())
                      if (self.center_combo.itemData(k) or "").lower() == s), -1)
 
+    def _center_display(self, spec: str) -> str:
+        """Anzeige mit dem Markernamen, wie er im RTSTRUCT steht (auch bei getipptem "marker:hs1")."""
+        i = self._find_center(spec)
+        return _center_text((self.center_combo.itemData(i) if i >= 0 else None) or spec)
+
     def _set_centers(self, markers: list) -> None:
         self.center_combo.blockSignals(True)
         self.center_combo.clear()
@@ -213,7 +219,7 @@ class TransformPage(WorkflowPage):
         order = " (Drehreihenfolge X, Y, Z, intrinsisch)" if sum(1 for v in (s.rx, s.ry, s.rz) if v) > 1 else ""
         lines = [f"Bewegung: {pv.description}{order}"]
         if pv.center_mm:
-            lines.append(f"Drehpunkt: {_center_text(s.center) if with_rs else 'Volumenmitte'} "
+            lines.append(f"Drehpunkt: {self._center_display(s.center) if with_rs else 'Volumenmitte'} "
                          f"({_mm(pv.center_mm)} mm)")
         if pv.drehpunkt_mm:
             lines.append(f"Neuer POINT-Marker „Drehpunkt“ im Ergebnis bei ({_mm(pv.drehpunkt_mm)} mm)")
@@ -258,7 +264,7 @@ class TransformPage(WorkflowPage):
     def _center_of(self, result: dict) -> str:
         s, js = result.get("summary") or {}, self._job_settings
         if s.get("tool") == transform.CASE_TOOL and js is not None:
-            return _center_text(js.center)
+            return self._center_display(js.center)
         return s.get("rotation_center_label") or "Volumenmitte"
 
     def _report_text(self, result: dict) -> str:
@@ -266,7 +272,8 @@ class TransformPage(WorkflowPage):
         s, js = result.get("summary") or {}, self._job_settings
         if not s:
             return ""
-        L = [f"Bewegung      {s.get('description', '')}"]
+        motion = (s.get("description") or "").split(" · ")      # Bericht ohne Zeilenumbruch: ein Teil je Zeile
+        L = [f"Bewegung      {motion[0]}"] + [f"              {m}" for m in motion[1:]]
         if s.get("rotation_center_mm"):
             L.append(f"Drehpunkt     {self._center_of(result)} ({_mm(s['rotation_center_mm'])} mm)")
         if s.get("drehpunkt_mm"):
@@ -275,7 +282,7 @@ class TransformPage(WorkflowPage):
             L.append(f"Methode       {METHOD_DE.get(js.method, js.method)}"
                      + (f", Interpolation {ORDER_DE.get(js.order, js.order)}" if js.method == "resample" else ""))
         L.append(f"CT-Schichten  {s.get('n_slices', 0)}")
-        L.append(f"FoR           {FOR_DE.get(s.get('for_strategy'), 'beibehalten')}")
+        L.append(f"FoR           {FOR_SHORT.get(s.get('for_strategy'), 'beibehalten')}")
         if s.get("T"):
             L += ["", "Matrix T (Patient -> Patient, LPS, mm):"]
             L += ["  " + "".join(f"{v:12.6f}" for v in row) for row in s["T"]]
@@ -287,8 +294,8 @@ class TransformPage(WorkflowPage):
         v = s.get("verify")
         if v:
             L += ["", f"Schwerpunkt-Prüfung: {v['checked']} ROIs, max. Abweichung {v['max_err_mm']:.2e} mm "
-                      f"({v.get('worst_roi') or '-'}), Schwelle {v['threshold_mm']:g} mm -> "
-                      f"{'bestanden' if v['passed'] else 'NICHT bestanden'}"]
+                      f"({v.get('worst_roi') or '-'})",
+                  f"  Schwelle {v['threshold_mm']:g} mm -> {'bestanden' if v['passed'] else 'NICHT bestanden'}"]
         return "\n".join(L)
 
     def summary_text(self, result: dict) -> str:

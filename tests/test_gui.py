@@ -148,6 +148,8 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     combo.setCurrentIndex(combo.count() - 1)
     assert page.center_edit.isVisible() and page.form.settings().center.count(",") == 2
     combo.setCurrentIndex(marker)
+    page.center_edit.setText("marker:hs1")                       # Kleinschreibung: derselbe Marker
+    assert combo.currentIndex() == marker
     page.form.widget("tx").setValue(2.0)
     page.form.widget("rz").setValue(5.0)
     text = page.preview_label.text()
@@ -161,7 +163,8 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     out = Path(res["output_dir"])
     assert out.name == f"{demo.root.name}_RB" and (out / "CT").is_dir() and (out / "RS_RB.dcm").is_file()
     assert page.overview.count() == page.displacement.count() == 1 and page.view3d_button.isEnabled()
-    assert "Matrix T" in page.report.toPlainText() and "Drehpunkt     Marker HS1" in page.report.toPlainText()
+    report = page.report.toPlainText()
+    assert "Matrix T" in report and "Drehpunkt     Marker HS1" in report and "FoR           beibehalten" in report
     assert "2 mm nach links" in page.summary_label.text() and "Verschiebung X" not in page.summary_label.text()
     page.command_button.click()
     assert QApplication.clipboard().text().startswith("dfm case-transform")
@@ -174,7 +177,7 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     assert "nur das CT" in page.preview_label.text()
     page.ct_only.setChecked(False)                                # die Wahl von vorher kommt zurueck
     wait_until(app, page.start_button.isEnabled)
-    assert page.form.settings().center == "marker:HS1"
+    assert page.form.settings().center == "marker:hs1"
     win.close()
 
 
