@@ -80,16 +80,26 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 There is no lint config yet; `pyproject.toml` declares ruff as a dependency group and builds the package with hatchling. The automated checks are:
 - `uv run pytest` (`tests/`, restricted via `testpaths`):
-  - `tests/test_import_graph.py` checks four things:
+  - `tests/test_import_graph.py` checks five things:
     - no import cycles at module level;
     - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
-    - every module imports first in a fresh interpreter;
+    - layers: no core module imports `api` (except the entry point `cli`), and `api` never imports `gui`;
+    - every module, including `api/*`, imports first in a fresh interpreter;
     - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
   - These tests use the demo case:
     - `tests/test_dose_indices.py` (P0.4): candidates, fixes, stages, progress and cancel;
     - `tests/test_case_modifier.py` (P0.5): stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
     - `tests/test_modifier.py` (P0.6): CT loader filters, `run_ct_transform`, resample progress and cancel, no browser, exit 2;
-    - `tests/test_analyzer_viz.py` (P0.7): silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot.
+    - `tests/test_analyzer_viz.py` (P0.7): silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot;
+    - `tests/test_cli.py` (P0.8a): `dfm` forwards argv unchanged, one version everywhere, `dfm selftest`;
+    - `tests/test_api.py` (P0.8b). It checks:
+      - Settings ↔ argparse: every CLI option is a field or a known non-setting, defaults and choices match, and a round trip through the real parser gives the same settings;
+      - the dose CLI hands the core the same arguments as the API;
+      - API output = CLI output: structures byte-identical, dose report and RS contours, transform CT geometry and contours; the copied command reproduces the run;
+      - `inspect`/`preview` print nothing and load no pyplot, `visualizer`, `dose_viz` or plotly;
+      - preview = run: ROI names and the Eclipse-mode values;
+      - error classes and exit codes;
+      - the inputs stay unchanged.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -122,7 +132,9 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
 - In `exact` mode, numbers in the console output that differ are failures, not warnings.
 - The work dir `%USERPROFILE%\dfm-golden` must stay outside the repo, because real-case runs contain patient data.
 - No goldens are committed. The synthetic snapshots are about 50 MB, and exact parity is only reliable on the same CPU.
-- The local reference is `G3b` (Python 3.14 from `uv.lock`).
+- `G3b` (Python 3.14 from `uv.lock`) is the migration anchor.
+  - Each step is compared exactly against the run of the previous step (`compare P07 P08b --mode exact`).
+  - The older run is then deleted, because real-case runs contain patient data.
 - CI (Phase 1) is to run the base and the PR commit on the same runner and compare them exactly.
 - `docs/migration-py314.md` documents the 3.8 → 3.14 drift. `tools/legacy/requirements-py38.txt` pins the old environment.
 
@@ -141,6 +153,66 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
   - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The planned GUI process must never import `dose_viz`.
   - `case_modifier` → `visualizer`/`analyzer` and `visualizer` → `modifier` only load what the chosen code path needs.
 - `tests/test_import_graph.py` enforces the rule.
+
+### `api/` — interface for the CLI command, the worker and the GUI (P0.8b)
+The layer sits above the core; the core never imports it (only `cli` does), and it never imports `gui`. Every workflow module has the same shape:
+
+| Module | Wraps | `dfm` equivalent |
+|---|---|---|
+| `api/structures.py` | `analyzer` + `visualizer` | `analyze … --output DIR` and `visualize … --output DIR` |
+| `api/dose.py` | `dose_indices` | `dose-indices` |
+| `api/transform.py` | `case_modifier` (with RS) or `modifier` (CT only) | `case-transform` / `ct-transform` |
+
+- **`Settings`** is a dataclass of `fields.setting(...)` fields, each with a `FieldMeta`:
+  - display: label, help, unit, level basic/advanced/expert;
+  - range: choices, min/max (inclusive);
+  - CLI mapping: `cli_flag`, `cli_invert` (positive field, `--no-x` flag), `cli_default` (e.g. `--center` is `None` on the CLI and `"volume"` in the API), `tools`, `kind` names/spec/path;
+  - `enabled_if(settings, info)` → reason when a field does not apply.
+- **Defaults are the CLI defaults.** `SettingsBase` provides:
+  - `to_argv(tool)`: only values that differ from the CLI default; a value starting with `-` is written as `--flag=value`;
+  - `from_namespace(ns, tool)` and `to_dict`/`from_dict` (type coercion, unknown keys are an error unless `strict=False`);
+  - `validate(info)` → `Issue`s, `disabled_fields(info)`, `non_default()`.
+
+  `NON_SETTINGS` lists the options that are selection, output or mode (e.g. `--rs`, `--output`, `--list`).
+- **Functions** of each workflow module:
+
+  | Function | Returns | Notes |
+  |---|---|---|
+  | `inspect(selection)` | info | Reads only, prints nothing, never raises; problems become `issues` |
+  | `preview(info, settings)` | preview | Pre-start check with the same functions as the run; writes nothing |
+  | `command(settings, selection, out_dir)` | list of `dfm` argv lists | `command_gaps` names what the CLI cannot express, e.g. a flat-export CT |
+  | `run(settings, selection, out_dir)` | `JobResult` | Always; prints the CLI console text (the worker turns it into log lines) and imports the plot modules only here |
+  | `default_folder(settings, selection)` | folder name | `<case_id><label>` or `<case_id>_STRUCT` |
+- **`selection.CaseSelection`** names the files explicitly: `case_id`, `case_dir`, `ct_files`, `rs`, `rd`, `rp`, `eclipse_ref`, `related`.
+  - `for_dose`, `for_transform`, `from_rtstruct` and `from_ct_dir` make exactly the CLI's choice in the standard layout.
+  - The scanner (P0.8d) will build selections for other layouts.
+- **`outputs.OutputSpec(root, folder, policy)`** handles the result folder:
+  - `root` must be absolute; `folder_name_problem` applies the Windows name rules;
+  - `target_dir` picks `_2`, `_3`, … for `policy="suffix"`, or reuses the folder for `overwrite`.
+- **`results`:**
+  - `JobResult(workflow, status ok|ok_warnings|failed|cancelled, exit_code 0/2/3/1, output_dir, outputs, issues, summary, timings, manifest, command)`. Outputs are relative to `output_dir`.
+  - `run_guarded` wraps the run body in a `StageTimer`. That context forwards stage/progress/cancel and measures the stages. It also turns exceptions into issues.
+  - `blocked` is the result when validation fails before the start.
+- **`issues`** re-exports `Issue`/`UserInputError` and translates exceptions into German issues:
+
+  | Exception | Code |
+  |---|---|
+  | `InvalidDicomError` | `DICOM.INVALID` |
+  | `FileNotFoundError` | `FILE.NOT_FOUND` |
+  | `PermissionError` | `FILE.PERMISSION` |
+  | other `OSError` | `FILE.IO` |
+  | `MemoryError` | `SYSTEM.MEMORY` |
+  | pydicom `AttributeError` | `DICOM.MISSING_TAG` |
+  | `KeyError` / `ValueError` | `INPUT.*` |
+  | `JobCancelled` | `JOB.CANCELLED` |
+  | anything else | `INTERNAL`, with the traceback |
+
+  `exit_code_for(exc)` returns 2 for input errors (`ValueError`, `KeyError`, `OSError`, `InvalidDicomError`, missing tags), 3 for cancel and 1 otherwise.
+- **`sysinfo`:** `available_memory_bytes()` (Windows `GlobalMemoryStatusEx`) and `format_bytes`.
+- **Previews:**
+  - dose: effective values and locked fields (`resolve_effective`, `ECLIPSE_LOCKED`), targets, Rx, levels, ROI names (`rtstruct_writer.planned_roi_names`), fine grid with a memory estimate (`DOSE.GRID_TOO_LARGE` above `dose.MAX_FINE_VOXELS`, `SYSTEM.MEMORY_LOW` against free RAM) and the Eclipse sources. Errors carry the field they belong to (`target`, `rx`, `isodose`, `eclipse_values`, `append_csv`, `grid_mm`).
+  - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`).
+- **Result layout:** the CT-only transform writes `<out>/CT/` plus `visualization_3d.html`, so every transform result is again a case folder.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
@@ -162,12 +234,20 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
 ### `dose.py` / `dose_indices.py` / `rtstruct_writer.py` / `dose_viz.py` — dose indices
 Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_grid_from_dataset` (`DoseGrid`: float32 Gy array `(k,j,i)`, affine with the same `P = A @ [k,j,i,1]` convention as `modifier.extract_geometry`, GFOV relative/absolute, validation of units/GFOV/FoR) → `select_targets` / `resolve_prescription` / `parse_isodose_levels` → `compute_dose_indices`: one `FineGrid` (in-plane `--grid`, z = native dose planes ∩ CT planes, bbox = targets ∪ lowest isodose level + margin; `--eclipse-compat` aligns the voxel centres to the CT pixel raster) → `sample_dose_on_grid` (`map_coordinates` per plane on a cropped native array; cubic prefilters once like `modifier.resample_volume`; NaN outside the grid) → `rasterize_structure` (wrapper around `analyzer.rasterize_contours`, XOR per ring, plus per-plane slab weights: `eclipse` halves the first/last slab of every contiguous z-run) → isodose masks, `ndimage.label` components (`--piv-scope component` keeps only components overlapping the target) → `evaluate_target` (volumes as weighted voxel sums, weighted DVH percentiles, all indices) → `build_eclipse_reference` / `compare_with_eclipse` (RTDOSE `DVHSequence` via `dose.read_dvh_sequence`, `eclipse_ref.json`, `--eclipse-values`; precedence cli > json > dvh, gaps filled by `derive_eclipse_values`) → RS export → `dose_viz.run_dose_visualization` (`validation.html` + `dose_overview.png`, wrapped in try/except like the RS export) → report/JSON/TXT/CSV.
 
-**Orchestration (P0.4).** `run_dose_indices` keeps its signature and output and runs three stages:
-- `prepare_dose_run` → `DoseRunPlan`: discovery, loading and checks, selection, Eclipse reference, CT index, `--eclipse-compat`.
+**Orchestration (P0.4, split further in P0.8b).** `run_dose_indices` keeps its signature and output and runs three stages:
+- `prepare_dose_run` → `DoseRunPlan` runs three steps:
+  - discovery (or `files=` from `dose_files`: explicit files, CT as a folder or a file list);
+  - `load_dose_inputs` → `DoseInputs`: RS/RD/RP, dose grid, reference checks and CT index. An unusable CT is only recorded as `ct_error`.
+  - `plan_dose_run`: targets, Rx, levels, Eclipse reference, the CT decision (error with RS export or Eclipse mode, else a warning) and `eclipse_compat_settings`.
+
+  `out_dir=` sets the exact result folder instead of `<output>/<case_id><label>`.
 - `compute_dose_run` → `DoseIndexArtifacts`.
 - `write_dose_outputs` → report: RS export, viz, JSON/TXT/CSV.
 
-`run_dose_indices_ex` returns `(report, artifacts)`.
+Supporting pieces:
+- `run_dose_indices_ex` returns `(report, artifacts)`.
+- `plan_fine_grid` builds the target specs and the fine grid without sampling. The API preview uses it for the voxel count, with `max_voxels=inf` to measure even an oversized grid.
+- `rtstruct_writer.build_ct_slice_index` accepts a folder or a list of files.
 
 **Candidates without aborting**, for a GUI:
 - `target_candidates` and `rx_candidates` return the automatic choice with a reason. `select_targets` and `resolve_prescription` build on them and keep their messages.
@@ -210,6 +290,9 @@ Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions �
 - `inspect_rtstruct(path_or_ds, volumes=True)` gives the quick ROI table (number, name, type, category, geometric types, contour count, planimetric volume, colour, marker), POINT markers, FoR UIDs and structure-set label/date.
 - `parse_name_list` trims `--targets`/`--oars` in both CLIs.
 - `find_point_markers` lives in `dicom_utils` (re-exported by `case_modifier`).
+- `select_rois(names, categories, targets, oars)` is the ROI choice of `analyze_rtstruct`; the API preview uses it too.
+- `write_analysis_json` writes `<stem>_analysis.json` for `--output`.
+- `run_analysis(return_info=True)` also returns `info`, including the issues.
 
 Key conventions:
 - Contours are kept as a `list[np.ndarray]`, one (N,3) array per contour (a slice may hold several: islands and holes). `contours_to_points` flattens them when a unified point cloud is needed.
@@ -228,7 +311,7 @@ Rotations use **intrinsic XYZ Euler angles** (`Rotation.from_euler("XYZ", ...)` 
 - `load_ct_headers(dir_or_files, series_uid=None)` and `load_ct_series_files(files, series_uid=None)` keep only `Modality` CT with IPP. They require exactly one series (`series_uid` chooses; otherwise `UserInputError` `CT.MULTIPLE_SERIES`) and reject duplicate SOPs. The header loader filters first; then only the chosen files are read in full. So a flat Eclipse export, with RS/RP/RD next to the CT, works.
 - `load_ct_series(dir)` stays unchanged for old callers.
 - `validate_ct_geometry` (with the orientation guard) lives here; `case_modifier` re-exports it.
-- `run_ct_transform(ct_dir, output_dir, tx..rz, method=, order=, viz=, viz_html=, series_uid=)` is the CLI run as a function and returns a dict (`n_slices`, `series_uid`, `sop_map`, `T`, `rotation_center`, `viz_html_path`).
+- `run_ct_transform(ct_dir, output_dir, tx..rz, method=, order=, viz=, viz_html=, series_uid=)` is the CLI run as a function and returns a dict (`n_slices`, `series_uid`, `sop_map`, `T`, `rotation_center`, `viz_html_path`). `ct_dir` may also be a list of CT files.
 - `main` catches input errors: exit 2 instead of a traceback.
 - `resample_volume` reports progress and checks for cancel per 20-slice chunk. Stages are `load` / `transform` / `viz`.
 - `visualize_3d` writes the HTML and returns the figure. It opens a browser only with `show=True`.
@@ -248,7 +331,14 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
 - **`resolve_center`** takes `volume`, `marker:NAME` or `x,y,z`. The prompt appears only if interactive and stdin is a TTY; stdin may be `None` under pythonw/GUI.
 - **`plan_transform` → `TransformPlan`** builds `T` and the paths, and pre-assigns all UIDs: CT series, `sop_map` old→new, optional FoR. It already runs `transform_rtstruct` and `check_contour_clipping`, so a bad RS reference (`KeyError`) fails before anything is written. The dry run stops here and loads no pixels.
 - **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
-- The result dict adds `issues` (`issues.Issue.to_dict()`: `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`), `clipping`, `method` and `for_strategy`.
+- The result dict adds these keys:
+  - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`;
+  - `clipping`, `method` and `for_strategy`;
+  - `viz`: the `{'written', 'skipped'}` report of the before/after plots.
+- For the API (P0.8b):
+  - `preflight_case(..., ct_files=, case_id=, siblings=, quiet=)` accepts an explicit CT file list with `--rs` instead of `<case>/CT/`;
+  - `plan_transform(..., out_dir=, quiet=)` takes the exact result folder;
+  - `quiet` silences both functions for the preview.
 - Console output is unchanged, except that the sibling note appears once instead of twice.
 - Stages reported to `_runtime`: `preflight` / `plan` / `ct_transform` / `rs_write` / `verify` / `viz`, with a cancel check between them.
 

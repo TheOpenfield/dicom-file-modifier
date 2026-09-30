@@ -1,10 +1,13 @@
 """
-Importgraph des Pakets (Plan P0.3).
+Importgraph des Pakets (Plan P0.3, Schichten ab P0.8).
 
 - Auf Modulebene gibt es keine Import-Zyklen.
 - Kein Paketmodul importiert die CLI-Orchestratoren ``case_modifier`` oder
   ``dose_indices``, weder auf Modulebene noch in Funktionen.
-- Jedes Modul laesst sich in einem frischen Interpreter als erstes importieren.
+- Schichten: Kein Kernmodul importiert ``api`` (ausser dem Einstiegspunkt
+  ``cli``); ``api`` importiert nie ``gui``.
+- Jedes Modul (auch in ``api/``) laesst sich in einem frischen Interpreter als
+  erstes importieren.
 - Die nach ``dicom_utils``/``dose_constants`` verschobenen Namen sind unter den
   alten Pfaden dieselben Objekte.
 """
@@ -85,7 +88,50 @@ def test_no_module_imports_an_orchestrator():
     assert not offenders, f"Module importieren CLI-Orchestratoren: {offenders}"
 
 
-@pytest.mark.parametrize("module", MODULES)
+API_DIR = PKG_DIR / "api"
+API_MODULES = sorted(p.stem for p in API_DIR.glob("*.py") if p.stem != "__init__")
+
+
+def _top_level_imports(path: Path, depth: int, own: str = "") -> set:
+    """
+    Direkte Kinder des Pakets (Module/Unterpakete), die eine Datei importiert,
+    auf Modulebene und in Funktionen.  ``depth`` = Tiefe der Datei unter dem
+    Paket (0 = Paketmodul, 1 = ``api/``); Importe innerhalb des eigenen
+    Unterpakets zaehlen als ``own``.
+    """
+    out = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                if node.module == PKG:
+                    out |= {a.name for a in node.names}
+                elif node.module and node.module.startswith(PKG + "."):
+                    out.add(node.module.split(".")[1])
+            elif node.level - 1 == depth:                     # relativ zur Paketwurzel
+                out |= {node.module.split(".")[0]} if node.module else {a.name for a in node.names}
+            else:                                             # im eigenen Unterpaket
+                out.add(own)
+        elif isinstance(node, ast.Import):
+            out |= {a.name.split(".")[1] for a in node.names if a.name.startswith(PKG + ".")}
+    return out
+
+
+def test_core_does_not_import_the_api_layer():
+    offenders = sorted(m for m in MODULES if m not in ENTRY_POINTS
+                       and {"api", "gui"} & _top_level_imports(PKG_DIR / f"{m}.py", 0))
+    assert not offenders, f"Kernmodule importieren api/gui: {offenders}"
+    assert "api" in _top_level_imports(PKG_DIR / "cli.py", 0)      # die Pruefung greift
+
+
+def test_api_never_imports_the_gui():
+    found = {m: _top_level_imports(API_DIR / f"{m}.py", 1, own="api")
+             for m in API_MODULES + ["__init__"]}
+    offenders = sorted(m for m, names in found.items() if "gui" in names)
+    assert not offenders, f"api-Module importieren gui: {offenders}"
+    assert "dose_indices" in found["dose"] and "api" in found["dose"]   # die Pruefung greift
+
+
+@pytest.mark.parametrize("module", MODULES + [f"api.{m}" for m in API_MODULES])
 def test_module_imports_first_in_fresh_interpreter(module):
     proc = subprocess.run([sys.executable, "-c", f"import {PKG}.{module}"],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)

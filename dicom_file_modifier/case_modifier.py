@@ -679,29 +679,55 @@ class CasePreflight:
     issues: list = field(default_factory=list)
 
 
-def preflight_case(case_dir: str, rs_override: "str | None" = None, label: str = "_RB") -> CasePreflight:
+def _printer(quiet: bool):
+    return (lambda *a, **k: None) if quiet else print
+
+
+def preflight_case(case_dir: "str | None", rs_override: "str | None" = None, label: str = "_RB",
+                   *, ct_files: "list | None" = None, case_id: "str | None" = None,
+                   siblings: "list | None" = None, quiet: bool = False) -> CasePreflight:
     """
     Stufe 1: Discovery, CT-Header (ohne Pixel), Geometrie- und
     Orientierungspruefung, RTSTRUCT, FoR-Konsistenz, ``--label``.  Druckt den
-    Kopf des Laufs.  Eingabefehler -> ``ValueError``/``FileNotFoundError``.
+    Kopf des Laufs (``quiet``: nichts).  Eingabefehler ->
+    ``ValueError``/``FileNotFoundError``.
+
+    ``ct_files`` (nur mit ``rs_override``) ersetzt die Ordner-Konvention
+    ``<case>/CT/`` (z.B. flacher Export); ``case_id`` ersetzt dann den
+    Ordnernamen, ``siblings`` die gefundenen RP-/RD-Dateien.
     """
     ctx = _runtime.current()
     ctx.stage("preflight", "Fall pruefen")
-    ct_dir, rs_path, siblings = discover_case(case_dir, rs_override=rs_override, return_siblings=True)
-    print(f"\nLade Case '{case_dir}' …")
+    say = _printer(quiet)
+    if ct_files is None:
+        ct_dir, rs_path, siblings = discover_case(case_dir, rs_override=rs_override,
+                                                  return_siblings=True)
+        ct_source = ct_dir
+    else:
+        if rs_override is None:
+            raise ValueError("Mit einer CT-Dateiliste muss das RTSTRUCT angegeben werden (--rs).")
+        rs_path = Path(rs_override)
+        if not rs_path.is_file():
+            raise FileNotFoundError(f"RS-Datei nicht gefunden: {rs_override!r}")
+        ct_source = [str(f) for f in ct_files]
+        parents = {Path(f).parent for f in ct_source}
+        ct_dir = parents.pop() if len(parents) == 1 else rs_path.parent
+        siblings = [Path(p) for p in (siblings or [])]
+    base = Path(case_dir) if case_dir is not None else rs_path.parent
+    say(f"\nLade Case '{case_dir if case_dir is not None else base}' …")
     issues = []
     if siblings:
-        print(_siblings_note(siblings))
+        say(_siblings_note(siblings))
         issues.append(Issue(
             "info", "CASE.SIBLINGS_NOT_TRANSFORMED",
             "Plan- und Dosisdateien im Fallordner werden nicht mit-transformiert: "
-            + ", ".join(p.name for p in siblings),
+            + ", ".join(Path(p).name for p in siblings),
             hint_de="RTPLAN/RTDOSE passen nach der Transformation nicht mehr zum CT."))
-    print(f"  CT-Ordner   : {ct_dir}")
-    print(f"  RTSTRUCT    : {rs_path}")
+    say(f"  CT-Ordner   : {ct_dir}")
+    say(f"  RTSTRUCT    : {rs_path}")
 
-    headers = load_ct_headers(ct_dir)
-    print(f"  {len(headers)} CT-Slices geladen")
+    headers = load_ct_headers(ct_source)
+    say(f"  {len(headers)} CT-Slices geladen")
     validate_ct_geometry(headers)
 
     rs_ds = pydicom.dcmread(str(rs_path))
@@ -712,17 +738,17 @@ def preflight_case(case_dir: str, rs_override: "str | None" = None, label: str =
         )
     ct_for_uid = get_ct_frame_of_reference(headers)
     validate_for_consistency(ct_for_uid, rs_ds)
-    print(f"  FrameOfReferenceUID OK ({ct_for_uid[:24]}…)")
+    say(f"  FrameOfReferenceUID OK ({ct_for_uid[:24]}…)")
 
-    case_id = Path(case_dir).resolve().name
+    case_id = case_id or base.resolve().name
     validate_label(label, case_id)
     geom = mod.extract_geometry(headers)
     vol_c = mod.volume_center(geom)
     nz, ny, nx = geom["shape"]
-    print(f"  Volumengroesse: {nz} x {ny} x {nx}  Voxel")
-    print(f"  Volumen-Mitte : ({vol_c[0]:.1f}, {vol_c[1]:.1f}, {vol_c[2]:.1f}) mm")
+    say(f"  Volumengroesse: {nz} x {ny} x {nx}  Voxel")
+    say(f"  Volumen-Mitte : ({vol_c[0]:.1f}, {vol_c[1]:.1f}, {vol_c[2]:.1f}) mm")
     return CasePreflight(
-        case_dir=Path(case_dir), case_id=case_id, ct_dir=ct_dir, rs_path=rs_path,
+        case_dir=base, case_id=case_id, ct_dir=ct_dir, rs_path=rs_path,
         siblings=siblings, ct_headers=headers, rs_ds=rs_ds, ct_for_uid=ct_for_uid, geom=geom,
         volume_center=vol_c, markers=find_point_markers(rs_ds), issues=issues,
     )
@@ -783,16 +809,18 @@ class TransformPlan:
 
 
 def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
-                   rx: float, ry: float, rz: float, *, output_dir: str,
+                   rx: float, ry: float, rz: float, *, output_dir: "str | None" = None,
                    method: str = "resample", order: int = 1, label: str = "_RB",
                    center: "np.ndarray | None" = None, center_label: str = "Volumenmitte",
                    new_frame_of_reference: bool = False,
-                   series_number_offset: int = 1000) -> TransformPlan:
+                   series_number_offset: int = 1000, out_dir: "str | None" = None,
+                   quiet: bool = False) -> TransformPlan:
     """
     Stufe 2: Transformationsmatrix, Ausgabepfade und alle neuen UIDs; das
     RTSTRUCT wird schon hier transformiert und auf Clipping geprueft, damit
     beim Schreiben kein halber Ausgabeordner entstehen kann.  Druckt den
-    Transformationsblock.
+    Transformationsblock (``quiet``: nichts).  Ergebnisordner ist ``out_dir``
+    oder ``<output_dir>/<case_id><label>``.
     """
     ctx = _runtime.current()
     ctx.check_cancel()
@@ -807,15 +835,18 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
         center = np.asarray(center, dtype=np.float64).reshape(3)
         resolved_label = center_label
 
-    print(f"\nTransformation:")
-    print(f"  Translation : tx={tx} mm, ty={ty} mm, tz={tz} mm")
-    print(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [intrinsisch XYZ]")
-    print(f"  Methode     : {method}")
-    print(f"  Zentrum     : {resolved_label}  "
-          f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
+    say = _printer(quiet)
+    say(f"\nTransformation:")
+    say(f"  Translation : tx={tx} mm, ty={ty} mm, tz={tz} mm")
+    say(f"  Rotation    : rx={rx} deg, ry={ry} deg, rz={rz} deg  [intrinsisch XYZ]")
+    say(f"  Methode     : {method}")
+    say(f"  Zentrum     : {resolved_label}  "
+        f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
     T = mod.build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
 
-    case_out = Path(output_dir) / f"{pre.case_id}{label}"
+    if out_dir is None and output_dir is None:
+        raise ValueError("Ausgabeordner fehlt (output_dir oder out_dir).")
+    case_out = Path(out_dir) if out_dir is not None else Path(output_dir) / f"{pre.case_id}{label}"
     new_for_uid = str(generate_uid()) if new_frame_of_reference else None
     for_strategy = "new" if new_frame_of_reference else "keep"
     ct_series_uid = str(generate_uid())
@@ -975,12 +1006,13 @@ def execute_transform(pre: CasePreflight, plan: TransformPlan, *, verify: bool =
 
     # Vorher/Nachher-Visualisierung; Fehler duerfen den geschriebenen Transform
     # nicht entwerten -> defensiv abgefangen.
+    viz_report = None
     if not no_viz:
         ctx.check_cancel()
         ctx.stage("viz", "Vorher/Nachher-Ansicht erstellen")
         try:
             from . import visualizer as viz
-            viz.run_case_visualization(
+            viz_report = viz.run_case_visualization(
                 orig_ds=pre.rs_ds,
                 new_ds=new_rs,
                 center=plan.center,
@@ -1020,6 +1052,7 @@ def execute_transform(pre: CasePreflight, plan: TransformPlan, *, verify: bool =
         "method":          plan.method,
         "for_strategy":    plan.for_strategy,
         "clipping":        _clipping_dicts(plan.clipping),
+        "viz":             viz_report,
         "issues":          [i.to_dict() for i in issues],
     }
 

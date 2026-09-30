@@ -69,18 +69,24 @@ class RoiSpec:
 # 1. CT-Schichtindex
 # ---------------------------------------------------------------------------
 
-def build_ct_slice_index(ct_dir: str) -> dict:
+def build_ct_slice_index(ct_dir) -> dict:
     """
     Liest die CT-Header (ohne Pixel) und liefert
     ``{'series_uid', 'study_uid', 'for_uid', 'sop_class_uid', 'z_values',
     'z_to_sop', 'sops', 'pixel_spacing', 'ipp_xy', 'n_slices', 'z_to_path',
     'paths'}`` (``z_to_path``/``paths``: Dateipfade je Schicht, damit
     ``dose_viz`` nur die Schichten im Bereich des Feingitters mit Pixeln laedt).
+    ``ct_dir`` ist ein Ordner (``*.dcm``) oder eine Liste von Dateien.
     """
     import glob
     import os
 
-    files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
+    if isinstance(ct_dir, (str, os.PathLike)):
+        files = sorted(glob.glob(os.path.join(glob.escape(str(ct_dir)), "*.dcm")))
+        where = repr(ct_dir)
+    else:
+        files = [str(f) for f in ct_dir]
+        where = f"den {len(files)} CT-Dateien"
     slices = []
     for f in files:
         try:
@@ -90,7 +96,7 @@ def build_ct_slice_index(ct_dir: str) -> dict:
         if str(ds.get("Modality", "")).upper() == "CT" and "ImagePositionPatient" in ds:
             slices.append(ds)
     if not slices:
-        raise ValueError(f"Keine CT-Schichten in {ct_dir!r} gefunden.")
+        raise ValueError(f"Keine CT-Schichten in {where} gefunden.")
     slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
     series = {str(s.SeriesInstanceUID) for s in slices}
     fors = {str(s.get("FrameOfReferenceUID", "")) for s in slices}
@@ -268,6 +274,32 @@ def build_roi_specs(art, include_target: bool = False, max_name_len: int = 64,
             if sp.kind == "isodose" and sp.description.startswith(f"Isodose {lv.label} "):
                 lv.roi_name = sp.name
     return specs
+
+
+def planned_roi_names(level_specs: list, target_names: list, include_target: bool = False,
+                      max_name_len: int = 64) -> list:
+    """
+    ROI-Namen, die ``build_roi_specs`` schreiben wuerde, ohne Rechnung (Vorschau):
+    ``[(kind, name, bezug), ...]`` in derselben Reihenfolge und mit derselben
+    Eindeutigkeits-Passe; ``bezug`` ist der Level-``label`` bzw. der Zielname.
+    """
+    stubs, refs = [], []
+    if include_target:
+        for t in target_names:
+            stubs.append(RoiSpec(name=t[:max_name_len], color=(0, 0, 0), kind="target"))
+            refs.append(t)
+    for lv in level_specs:
+        stubs.append(RoiSpec(name=iso_name(lv["pct"], lv["gy"])[:max_name_len], color=(0, 0, 0),
+                             kind="isodose"))
+        refs.append(lv["label"])
+    for t in target_names:
+        for kind, prefix, suffix in (("inter", "", "_x_ISO100"), ("under", "", "_minus_ISO100"),
+                                     ("spill", "ISO100_minus_", "")):
+            stubs.append(RoiSpec(name=_fit_name(prefix, t, suffix, max_name_len), color=(0, 0, 0),
+                                 kind=kind))
+            refs.append(t)
+    _unique_names(stubs)
+    return [(sp.kind, sp.name, ref) for sp, ref in zip(stubs, refs)]
 
 
 def summary_description(art, max_len: int = 200) -> str:

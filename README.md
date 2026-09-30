@@ -34,6 +34,8 @@ dicom-file-modifier/
 ├── output/                  # Analysis results and modified files (not synced)
 ├── dicom_file_modifier/     # Python package
 │   ├── __init__.py
+│   ├── __main__.py, cli.py  # `dfm` entry point (python -m dicom_file_modifier)
+│   ├── api/                 # Interface for scripts, the worker and the desktop app (settings, inspect, preview, run)
 │   ├── analyzer.py          # RTSTRUCT analysis module
 │   ├── modifier.py          # CT rigid body transformer
 │   ├── case_modifier.py     # CT + RTSTRUCT lockstep transformer
@@ -46,6 +48,8 @@ dicom-file-modifier/
 │   ├── phantom.py           # Analytic geometry/dose models and closed-form expectations for demo.py
 │   ├── dicom_utils.py       # Small DICOM helpers shared by several modules (FoR lookup, SOP UID, label length)
 │   ├── dose_constants.py    # Constants shared by the dose-index modules (tool version, ROI colours)
+│   ├── issues.py            # Structured findings (code, German message, hint) for CLI and GUI
+│   ├── _runtime.py          # Progress/cancel context for long computations
 │   └── _compat.py           # pydicom 2.x/3.x compatibility shims
 ├── tests/                   # pytest suite (uv run pytest)
 ├── tools/
@@ -95,6 +99,29 @@ dfm visualize | ct-transform | case-transform | dose-indices | demo ...
 dfm selftest              # installation check: all self-tests (case modifier on a freshly generated demo case)
 dfm --version --json      # versions of the package, the tools and the libraries
 ```
+
+### Python API
+
+`dicom_file_modifier.api` offers the three workflows as functions: structure analysis, dose indices and transformation. The planned desktop app is built on this layer, and scripts can use it as well. Each workflow module has the same steps:
+
+| Step | What it does |
+|---|---|
+| `inspect(selection)` | reads the inputs, prints nothing |
+| `preview(info, settings)` | checks everything before the start and writes nothing |
+| `run(settings, selection, out_dir)` | writes the results and returns a `JobResult` with status, issues, outputs and the equivalent `dfm` command |
+
+```python
+from dicom_file_modifier.api import dose, selection
+
+sel = selection.for_dose("data/<case-id>")        # same files the CLI would pick
+settings = dose.Settings(eclipse_compat="high")   # defaults = CLI defaults
+pv = dose.preview(dose.inspect(sel), settings)    # targets, Rx, ROI names, fine grid + memory estimate
+if pv.ok:
+    res = dose.run(settings, sel, "C:/Results/<case-id>_IDX")
+    print(res.status, res.outputs, res.command)
+```
+
+The results are identical to the CLI's; `tests/test_api.py` checks this on the demo case.
 
 ### Analyzer
 

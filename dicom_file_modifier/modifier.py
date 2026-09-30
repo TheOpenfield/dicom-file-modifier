@@ -727,14 +727,19 @@ def run_ct_transform(
     Geometrie inkl. Orientierung pruefen, transformieren, als neue Serie
     speichern, optional die 3D-Ansicht als HTML schreiben (nie ein
     Browserfenster).  Rotation intrinsisch XYZ um die Volumenmitte.
+    ``ct_dir`` ist ein Ordner oder eine Liste von CT-Dateien.
     Eingabefehler -> ``ValueError``/``FileNotFoundError`` (CLI-Exit 2).
     """
     if method not in ("resample", "metadata"):
         raise ValueError(f"Unbekannte Methode: {method!r}")
     ctx = _runtime.current()
     ctx.stage("load", "CT laden und pruefen")
-    print(f"\nLade CT-Serie aus {str(ct_dir)!r} …")
-    slices = load_ct_series_files(ct_dir_files(ct_dir), series_uid=series_uid, where=repr(str(ct_dir)))
+    if isinstance(ct_dir, (list, tuple)):
+        files, where = [str(f) for f in ct_dir], f"den {len(ct_dir)} CT-Dateien"
+    else:
+        files, where = ct_dir_files(ct_dir), repr(str(ct_dir))
+    print(f"\nLade CT-Serie aus {where} …")
+    slices = load_ct_series_files(files, series_uid=series_uid, where=where)
     print(f"  {len(slices)} Slices geladen")
     validate_ct_geometry(slices)
 

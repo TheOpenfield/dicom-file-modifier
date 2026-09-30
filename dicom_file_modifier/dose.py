@@ -490,10 +490,13 @@ def native_level_bbox(dose: DoseGrid, level_gy: float, margin_voxels: int = 2) -
     return pts.min(axis=0), pts.max(axis=0)
 
 
+MAX_FINE_VOXELS = 40_000_000       # Obergrenze des Feingitters (Speicher)
+
+
 def build_fine_grid(dose: DoseGrid, bbox_lo, bbox_hi, res_xy: float,
                     contour_z: Optional[np.ndarray] = None,
                     restrict_z_to: Optional[np.ndarray] = None,
-                    margin_mm: float = 1.0, max_voxels: int = 40_000_000,
+                    margin_mm: float = 1.0, max_voxels: float = MAX_FINE_VOXELS,
                     align: Optional[tuple] = None) -> FineGrid:
     """
     Feingitter ueber die BBox: In-Plane-Achsen an 1-mm-Vielfache gesnappt

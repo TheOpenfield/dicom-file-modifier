@@ -808,6 +808,37 @@ def _load(source) -> pydicom.Dataset:
     return source if isinstance(source, pydicom.Dataset) else load_rtstruct(str(source))
 
 
+def select_rois(names: dict, categories: dict, target_names: Optional[list] = None,
+                oar_names: Optional[list] = None) -> tuple:
+    """
+    ROI-Auswahl von ``analyze_rtstruct``: ``(target_nums, oar_nums, helper_nums)``.
+    Mit Namenslisten: case-insensitiver Teilstring, ohne Marker und EXTERNAL;
+    sonst nach Kategorie (TARGET bzw. serielle/parallele OARs).  Hilfsstrukturen
+    sind alle HELPER, die nicht schon Ziel oder OAR sind.
+    """
+    def _name_matches(nm, patterns):
+        return any(p.lower() in nm.lower() for p in patterns)
+
+    if target_names:
+        target_nums = {n for n, nm in names.items()
+                       if _name_matches(nm, target_names)
+                       and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
+    else:
+        target_nums = {n for n, c in categories.items() if c == CAT_TARGET}
+
+    if oar_names:
+        oar_nums = {n for n, nm in names.items()
+                    if _name_matches(nm, oar_names)
+                    and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
+    else:
+        oar_nums = {n for n, c in categories.items()
+                    if c in (CAT_OAR_SERIAL, CAT_OAR_PARALLEL)}
+
+    helper_nums = {n for n, c in categories.items()
+                   if c == CAT_HELPER and n not in target_nums and n not in oar_nums}
+    return target_nums, oar_nums, helper_nums
+
+
 def analyze_rtstruct(source, target_names: Optional[list[str]] = None,
                      oar_names: Optional[list[str]] = None) -> tuple:
     """
@@ -835,27 +866,7 @@ def analyze_rtstruct(source, target_names: Optional[list[str]] = None,
             num: classify_structure(nm, types.get(num, ""), geom_types.get(num, set()))
             for num, nm in names.items()
         }
-
-        def _name_matches(nm, patterns):
-            return any(p.lower() in nm.lower() for p in patterns)
-
-        if target_names:
-            target_nums = {n for n, nm in names.items()
-                           if _name_matches(nm, target_names)
-                           and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
-        else:
-            target_nums = {n for n, c in categories.items() if c == CAT_TARGET}
-
-        if oar_names:
-            oar_nums = {n for n, nm in names.items()
-                        if _name_matches(nm, oar_names)
-                        and categories[n] not in (CAT_MARKER, CAT_EXTERNAL)}
-        else:
-            oar_nums = {n for n, c in categories.items()
-                        if c in (CAT_OAR_SERIAL, CAT_OAR_PARALLEL)}
-
-        helper_nums = {n for n, c in categories.items()
-                       if c == CAT_HELPER and n not in target_nums and n not in oar_nums}
+        target_nums, oar_nums, helper_nums = select_rois(names, categories, target_names, oar_names)
 
         def _subtype(num):
             c = categories[num]
@@ -938,11 +949,12 @@ def analyze_rtstruct(source, target_names: Optional[list[str]] = None,
 def run_analysis(filepath: str,
                  target_names: Optional[list[str]] = None,
                  oar_names: Optional[list[str]] = None,
-                 list_only: bool = False) -> dict:
+                 list_only: bool = False, return_info: bool = False):
     """
     Hauptfunktion: Lädt RTSTRUCT, analysiert Strukturen, berechnet Abstände.
 
-    Druckschicht um ``analyze_rtstruct`` (gleiche Ausgabe wie bisher).
+    Druckschicht um ``analyze_rtstruct`` (gleiche Ausgabe wie bisher);
+    ``return_info=True`` liefert ``(results, info)`` wie ``analyze_rtstruct``.
 
     Parameters
     ----------
@@ -977,7 +989,8 @@ def run_analysis(filepath: str,
         print(f"{roi_num:<6} {roi_name:<30} {rt_type:<15}")
 
     if list_only:
-        return {"structures": names, "types": types}
+        listing = {"structures": names, "types": types}
+        return (listing, {}) if return_info else listing
 
     results, info = analyze_rtstruct(ds, target_names, oar_names)
 
@@ -1014,7 +1027,7 @@ def run_analysis(filepath: str,
                   f"{e['hausdorff_distance_mm']:>7.2f} {e['assd_mm']:>7.2f} "
                   f"{e['centroid_distance_mm']:>7.2f}")
 
-    return results
+    return (results, info) if return_info else results
 
 
 def inspect_rtstruct(source, volumes: bool = True) -> dict:
@@ -1312,18 +1325,23 @@ Beispiele:
     )
 
     if args.output:
-        out_dir = Path(args.output)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{Path(args.file).stem}_analysis.json"
-        with out_path.open("w", encoding="utf-8") as fh:
-            json.dump(_results_to_jsonable(results), fh,
-                      indent=2, ensure_ascii=False)
+        out_path = write_analysis_json(results, args.output, Path(args.file).stem)
         print(f"\nAnalyse-Ergebnisse gespeichert: {out_path}")
 
     print(f"\n{'=' * 60}")
     print("Analyse abgeschlossen.")
     print(f"{'=' * 60}\n")
     return 0
+
+
+def write_analysis_json(results: dict, out_dir, stem: str) -> Path:
+    """``<out_dir>/<stem>_analysis.json`` (ohne Punktwolken), wie ``--output``."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{stem}_analysis.json"
+    with out_path.open("w", encoding="utf-8") as fh:
+        json.dump(_results_to_jsonable(results), fh, indent=2, ensure_ascii=False)
+    return out_path
 
 
 def _results_to_jsonable(obj):
