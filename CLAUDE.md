@@ -12,6 +12,7 @@ Install dependencies (Python ≥ 3.12; `uv.lock` pins the tested versions on Pyt
 ```bash
 uv sync                  # .venv with Python 3.14 and the locked dependencies
 pip install -e .         # alternative: minimum versions from pyproject.toml (requirements.txt does the same)
+uv run pytest            # test suite in tests/
 ```
 
 Each module is invoked as `python -m dicom_file_modifier.<module>`:
@@ -70,7 +71,12 @@ Modifier-specific flags worth knowing: `--method {resample,metadata}` (default `
 
 `case_modifier` adds: `--center {volume,marker:NAME,x,y,z}` (rotation centre; default = interactive prompt with marker list, or volume centre if `--non-interactive`), `--label TEXT` (suffix for output dir / RS filename / `StructureSetLabel` / `SeriesDescription`; default `_RB`), `--new-frame-of-reference` (mints a new `FrameOfReferenceUID` for the transformed pair; default behaviour keeps the original FoR for legacy plan/dose linkage), `--dry-run`, `--verify`, `--no-viz` (skip the before/after plots), `--viz-ct-surface` (also extract the CT body surface into the 3D HTML).
 
-There is no pytest suite or lint config yet. `pyproject.toml` declares pytest and ruff as dependency groups and builds the package with hatchling. The only automated checks are:
+There is no lint config yet; `pyproject.toml` declares ruff as a dependency group and builds the package with hatchling. The automated checks are:
+- `uv run pytest` (`tests/`, restricted via `testpaths`). So far this is `tests/test_import_graph.py`, which checks four things:
+  - no import cycles at module level;
+  - no package module imports the orchestrators `case_modifier` / `dose_indices`, eagerly or lazily;
+  - every module imports first in a fresh interpreter;
+  - the names moved to `dicom_utils` / `dose_constants` are still the same objects under their old paths.
 - `python -m dicom_file_modifier.analyzer --self-test`: synthetic geometry (XOR holes, keyhole contours, z-gaps).
 - `python -m dicom_file_modifier.case_modifier <case> --self-test`: rigid-body round trip. It runs on the synthetic demo case too.
 - `python -m dicom_file_modifier.dose_indices --self-test`: analytic sphere phantom with closed-form CI/GI/HI expectations.
@@ -104,6 +110,17 @@ There is no pytest suite or lint config yet. `pyproject.toml` declares pytest an
 ## Architecture
 
 Five runnable modules plus three libraries, and the synthetic test-case generator `demo` (with `phantom` and `_compat`). `analyzer`, `modifier`, and `visualizer` are independent — they share no internal state and couple only via files on disk (`data/` inputs, `output/` results). `case_modifier` is an orchestrator: it imports building blocks from `modifier` and `analyzer` to transform a CT and its companion RTSTRUCT in lockstep. `dose_indices` is a second orchestrator for RS + RD (+ RP) built on the libraries `dose.py` (dose grid numerics, Eclipse DVH reader), `rtstruct_writer.py` (isodose RTSTRUCT export) and `dose_viz.py` (validation view).
+
+**Import rule (P0.3):**
+- No package module imports the orchestrators `case_modifier` or `dose_indices`.
+- Helpers used by several modules live in two modules that import nothing from the package:
+  - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
+  - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION`, `LEVEL_COLORS`, `HELPER_COLORS`.
+- Both are re-exported at their old locations (`case_modifier`, `modifier`, `dose_indices`).
+- The remaining lazy imports are not cycles:
+  - `dose_indices` → `dose_viz` keeps plotly/matplotlib out of callers that do not visualise. The planned GUI process must never import `dose_viz`.
+  - `case_modifier` → `visualizer`/`analyzer` and `visualizer` → `modifier` only load what the chosen code path needs.
+- `tests/test_import_graph.py` enforces the rule.
 
 ### `demo.py` / `phantom.py` / `_compat.py` — synthetic test case
 `demo.make_demo_case(out_dir, DemoSpec(...))` writes a head-first-supine phantom case.
@@ -174,7 +191,7 @@ This module also hosts the **case-transform visualisation** used by `case_modifi
 
 - DICOM patient coordinate system is **LPS** (X=left, Y=posterior, Z=superior); all distances/translations are in mm, rotations in degrees.
 - `data/` and `output/` are gitignored — don't commit DICOM files or generated artifacts.
-- Assign a new `SOPInstanceUID` only via `modifier.set_sop_instance_uid`: it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
+- Assign a new `SOPInstanceUID` only via `dicom_utils.set_sop_instance_uid` (also importable as `modifier.set_sop_instance_uid`): it also updates the file-meta `MediaStorageSOPInstanceUID`, which must match and which pydicom's `save_as` does not sync.
 - Some user-facing strings and argparse help text are in German; keep that consistent within each module rather than mixing languages.
 - Windows `MAX_PATH` (260): Eclipse-style input names (`RS.<64-char uid>.dcm`) plus deep output folders can exceed it. For example, `analyzer --output` writes `<stem>_analysis.json` and fails with `FileNotFoundError` under the long scratchpad path. Keep test and golden work dirs short.
 - The README contains substantial mathematical documentation (volume, sphericity, Hausdorff, affine math, interpolation orders) — consult it before changing the geometric formulas, since the implementations are derived from those exact definitions.

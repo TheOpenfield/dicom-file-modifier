@@ -57,6 +57,8 @@ from pydicom.sequence import Sequence
 from pydicom.uid import generate_uid
 
 from . import modifier as mod
+# Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
+from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references
 
 
 # ---------------------------------------------------------------------------
@@ -131,18 +133,6 @@ def get_ct_frame_of_reference(slices: list) -> str:
             + "\n  ".join(sorted(for_uids))
         )
     return for_uids.pop()
-
-
-def get_rs_frame_of_references(rs_ds: pydicom.Dataset) -> set[str]:
-    """Sammelt alle im RTSTRUCT referenzierten FrameOfReferenceUIDs."""
-    uids: set[str] = set()
-    if hasattr(rs_ds, "FrameOfReferenceUID"):
-        uids.add(str(rs_ds.FrameOfReferenceUID))
-    if hasattr(rs_ds, "ReferencedFrameOfReferenceSequence"):
-        for ref in rs_ds.ReferencedFrameOfReferenceSequence:
-            if hasattr(ref, "FrameOfReferenceUID"):
-                uids.add(str(ref.FrameOfReferenceUID))
-    return uids
 
 
 def validate_for_consistency(ct_for_uid: str, rs_ds: pydicom.Dataset) -> None:
@@ -430,23 +420,6 @@ def add_drehpunkt_marker(
     rs_ds.ROIContourSequence.append(rc)
 
     return new_roi_num
-
-
-def _truncate(value: str, max_len: int) -> str:
-    """Schneidet einen String auf die DICOM-VR-Laenge ohne Encoding-Tricks."""
-    return value[:max_len]
-
-
-def _label_with_suffix(orig: str, suffix: str, max_len: int) -> str:
-    """
-    Haengt ``suffix`` an ``orig`` an und kuerzt das Ergebnis sauber auf
-    ``max_len``.  Wenn ``orig + suffix`` zu lang ist, wird ``orig`` so weit
-    gekuerzt, dass das Suffix vollstaendig erhalten bleibt.
-    """
-    if len(orig) + len(suffix) <= max_len:
-        return orig + suffix
-    keep = max(0, max_len - len(suffix))
-    return (orig[:keep] + suffix)[:max_len]
 
 
 def build_transform_description(

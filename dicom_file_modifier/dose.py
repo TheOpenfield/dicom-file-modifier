@@ -31,6 +31,7 @@ from scipy import ndimage
 from scipy.integrate import trapezoid
 
 from . import analyzer as ana
+from .dicom_utils import get_rs_frame_of_references
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +208,6 @@ def validate_dose_against_rtstruct(dose: DoseGrid, rs_ds: pydicom.Dataset,
     FoR-Mismatch RD<->RS -> ``ValueError``; abweichende Referenz-UIDs
     (RD->RS, RD->RP, RP->RS) -> Warnungstexte.
     """
-    from .case_modifier import get_rs_frame_of_references
-
     warnings = []
     rs_fors = get_rs_frame_of_references(rs_ds)
     if dose.frame_of_reference_uid and rs_fors and dose.frame_of_reference_uid not in rs_fors:

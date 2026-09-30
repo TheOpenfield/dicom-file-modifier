@@ -32,8 +32,8 @@ from pydicom.uid import (PYDICOM_IMPLEMENTATION_UID, ExplicitVRLittleEndian,
 from . import dose as dm
 from . import analyzer as ana
 from ._compat import dcmwrite_file_format
-from .case_modifier import _label_with_suffix, _truncate
-from .modifier import set_sop_instance_uid
+from .dicom_utils import _label_with_suffix, _truncate, get_rs_frame_of_references, set_sop_instance_uid
+from .dose_constants import HELPER_COLORS, TOOL_NAME, TOOL_VERSION
 
 RTSTRUCT_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.481.3"
 CT_IMAGE_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.2"
@@ -123,8 +123,6 @@ def validate_index_against_rs(ct_index: dict, orig_rs: pydicom.Dataset) -> list:
     FoR- oder Serien-Mismatch zwischen CT-Ordner und Original-RS -> ``ValueError``;
     fehlende referenzierte Schichten -> Warnungstexte.
     """
-    from .case_modifier import get_rs_frame_of_references
-
     warnings = []
     rs_fors = get_rs_frame_of_references(orig_rs)
     if rs_fors and ct_index["for_uid"] not in rs_fors:
@@ -246,7 +244,6 @@ def build_roi_specs(art, include_target: bool = False, max_name_len: int = 64,
         descs = {"inter": "Schnitt Ziel & Rx-Isodose (TV&PIV)",
                  "under": "Ziel ausserhalb der Rx-Isodose (unterdosiert)",
                  "spill": "Rx-Isodose ausserhalb des Ziels (Spill)"}
-        from .dose_indices import HELPER_COLORS
         for kind in ("inter", "under", "spill"):
             specs.append(RoiSpec(
                 name=names[kind], color=HELPER_COLORS[kind],
@@ -302,8 +299,7 @@ def _now_strings() -> tuple:
 
 
 def _tool_version() -> str:
-    from .dose_indices import TOOL_VERSION
-    return f"dose_indices {TOOL_VERSION}"[:16]
+    return f"{TOOL_NAME} {TOOL_VERSION}"[:16]
 
 
 def write_isodose_rtstruct(orig_rs: pydicom.Dataset, ct_index: dict, rois: list,

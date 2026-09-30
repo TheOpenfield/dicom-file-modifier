@@ -44,6 +44,8 @@ from scipy.ndimage import map_coordinates, spline_filter
 from scipy.spatial.transform import Rotation
 
 from ._compat import replace_pixel_data
+# Seit P0.3 in dicom_utils; hier weiter importierbar (alte Importpfade)
+from .dicom_utils import set_sop_instance_uid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,18 +260,6 @@ def apply_metadata_transform(slices: list, T: np.ndarray) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Speichern
 # ─────────────────────────────────────────────────────────────────────────────
-
-def set_sop_instance_uid(ds: pydicom.Dataset, uid: str) -> None:
-    """
-    Setzt die SOPInstanceUID und zieht die MediaStorageSOPInstanceUID im
-    File-Meta-Header (DICOM Part 10) mit.  Beide müssen identisch sein, und
-    ``save_as`` gleicht sie nicht ab.
-    """
-    ds.SOPInstanceUID = uid
-    # Ohne Header (fehlt oder leer) keinen unvollständigen Header anlegen
-    if getattr(ds, "file_meta", None):
-        ds.file_meta.MediaStorageSOPInstanceUID = uid
-
 
 def save_ct_series(
     slices: list,

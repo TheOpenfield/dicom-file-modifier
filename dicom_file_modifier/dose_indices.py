@@ -53,10 +53,12 @@ from scipy.integrate import trapezoid
 
 from . import analyzer as ana
 from . import dose as dm
+from . import rtstruct_writer as rw
 from ._compat import PYDICOM_MAJOR
+# Seit P0.3 in dose_constants (loest den Zyklus mit rtstruct_writer/dose_viz);
+# hier weiter importierbar (alte Importpfade)
+from .dose_constants import HELPER_COLORS, LEVEL_COLORS, TOOL_NAME, TOOL_VERSION  # noqa: F401
 
-TOOL_NAME = "dose_indices"
-TOOL_VERSION = "1.1.0"
 DEFAULT_ISODOSE = "100,50"
 GRID_CHOICES = (1.0, 0.5, 0.25, 0.1)
 INTERP_ORDER = {"linear": 1, "cubic": 3}
@@ -73,13 +75,6 @@ CSV_COLUMNS = [
     "d_tv_pct", "d_tv_piv_pct", "d_piv_pct", "d_ci_paddick_pct", "d_gi_pct",
     "d_hi_icru83_pct", "d_d98_pct", "ecl_tol_pct", "ecl_n_flagged",
 ]
-
-# Farbvorschlaege (RGB) fuer Isodosen-ROIs nach Prozent-Level
-LEVEL_COLORS = {
-    100: (255, 0, 255), 95: (255, 128, 255), 90: (255, 105, 180), 80: (255, 165, 0),
-    70: (255, 215, 0), 60: (0, 200, 100), 50: (0, 255, 255), 30: (0, 128, 255), 20: (0, 0, 255),
-}
-HELPER_COLORS = {"inter": (0, 255, 0), "under": (255, 255, 0), "spill": (255, 0, 0)}
 
 
 # ---------------------------------------------------------------------------
@@ -693,9 +688,9 @@ def compare_with_eclipse(art: "DoseIndexArtifacts", ref: EclipseReference,
                           "fuer den Abgleich --piv-scope global oder --eclipse-compat")
         out[name] = {
             "rows": rows, "tol_pct": float(tol_pct),
-            "n_compared": sum(1 for rw in rows if rw["diff_abs"] is not None),
+            "n_compared": sum(1 for row in rows if row["diff_abs"] is not None),
             "n_flagged": len(flagged), "flagged": flagged,
-            "sources": sorted({rw["source"] for rw in rows if rw["source"]}),
+            "sources": sorted({row["source"] for row in rows if row["source"]}),
             "piv_scope_note": scope_note,
         }
     return out
@@ -1251,13 +1246,13 @@ def _format_eclipse_block(ec: Optional[dict], er: dict) -> list:
         src.append("derived = aus Eclipse-Werten abgeleitet")
     L = [f"  Abgleich Eclipse   Toleranz {ec['tol_pct']:g} % | Quellen: {'; '.join(src) or '-'}",
          f"    {'Komponente':<18}{'Tool':>9}{'Eclipse':>9}{'Diff':>9}{'Diff %':>9}  Quelle"]
-    for rw in ec["rows"]:
-        nd = 2 if rw["key"].endswith("_gy") else 3
-        mark = "  !" if rw.get("within_tol") is False else ""
-        note = f"  ({rw['note']})" if rw.get("note") else ""
-        L.append(f"    {rw['label']:<18}{_fmt(rw['tool'], nd, 9)}{_fmt(rw['eclipse'], nd, 9)}"
-                 f"{_fmt(rw['diff_abs'], nd, 9)}{_fmt(rw['diff_pct'], 1, 9)}  "
-                 f"{(rw['source'] or '-'):<8}{mark}{note}")
+    for row in ec["rows"]:
+        nd = 2 if row["key"].endswith("_gy") else 3
+        mark = "  !" if row.get("within_tol") is False else ""
+        note = f"  ({row['note']})" if row.get("note") else ""
+        L.append(f"    {row['label']:<18}{_fmt(row['tool'], nd, 9)}{_fmt(row['eclipse'], nd, 9)}"
+                 f"{_fmt(row['diff_abs'], nd, 9)}{_fmt(row['diff_pct'], 1, 9)}  "
+                 f"{(row['source'] or '-'):<8}{mark}{note}")
     if ec["n_flagged"]:
         names = ", ".join(ECLIPSE_LABELS[k].split(" [")[0] for k in ec["flagged"])
         L.append(f"    {ec['n_flagged']} von {ec['n_compared']} Werten ausserhalb der Toleranz: {names}")
@@ -1290,7 +1285,7 @@ def csv_rows(report: dict) -> list:
             "run_timestamp": m.get("timestamp"),
         })
         ec = t.get("eclipse") or {}
-        by = {rw["key"]: rw for rw in ec.get("rows", [])}
+        by = {row["key"]: row for row in ec.get("rows", [])}
         e = lambda k: by.get(k, {}).get("eclipse")     # noqa: E731
         d = lambda k: by.get(k, {}).get("diff_pct")    # noqa: E731
         rows[-1].update({
@@ -1446,7 +1441,6 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     # CT-Schichtindex (fuer RS-Export, z-Beschraenkung und Eclipse-Raster)
     ct_index = None
     if files["ct_dir"] is not None:
-        from . import rtstruct_writer as rw
         ct_index = rw.build_ct_slice_index(str(files["ct_dir"]))
         warns += rw.validate_index_against_rs(ct_index, rs_ds)
     elif write_rs:
@@ -1498,7 +1492,6 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     # RS-Export (Fehler duerfen die Indizes nicht verwerfen)
     specs = None
     if write_rs:
-        from . import rtstruct_writer as rw
         rs_out = out_dir / f"RS_{case_id}{label}.dcm"
         try:
             desc = rw.summary_description(art)
@@ -1523,8 +1516,7 @@ def run_dose_indices(case_dir: Optional[str] = None, *, rs: Optional[str] = None
     # duerfen die Indexdateien nicht entwerten -> defensiv abgefangen.
     if not no_viz:
         try:
-            from . import dose_viz
-            from . import rtstruct_writer as rw
+            from . import dose_viz          # erst hier: laedt plotly/matplotlib
             if specs is None:          # --no-rs oder RS-Export fehlgeschlagen
                 specs = rw.build_roi_specs(art, include_target=include_target,
                                            max_name_len=max_name_len, simplify_mm=simplify_mm,
@@ -1976,7 +1968,7 @@ def _run_self_test() -> int:
     n_warn0 = len(r_ref["warnings"])
     cmp_ok = compare_with_eclipse(art_ref, ref_ok, 5.0)["Kugel"]
     check("Eclipse-Abgleich: identische Referenz -> 13 Werte verglichen, Diff 0, nichts markiert, keine Warnung",
-          cmp_ok["n_compared"] == 13 and max(abs(rw["diff_abs"]) for rw in cmp_ok["rows"]) < 1e-9
+          cmp_ok["n_compared"] == 13 and max(abs(row["diff_abs"]) for row in cmp_ok["rows"]) < 1e-9
           and cmp_ok["n_flagged"] == 0 and len(r_ref["warnings"]) == n_warn0
           and ref_ok.meta.get("source") == "Self-Test",
           f"n={cmp_ok['n_compared']}, markiert={cmp_ok['n_flagged']}")
@@ -1985,7 +1977,7 @@ def _run_self_test() -> int:
     ref_bad = eclipse_reference_from_dict(bad, ["Kugel"], ph.RX, "json")
     derive_eclipse_values(ref_bad, "Kugel")
     cmp_bad = compare_with_eclipse(art_ref, ref_bad, 5.0)["Kugel"]
-    by = {rw["key"]: rw for rw in cmp_bad["rows"]}
+    by = {row["key"]: row for row in cmp_bad["rows"]}
     check("Eclipse-Abgleich: PIV +30 % -> PIV/CI/GI markiert (CI, GI abgeleitet), TV innerhalb, Warnung im Zielblock",
           set(cmp_bad["flagged"]) == {"piv_cm3", "ci_paddick", "gi"} and by["ci_paddick"]["source"] == "derived"
           and by["gi"]["source"] == "derived" and by["tv_cm3"]["within_tol"] is True
@@ -2018,7 +2010,6 @@ def _run_self_test() -> int:
     import tempfile
     from types import SimpleNamespace
     from . import dose_viz
-    from . import rtstruct_writer as rw
     tm_ref = art_ref.targets["Kugel"]
     curve = dose_viz.build_dvh_curve(tm_ref.dose_samples, tm_ref.sample_weights, art_ref.grid.voxel_volume_mm3)
     st_w = dm.weighted_dose_statistics(tm_ref.dose_samples, tm_ref.sample_weights, ph.RX)

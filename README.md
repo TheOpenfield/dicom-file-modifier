@@ -44,7 +44,10 @@ dicom-file-modifier/
 │   ├── rtstruct_writer.py   # Isodose / helper-contour RTSTRUCT export
 │   ├── demo.py              # Synthetic demo/test case (CT + RS + RP + RD, no patient data)
 │   ├── phantom.py           # Analytic geometry/dose models and closed-form expectations for demo.py
+│   ├── dicom_utils.py       # Small DICOM helpers shared by several modules (FoR lookup, SOP UID, label length)
+│   ├── dose_constants.py    # Constants shared by the dose-index modules (tool version, ROI colours)
 │   └── _compat.py           # pydicom 2.x/3.x compatibility shims
+├── tests/                   # pytest suite (uv run pytest)
 ├── tools/
 │   ├── golden.py            # Golden-output harness (CLI parity before/after refactors and upgrades)
 │   ├── golden_rules.json    # Comparison tolerances for the migration mode
@@ -70,6 +73,7 @@ With [uv](https://docs.astral.sh/uv/) (recommended; installs exactly the locked 
 ```bash
 uv sync                                                   # creates .venv (Python 3.14 + locked dependencies)
 uv run python -m dicom_file_modifier.analyzer --self-test
+uv run pytest                                             # test suite in tests/
 ```
 
 With pip (minimum versions from `pyproject.toml`, not pinned):

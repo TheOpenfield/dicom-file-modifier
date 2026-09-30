@@ -48,6 +48,9 @@ lint = ["ruff>=0.6"]
 [tool.uv]
 default-groups = ["test"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["dicom_file_modifier"]
 
