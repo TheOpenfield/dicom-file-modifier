@@ -44,6 +44,7 @@ from dicom_file_modifier.analyzer import (
     CAT_TARGET, CAT_OAR_SERIAL, CAT_OAR_PARALLEL, CAT_HELPER,
     CATEGORY_ORDER,
 )
+from dicom_file_modifier.dicom_utils import contour_points
 
 
 # Farben
@@ -785,7 +786,7 @@ def _structure_pointclouds(
                 is_point = True
                 break
             if hasattr(c, "ContourData"):
-                arr = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
+                arr = contour_points(c)
                 if arr.size:
                     pts_list.append(arr)
         if is_point or not pts_list:

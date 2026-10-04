@@ -11,7 +11,7 @@ import types
 import typing
 from pathlib import Path
 
-from PySide6.QtCore import QLocale, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QLocale, QObject, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -66,8 +66,37 @@ def open_path(path) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
+_STD_ICONS: dict = {}
+
+
 def std_icon(widget: QWidget, name: str) -> QIcon:
-    return widget.style().standardIcon(getattr(QStyle.StandardPixmap, name))
+    """Standardsymbol des Stils, einmal je Name geladen (Hinweisliste, Zustand, Fehlermarken)."""
+    icon = _STD_ICONS.get(name)
+    if icon is None:
+        icon = _STD_ICONS[name] = widget.style().standardIcon(getattr(QStyle.StandardPixmap, name))
+    return icon
+
+
+class _WheelGuard(QObject):
+    """Mausrad aendert nur fokussierte Felder; sonst geht das Ereignis an die Scrollflaeche weiter."""
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
+            event.ignore()                      # Qt reicht ein ignoriertes Rad-Ereignis an die Eltern
+            return True
+        return False
+
+
+_WHEEL_GUARD: list = []
+
+
+def guard_wheel(widget: QWidget) -> QWidget:
+    """Spinbox oder Combo: Wert per Mausrad erst nach dem Anklicken aendern, sonst scrollt die Spalte."""
+    if not _WHEEL_GUARD:
+        _WHEEL_GUARD.append(_WheelGuard())
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_WHEEL_GUARD[0])
+    return widget
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +286,7 @@ class SettingsForm(QWidget):
             for c in meta.choices:
                 w.addItem(labels.get(c, str(c)), c)
             w.currentIndexChanged.connect(emit)
-            return "choice", w
+            return "choice", guard_wheel(w)
         if typ is bool:
             w = QCheckBox(meta.label)
             w.toggled.connect(emit)
@@ -272,7 +301,7 @@ class SettingsForm(QWidget):
             else:
                 w.setRange(int(max(lo, -INT_MAX)), int(min(hi, INT_MAX)))
             w.valueChanged.connect(emit)
-            return "number", w
+            return "number", guard_wheel(w)
         w = QLineEdit()
         w.setMinimumWidth(120)
         if name in SPEC_EXAMPLES:
@@ -462,12 +491,15 @@ class IssueList(QScrollArea):
         return len(self._issues)
 
     def set_issues(self, issues) -> None:
+        new = [i if isinstance(i, dict) else i.to_dict() for i in issues]
+        if new == self._issues:
+            return                                      # gleiche Befunde: Zeilen stehen schon
         while self._lay.count():
             w = self._lay.takeAt(0).widget()
             if w is not None:
                 w.hide()                                # sonst bis zum Loeschen unter den neuen Zeilen sichtbar
                 w.deleteLater()
-        self._issues = [i if isinstance(i, dict) else i.to_dict() for i in issues]
+        self._issues = new
         show = self.text_map or str
         for d in self._issues:
             row = _Row()

@@ -2,14 +2,16 @@
 Grundgeruest der Workflow-Seiten: Eingaben -> Einstellungen -> Pruefung ->
 Start -> Ergebnis.  Die Seite liefert ``api`` (Workflow-Modul), ``selection``,
 ``on_inspected``, ``check``, ``clear_outputs``/``show_outputs`` und optional
-``summary_text``; Inspektion im Hintergrund, Pruefung bei jeder Aenderung,
-Lauf ueber das Hauptfenster (Worker).
+``summary_text``; Inspektion im Hintergrund, Pruefung nach jeder Eingabepause
+(``CHECK_DELAY_MS``, bis dahin ist Start gesperrt), Lauf ueber das Hauptfenster
+(Worker).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout, QLabel, QMenu, QPushButton,
                                QScrollArea, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
@@ -26,6 +28,7 @@ from .widgets import ImageViewer, STATUS_DE, IssueList, StateLine, breakable, op
 LONGEST_FILE_NAME = 100
 MAX_PATH = 259
 RESULT_LEVEL = {"ok": "ok", "ok_warnings": "warning", "failed": "error", "cancelled": "info"}
+CHECK_DELAY_MS = 200                    # Pruefung erst nach dieser Eingabepause: eine je Tipp- oder Klickfolge
 
 
 def _value_text(v, unit: str = "") -> str:
@@ -61,6 +64,10 @@ class WorkflowPage(QWidget):
         self._running = self._ok = False
         self._job_settings = None
         self._job_disabled: set = set()
+        self._check_timer = QTimer(self)
+        self._check_timer.setSingleShot(True)
+        self._check_timer.setInterval(CHECK_DELAY_MS)
+        self._check_timer.timeout.connect(self._update_preview)
         self.state = StateLine()
         self.preview_label = QLabel("Kein Datensatz geöffnet.")
         self.preview_label.setWordWrap(True)
@@ -107,7 +114,7 @@ class WorkflowPage(QWidget):
     def build(self, inputs: list, form, results: list, buttons: list = ()) -> None:
         """Layout: links (scrollbar) Eingaben, Einstellungen, Pruefung, Start; rechts das Ergebnis."""
         self.form = form
-        form.changed.connect(self._update_preview)
+        form.changed.connect(self._schedule_check)
         self.issues.text_map = self.result_issues.text_map = form.gui_text
         left = QWidget()
         col = QVBoxLayout(left)
@@ -214,7 +221,22 @@ class WorkflowPage(QWidget):
     def output_spec(self) -> OutputSpec:
         return OutputSpec(str(self.main.config.results_root))
 
+    def _schedule_check(self) -> None:
+        """Nach einer Eingabe: sofort "wird geprueft" (Start gesperrt), die Pruefung folgt nach der Eingabepause."""
+        if self.info is None:
+            return                                      # die Inspektion prueft, wenn sie fertig ist
+        self._ok = False
+        self.state.set_state(None, "Wird geprüft …")
+        self._update_start()
+        self._check_timer.start()
+
+    def flush_check(self) -> None:
+        """Eine anstehende Pruefung sofort ausfuehren (vor dem Start, in Tests)."""
+        if self._check_timer.isActive():
+            self._update_preview()
+
     def _update_preview(self) -> None:
+        self._check_timer.stop()
         if self.info is None:
             return
         try:
@@ -272,6 +294,9 @@ class WorkflowPage(QWidget):
 
     # -- Lauf und Ergebnis -------------------------------------------------------------
     def _start(self) -> None:
+        self.flush_check()
+        if not self._ok or self._running:
+            return
         self._job_settings = self.form.settings()
         self._job_disabled = set(self._job_settings.disabled_fields(self.info))    # wirkten nicht
         job = api_jobs.new_job(self.api.WORKFLOW, self._job_settings, self.info.selection,

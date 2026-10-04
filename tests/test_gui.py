@@ -1,7 +1,8 @@
 """
 Desktop-App (Plan Phase 1/2), offscreen auf dem Demo-Fall: Seite
 Strukturanalyse Ende-zu-Ende ueber den echten Worker, Abbruch ueber den
-``JobRunner``, und der GUI-Prozess laedt keine Plot-Module.
+``JobRunner``, Pruefung nach der Eingabepause, Mausrad nur mit Fokus, und der
+GUI-Prozess laedt keine Plot-Module.
 """
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ import pytest
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QValidator  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QValidator, QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from dicom_file_modifier.api import dose, jobs, selection  # noqa: E402
+from dicom_file_modifier.api import dose, jobs, selection, transform  # noqa: E402
 from dicom_file_modifier.api.outputs import OutputSpec  # noqa: E402
 from dicom_file_modifier.demo import DemoSpec, make_demo_case  # noqa: E402
 from dicom_file_modifier.gui.config import AppConfig  # noqa: E402
@@ -108,17 +110,22 @@ def test_dose_page_end_to_end(app, demo, tmp_path):
     # Eclipse-kompatibel sperrt die Rasterfelder und zeigt die effektiven Werte
     mode, grid = page.form.widget("eclipse_compat"), page.form.widget("grid_mm")
     mode.setCurrentIndex(mode.findData("high"))
+    page.flush_check()
     assert not grid.isEnabled() and "Gesperrt" in grid.toolTip()
     assert "am CT-Pixelraster" in page.preview_label.text() and page.start_button.isEnabled()
     mode.setCurrentIndex(0)
+    page.flush_check()
     assert grid.isEnabled()
 
     # ungueltige Isodosen: Feld rot umrandet, Start gesperrt
     iso = page.form.widget("isodose")
     iso.setText("100,abc")
+    assert not page.start_button.isEnabled() and page.state.text.text() == "Wird geprüft …"
+    page.flush_check()
     assert not page.start_button.isEnabled() and page.form.error_fields() == {"isodose"}
     assert page.state.text.text() == "Nicht startbar"
     page.form.set_settings(dose.Settings(viz=False))
+    page.flush_check()
     assert page.start_button.isEnabled() and not page.form.error_fields()
 
     page.start_button.click()
@@ -160,6 +167,7 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     assert combo.currentIndex() == marker
     page.form.widget("tx").setValue(2.0)
     page.form.widget("rz").setValue(5.0)
+    page.flush_check()
     text = page.preview_label.text()
     assert "2 mm nach links · +5° um die Kopf-Fuss-Achse" in text and "Drehpunkt: Marker HS1 (" in text
     assert "FrameOfReference: beibehalten" in text
@@ -187,6 +195,41 @@ def test_transform_page_end_to_end(app, demo, tmp_path):
     wait_until(app, page.start_button.isEnabled)
     assert page.form.settings().center == "marker:hs1"
     win.close()
+
+
+def test_a_series_of_changes_is_checked_once_after_a_pause(app, demo, tmp_path, monkeypatch):
+    win = MainWindow(AppConfig(results_root=tmp_path / "results", jobs_dir=tmp_path / "jobs"))
+    win.open_case(demo.root)
+    page = win.transform
+    wait_until(app, page.start_button.isEnabled)
+    checked, check = [], page.check
+    monkeypatch.setattr(page, "check", lambda s: checked.append(s.tx) or check(s))
+    for v in (1.0, 1.5, 2.0, 2.5, 3.0):                           # z.B. gehaltene Pfeiltaste
+        page.form.widget("tx").setValue(v)
+    assert not page.start_button.isEnabled() and page.state.text.text() == "Wird geprüft …"
+    assert checked == []
+    wait_until(app, page.start_button.isEnabled)
+    assert checked == [3.0] and "3 mm nach links" in page.preview_label.text()
+    win.close()
+
+
+def test_the_wheel_changes_only_a_focused_field(app):
+    form = SettingsForm(transform.Settings, fields=["tx", "method"])
+    form.show()
+    spin, combo = form.widget("tx"), form.widget("method")
+
+    def wheel(w):
+        QApplication.sendEvent(w, QWheelEvent(QPointF(5, 5), QPointF(w.mapToGlobal(QPoint(5, 5))), QPoint(0, 0),
+                                              QPoint(0, -120), Qt.MouseButton.NoButton,
+                                              Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False))
+
+    wheel(spin)
+    wheel(combo)
+    assert spin.value() == 0.0 and combo.currentIndex() == 0      # nicht angeklickt: Spalte scrollt
+    spin.hasFocus = lambda: True                                  # wie nach einem Klick ins Feld
+    wheel(spin)
+    assert spin.value() == -1.0
+    form.close()
 
 
 def test_decimal_spinbox_accepts_a_comma_and_shows_a_point(app):

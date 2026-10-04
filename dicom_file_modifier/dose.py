@@ -32,7 +32,7 @@ from scipy.integrate import trapezoid
 
 from . import _runtime
 from . import analyzer as ana
-from .dicom_utils import get_rs_frame_of_references
+from .dicom_utils import contour_points, get_rs_frame_of_references
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +57,23 @@ class DoseGrid:
     gfov_mode: str = "relative"        # "relative" | "absolute"
     source_path: Optional[str] = None
     warnings: list = field(default_factory=list)
+    _projections: Optional[tuple] = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def shape(self) -> tuple:
         return tuple(self.array.shape)
+
+    def axis_maxima(self) -> tuple:
+        """
+        Je Achse das Maximum ueber die beiden anderen (NaN ignoriert), einmal je
+        Array berechnet: ``maxima[a] >= level`` ist genau ``(array >= level).any(other)``.
+        """
+        cached = self._projections
+        if cached is None or cached[0] is not self.array:
+            a = self.array
+            cached = self._projections = (a, tuple(
+                np.fmax.reduce(a, axis=tuple(x for x in range(3) if x != axis)) for axis in range(3)))
+        return cached[1]
 
     @property
     def normal(self) -> np.ndarray:
@@ -473,17 +486,19 @@ def contours_bbox(contour_sets: list) -> tuple:
 def native_level_bbox(dose: DoseGrid, level_gy: float, margin_voxels: int = 2) -> Optional[tuple]:
     """
     BBox (Patienten-mm) aller nativen Voxel mit D >= level, um ``margin_voxels``
-    erweitert; ``None`` wenn kein Voxel das Level erreicht.
+    erweitert; ``None`` wenn kein Voxel das Level erreicht.  Ueber die
+    Achsen-Maxima, die das Gitter einmal berechnet (die Vorschau fragt oft).
     """
-    m = dose.array >= level_gy
-    if not m.any():
+    if dose.array.size == 0:
+        return None
+    maxima = dose.axis_maxima()
+    if not (maxima[0] >= level_gy).any():
         return None
     lo_idx, hi_idx = [], []
     for axis in range(3):
-        other = tuple(a for a in range(3) if a != axis)
-        nz = np.flatnonzero(m.any(axis=other))
+        nz = np.flatnonzero(maxima[axis] >= level_gy)
         lo_idx.append(max(int(nz[0]) - margin_voxels, 0))
-        hi_idx.append(min(int(nz[-1]) + margin_voxels, m.shape[axis] - 1))
+        hi_idx.append(min(int(nz[-1]) + margin_voxels, dose.array.shape[axis] - 1))
     corners = np.array([[k, j, i] for k in (lo_idx[0], hi_idx[0])
                         for j in (lo_idx[1], hi_idx[1]) for i in (lo_idx[2], hi_idx[2])], float)
     pts = dose.index_to_patient(corners)
@@ -601,7 +616,7 @@ def closed_planar_contours(rs_ds: pydicom.Dataset, roi_number: int) -> list:
             gt = str(c.get("ContourGeometricType", "")).upper()
             if not gt.startswith("CLOSED_PLANAR"):
                 continue
-            pts = np.asarray(c.ContourData, dtype=float).reshape(-1, 3)
+            pts = contour_points(c)
             if len(pts) >= 3:
                 out.append(pts)
     return out

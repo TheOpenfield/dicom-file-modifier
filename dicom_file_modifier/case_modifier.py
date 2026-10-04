@@ -45,9 +45,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -59,7 +61,7 @@ from pydicom.uid import generate_uid
 from . import _runtime
 from . import modifier as mod
 from .modifier import load_ct_headers, validate_ct_geometry
-from .dicom_utils import (_label_with_suffix, _truncate, find_point_markers,
+from .dicom_utils import (_label_with_suffix, _truncate, contour_points, find_point_markers,
                           get_rs_frame_of_references)
 from .issues import Issue, UserInputError
 
@@ -182,34 +184,40 @@ def check_contour_clipping(
     """
     if method != "resample":
         return []  # in metadata mode geometrisch unmoeglich
-    A_inv = np.linalg.inv(geom["affine"])
-    nz, ny, nx = geom["shape"]
-
-    name_map = {
-        int(r.ROINumber): str(r.ROIName)
-        for r in getattr(new_rs_ds, "StructureSetROISequence", [])
-    }
-
-    issues: list[tuple[str, int, int, float]] = []
-    if not hasattr(new_rs_ds, "ROIContourSequence"):
-        return issues
-
-    for rc in new_rs_ds.ROIContourSequence:
+    names = _roi_names(new_rs_ds)
+    rois = []
+    for rc in new_rs_ds.get("ROIContourSequence", []):
         if not hasattr(rc, "ContourSequence"):
             continue
-        roi_num = int(getattr(rc, "ReferencedROINumber", -1))
-        roi_name = name_map.get(roi_num, f"ROI#{roi_num}")
+        name = _roi_name(rc, names)
+        if name != "Drehpunkt":                     # erst gar nicht lesen
+            rois.append((name, [contour_points(c) for c in rc.ContourSequence if hasattr(c, "ContourData")]))
+    return _clipping(rois, geom)
+
+
+def _roi_names(rs_ds: pydicom.Dataset) -> dict:
+    return {int(r.ROINumber): str(r.ROIName) for r in getattr(rs_ds, "StructureSetROISequence", [])}
+
+
+def _roi_name(rc, names: dict) -> str:
+    roi_num = int(getattr(rc, "ReferencedROINumber", -1))
+    return names.get(roi_num, f"ROI#{roi_num}")
+
+
+def _clipping(rois, geom: dict) -> list:
+    """
+    ``[(roi_name, n_outside, n_total, frac), ...]`` fuer ``rois`` =
+    ``(roi_name, [punkte (N, 3), ...])`` nach der Transformation: Punkte mit
+    ``A^-1 . p`` ausserhalb ``[0, n-1]``.  Lauf und Vorschau zaehlen hiermit.
+    """
+    A_inv = np.linalg.inv(geom["affine"])
+    nz, ny, nx = geom["shape"]
+    issues: list[tuple[str, int, int, float]] = []
+    for roi_name, contours in rois:
         # Drehpunkt-Marker selbst muss nicht gepruft werden (1 Punkt am Zentrum)
         if roi_name == "Drehpunkt":
             continue
-
-        all_pts = []
-        for c in rc.ContourSequence:
-            if not hasattr(c, "ContourData"):
-                continue
-            pts = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
-            if pts.size:
-                all_pts.append(pts)
+        all_pts = [pts for pts in contours if pts.size]
         if not all_pts:
             continue
 
@@ -315,6 +323,12 @@ def validate_label(label: str, case_id: str) -> None:
 # RTSTRUCT-Transformation (Stage 2)
 # ---------------------------------------------------------------------------
 
+def _transform_points(pts: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """(N, 3) -> (N, 3) mit T (4x4), je Kontur; Lauf und Vorschau rechnen identisch."""
+    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))])
+    return (T @ pts_h.T).T[:, :3]
+
+
 def _apply_T_to_flat_coords(flat_data, T: np.ndarray) -> list[str]:
     """
     Wendet T (4x4) auf eine flache DICOM-ContourData-Liste [x1,y1,z1,x2,y2,z2,...]
@@ -323,9 +337,34 @@ def _apply_T_to_flat_coords(flat_data, T: np.ndarray) -> list[str]:
     pts = np.array(flat_data, dtype=np.float64).reshape(-1, 3)
     if pts.size == 0:
         return []
-    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))])
-    new   = (T @ pts_h.T).T[:, :3]
-    return [f"{v:.6f}" for v in new.flatten()]
+    return [f"{v:.6f}" for v in _transform_points(pts, T).flatten()]
+
+
+def _round_like_ds(a: np.ndarray) -> np.ndarray:
+    """
+    Je Wert genau ``float(f"{v:.6f}")``, also die Koordinate, wie sie nach dem
+    Schreiben als DS-Text wieder gelesen wird, aber vektorisiert.  ``rint(v*1e6)``
+    rundet richtig, ausser wenn das Produkt genau auf ,5 faellt: dann entscheidet
+    der exakte Wert (wie die Formatierung: Haelfte zur geraden Ziffer).
+    """
+    a = np.ascontiguousarray(a, dtype=np.float64)
+    p = a * 1e6
+    k = np.rint(p)
+    ties = np.flatnonzero((p - np.floor(p)) == 0.5)
+    if ties.size:
+        flat_k, flat_a = k.reshape(-1), a.reshape(-1)          # Sichten (C-Reihenfolge)
+        for i in ties:
+            v = float(flat_a[i])
+            flat_k[i] = math.copysign(round(Fraction(v) * 1_000_000), v)
+    return k / 1e6
+
+
+def _unknown_sop_error(old: str) -> KeyError:
+    return KeyError(
+        "RTSTRUCT-Verweis auf unbekannte CT-SOPInstanceUID:\n"
+        f"  {old}\n"
+        "Diese SOP gehoerte nicht zum verarbeiteten CT-Verzeichnis."
+    )
 
 
 def _rewrite_referenced_sops(seq, sop_map: dict) -> int:
@@ -340,14 +379,33 @@ def _rewrite_referenced_sops(seq, sop_map: dict) -> int:
         if hasattr(item, "ReferencedSOPInstanceUID"):
             old = str(item.ReferencedSOPInstanceUID)
             if old not in sop_map:
-                raise KeyError(
-                    "RTSTRUCT-Verweis auf unbekannte CT-SOPInstanceUID:\n"
-                    f"  {old}\n"
-                    "Diese SOP gehoerte nicht zum verarbeiteten CT-Verzeichnis."
-                )
+                raise _unknown_sop_error(old)
             item.ReferencedSOPInstanceUID = sop_map[old]
             n += 1
     return n
+
+
+def check_rs_references(rs_ds: pydicom.Dataset, ct_headers: list) -> None:
+    """
+    ``KeyError`` wie in ``transform_rtstruct``, wenn das RTSTRUCT auf eine
+    CT-Schicht ausserhalb der Serie verweist; dieselben Sequenzen in derselben
+    Reihenfolge, ohne etwas zu kopieren.
+    """
+    known = {str(s.SOPInstanceUID) for s in ct_headers if getattr(s, "SOPInstanceUID", None)}
+    seqs = [c.ContourImageSequence for rc in rs_ds.get("ROIContourSequence", [])
+            for c in rc.get("ContourSequence", []) or []
+            if "ContourData" in c and "ContourImageSequence" in c]
+    for ref in rs_ds.get("ReferencedFrameOfReferenceSequence", []):
+        for study in ref.get("RTReferencedStudySequence", []) or []:
+            seqs += [series.ContourImageSequence
+                     for series in study.get("RTReferencedSeriesSequence", []) or []
+                     if "ContourImageSequence" in series]
+    for seq in seqs:
+        for item in seq:
+            if hasattr(item, "ReferencedSOPInstanceUID"):
+                old = str(item.ReferencedSOPInstanceUID)
+                if old not in known:
+                    raise _unknown_sop_error(old)
 
 
 def _next_roi_number(rs_ds: pydicom.Dataset) -> int:
@@ -480,7 +538,7 @@ def transform_rtstruct(
             for contour in roi_contour.ContourSequence:
                 if not hasattr(contour, "ContourData"):
                     continue
-                contour.ContourData = _apply_T_to_flat_coords(contour.ContourData, T)
+                contour.ContourData = _apply_T_to_flat_coords(contour_points(contour), T)
                 if hasattr(contour, "ContourImageSequence"):
                     _rewrite_referenced_sops(contour.ContourImageSequence, sop_map)
 
@@ -559,18 +617,9 @@ def align_contour_images(orig_ds: pydicom.Dataset, new_ds: pydicom.Dataset, ct_h
     jenseits der ersten oder letzten Schicht zaehlen nicht; die meldet das
     Clipping.
     """
-    iop = np.asarray(ct_headers[0].ImageOrientationPatient, dtype=np.float64)
-    normal = np.cross(iop[:3], iop[3:])
-    normal /= np.linalg.norm(normal)
-    planes = np.array([float(normal @ np.asarray(h.ImagePositionPatient, dtype=np.float64))
-                       for h in ct_headers])
+    normal, planes = _slice_planes(ct_headers)
     sops = [str(h.SOPInstanceUID) for h in ct_headers]
-
-    def nearest(pos: np.ndarray) -> tuple:
-        k = int(np.argmin(np.abs(planes - pos.mean())))
-        return k, float(np.max(np.abs(pos - planes[k])))
-
-    stats = {"n_contours": 0, "n_off_plane": 0, "n_tilted": 0, "max_offset_mm": 0.0}
+    stats, bounds = _off_plane_stats(), _plane_bounds(planes, tol)
     # das neue RS hat am Ende zusaetzlich den Drehpunkt (ohne Vorgaenger)
     for rc_old, rc_new in zip(orig_ds.get("ROIContourSequence", []), new_ds.get("ROIContourSequence", []),
                               strict=False):
@@ -578,22 +627,64 @@ def align_contour_images(orig_ds: pydicom.Dataset, new_ds: pydicom.Dataset, ct_h
                                 strict=True):
             if "ContourData" not in c_new:
                 continue
-            pos = np.asarray(c_new.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
-            k, offset = nearest(pos)
+            pos = contour_points(c_new) @ normal
+            k, offset, mean = _nearest_plane(pos, planes)
             refs = c_new.get("ContourImageSequence")
             if refs:
                 refs[0].ReferencedSOPInstanceUID = sop_map[sops[k]]
-            if str(c_new.get("ContourGeometricType", "")).upper() == "POINT":
+            if _is_point(c_new):
                 continue
-            stats["n_contours"] += 1
-            before = np.asarray(c_old.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
-            inside = planes.min() - tol <= pos.mean() <= planes.max() + tol
-            if offset <= tol or not inside or nearest(before)[1] > tol:
-                continue
-            stats["n_off_plane"] += 1
-            stats["n_tilted"] += int(float(pos.max() - pos.min()) > tol)
-            stats["max_offset_mm"] = max(stats["max_offset_mm"], offset)
+            before = _nearest_plane(contour_points(c_old) @ normal, planes)[1]
+            _count_off_plane(stats, pos, mean, offset, before, bounds, tol)
     return stats
+
+
+def _slice_planes(ct_headers: list) -> tuple:
+    """Schichtnormale und Lage der CT-Schichtebenen entlang der Normalen."""
+    iop = np.asarray(ct_headers[0].ImageOrientationPatient, dtype=np.float64)
+    normal = np.cross(iop[:3], iop[3:])
+    normal /= np.linalg.norm(normal)
+    planes = np.array([float(normal @ np.asarray(h.ImagePositionPatient, dtype=np.float64))
+                       for h in ct_headers])
+    return normal, planes
+
+
+def _plane_bounds(planes: np.ndarray, tol: float) -> tuple:
+    """Bereich der Schichtebenen (mit Toleranz): Konturen ausserhalb meldet das Clipping."""
+    return planes.min() - tol, planes.max() + tol
+
+
+def _nearest_plane(pos: np.ndarray, planes: np.ndarray) -> tuple:
+    """
+    ``(k, abstand, mittel)``: naechste Schichtebene zum Mittel von ``pos``, der
+    groesste Abstand der Punkte zu ihr und das Mittel.
+    """
+    mean = pos.mean()
+    k = int(np.argmin(np.abs(planes - mean)))
+    return k, float(np.max(np.abs(pos - planes[k]))), mean
+
+
+def _is_point(contour) -> bool:
+    return str(contour.get("ContourGeometricType", "")).upper() == "POINT"
+
+
+def _off_plane_stats() -> dict:
+    return {"n_contours": 0, "n_off_plane": 0, "n_tilted": 0, "max_offset_mm": 0.0}
+
+
+def _count_off_plane(stats: dict, pos: np.ndarray, mean: float, offset: float, offset_before: float,
+                     bounds: tuple, tol: float) -> None:
+    """
+    Eine Kontur (ohne POINT) nach der Bewegung zaehlen: ``pos`` = Punkte entlang
+    der Normalen, ``offset``/``offset_before`` = Abstand zur naechsten Ebene
+    nachher/vorher.  Lauf und Vorschau zaehlen hiermit.
+    """
+    stats["n_contours"] += 1
+    if offset <= tol or not (bounds[0] <= mean <= bounds[1]) or offset_before > tol:
+        return
+    stats["n_off_plane"] += 1
+    stats["n_tilted"] += int(float(pos.max() - pos.min()) > tol)
+    stats["max_offset_mm"] = max(stats["max_offset_mm"], offset)
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +706,7 @@ def parse_center_spec(
     spec: str,
     rs_ds: pydicom.Dataset,
     volume_center: np.ndarray,
+    markers: "list | None" = None,
 ) -> np.ndarray:
     """
     Loest einen Center-Spec-String in eine 3D-Position auf.
@@ -623,6 +715,9 @@ def parse_center_spec(
       - ``"volume"``               -> Volumenzentrum
       - ``"marker:NAME"``          -> POINT-Marker mit Namen NAME (case-insensitive)
       - ``"x,y,z"``                -> drei kommagetrennte Floats (LPS, mm)
+
+    ``markers``: schon gesuchte ``find_point_markers(rs_ds)`` (z.B.
+    ``CasePreflight.markers``), sonst wird das RTSTRUCT durchsucht.
     """
     raw = spec.strip()
     if not raw:
@@ -633,7 +728,7 @@ def parse_center_spec(
 
     if raw.lower().startswith("marker:"):
         target = raw[len("marker:"):].strip()
-        markers = find_point_markers(rs_ds)
+        markers = find_point_markers(rs_ds) if markers is None else markers
         for name, pos in markers:
             if name.lower() == target.lower():
                 return pos.copy()
@@ -798,16 +893,16 @@ def preflight_case(case_dir: "str | None", rs_override: "str | None" = None, lab
 
 
 def resolve_center(spec: "str | None", rs_ds: pydicom.Dataset, volume_center_lps: np.ndarray,
-                   interactive: bool = True) -> "tuple[np.ndarray | None, str]":
+                   interactive: bool = True, markers: "list | None" = None) -> "tuple[np.ndarray | None, str]":
     """
     Rotationszentrum aus ``spec`` ('volume', 'marker:NAME', 'x,y,z').  Ohne
     ``spec`` fragt ein Prompt nach, aber nur wenn ``interactive`` und stdin ein
     Terminal ist (ohne Konsole, z.B. pythonw oder GUI-EXE, ist stdin None);
     sonst Volumenmitte.  Rueckgabe: (Position oder None fuer die Volumenmitte,
-    Label fuer Ausgabe und Beschreibung).
+    Label fuer Ausgabe und Beschreibung).  ``markers`` wie bei ``parse_center_spec``.
     """
     if spec is not None:
-        pos = parse_center_spec(spec, rs_ds, volume_center_lps)
+        pos = parse_center_spec(spec, rs_ds, volume_center_lps, markers=markers)
         key = spec.lower().strip()
         if key == "volume":
             return None, "Volumenmitte"
@@ -868,15 +963,8 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
     ctx = _runtime.current()
     ctx.check_cancel()
     ctx.stage("plan", "Transformation planen")
-    if method not in ("resample", "metadata"):
-        raise ValueError(f"Unbekannte Methode: {method!r}")
-    vol_c = pre.volume_center
-    if center is None:
-        center = vol_c
-        resolved_label = center_label if center_label != "Volumenmitte" else "Volumenmitte"
-    else:
-        center = np.asarray(center, dtype=np.float64).reshape(3)
-        resolved_label = center_label
+    _check_method(method)
+    T, center, resolved_label, drehpunkt_pos = _motion(pre, tx, ty, tz, rx, ry, rz, center, center_label)
 
     say = _printer(quiet)
     say(f"\nTransformation:")
@@ -885,7 +973,6 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
     say(f"  Methode     : {method}")
     say(f"  Zentrum     : {resolved_label}  "
         f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}) mm")
-    T = mod.build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
 
     if out_dir is None and output_dir is None:
         raise ValueError("Ausgabeordner fehlt (output_dir oder out_dir).")
@@ -895,9 +982,6 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
     ct_series_uid = str(generate_uid())
     sop_map = {str(s.SOPInstanceUID): str(generate_uid())
                for s in pre.ct_headers if getattr(s, "SOPInstanceUID", None)}
-    # Drehpunkt im transformierten System: die Rotation laesst das Zentrum
-    # invariant, also T(centre) = centre + (tx, ty, tz).
-    drehpunkt_pos = center + np.array([tx, ty, tz])
     description = build_transform_description(
         tx, ty, tz, rx, ry, rz,
         center_label=resolved_label, method=method, for_strategy=for_strategy,
@@ -911,6 +995,45 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
     align = align_contour_images(pre.rs_ds, new_rs, pre.ct_headers, sop_map) if method == "resample" else None
     clipping = check_contour_clipping(new_rs, pre.geom, method)
 
+    issues = _plan_issues(align, clipping, for_strategy, pre.geom["dz"])
+    if align and align["n_off_plane"]:
+        n_off, n_all, n_tilt = align["n_off_plane"], align["n_contours"], align["n_tilted"]
+        say(f"  ! Konturen  : {n_off} von {n_all} nicht mehr in einer CT-Schichtebene"
+            + (f" ({n_tilt} gekippt)" if n_tilt else "")
+            + f", bis {align['max_offset_mm']:.2f} mm daneben; ein TPS kann sie verwerfen.")
+    return TransformPlan(
+        params={"tx": tx, "ty": ty, "tz": tz, "rx": rx, "ry": ry, "rz": rz},
+        method=method, order=order, label=label, T=T, center=center, center_label=resolved_label,
+        drehpunkt_pos=drehpunkt_pos, case_out=case_out, ct_out=case_out / "CT",
+        rs_out=case_out / f"RS{label}.dcm", ct_series_uid=ct_series_uid, sop_map=sop_map,
+        new_for_uid=new_for_uid, for_strategy=for_strategy,
+        series_number_offset=series_number_offset, new_rs=new_rs, clipping=clipping, issues=issues,
+    )
+
+
+def _check_method(method: str) -> None:
+    if method not in ("resample", "metadata"):
+        raise ValueError(f"Unbekannte Methode: {method!r}")
+
+
+def _motion(pre: CasePreflight, tx: float, ty: float, tz: float, rx: float, ry: float, rz: float,
+            center: "np.ndarray | None", center_label: str) -> tuple:
+    """``(T, Zentrum, Zentrumsbezeichnung, Drehpunkt-Position)`` fuer Planung und Pruefung."""
+    if center is None:
+        center = pre.volume_center
+        resolved_label = center_label if center_label != "Volumenmitte" else "Volumenmitte"
+    else:
+        center = np.asarray(center, dtype=np.float64).reshape(3)
+        resolved_label = center_label
+    T = mod.build_rigid_transform(rx, ry, rz, tx, ty, tz, center)
+    # Drehpunkt im transformierten System: die Rotation laesst das Zentrum
+    # invariant, also T(centre) = centre + (tx, ty, tz).
+    drehpunkt_pos = center + np.array([tx, ty, tz])
+    return T, center, resolved_label, drehpunkt_pos
+
+
+def _plan_issues(align: "dict | None", clipping: list, for_strategy: str, dz: float) -> list:
+    """Befunde zu Schichtebenen, FoR und Clipping (Planung und Pruefung)."""
     issues = []
     if align and align["n_off_plane"]:
         n_off, n_all, n_tilt = align["n_off_plane"], align["n_contours"], align["n_tilted"]
@@ -919,15 +1042,12 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
             hints.append("Rotationen um die Links-Rechts- und die anterior-posteriore Achse bildet nur "
                          "die Methode 'metadata' exakt ab (schraege Schichten).")
         if n_off > n_tilt:
-            hints.append(f"Verschiebung Z als Vielfaches des Schichtabstands ({pre.geom['dz']:g} mm) waehlen.")
+            hints.append(f"Verschiebung Z als Vielfaches des Schichtabstands ({dz:g} mm) waehlen.")
         issues.append(Issue(
             "warning", "CASE.CONTOURS_OFF_PLANE",
             f"{n_off} von {n_all} Konturen liegen nach der Bewegung nicht mehr in einer CT-Schichtebene"
             + (f" ({n_tilt} gekippt)." if n_tilt else "."),
             hint_de=" ".join(hints), field="method" if n_tilt else "tz"))
-        say(f"  ! Konturen  : {n_off} von {n_all} nicht mehr in einer CT-Schichtebene"
-            + (f" ({n_tilt} gekippt)" if n_tilt else "")
-            + f", bis {align['max_offset_mm']:.2f} mm daneben; ein TPS kann sie verwerfen.")
     if for_strategy == "keep":                     # gewollter Standard, daher nur Info
         issues.append(Issue(
             "info", "CASE.FOR_KEPT",
@@ -943,14 +1063,117 @@ def plan_transform(pre: CasePreflight, tx: float, ty: float, tz: float,
             hint_de="Dort zeigt das CT Luft statt Anatomie; die Methode 'metadata' vermeidet das.",
             field="method",
             detail="\n".join(f"{n}: {o} von {t} Punkten ({f:.1%})" for n, o, t, f in clipping)))
-    return TransformPlan(
-        params={"tx": tx, "ty": ty, "tz": tz, "rx": rx, "ry": ry, "rz": rz},
-        method=method, order=order, label=label, T=T, center=center, center_label=resolved_label,
-        drehpunkt_pos=drehpunkt_pos, case_out=case_out, ct_out=case_out / "CT",
-        rs_out=case_out / f"RS{label}.dcm", ct_series_uid=ct_series_uid, sop_map=sop_map,
-        new_for_uid=new_for_uid, for_strategy=for_strategy,
-        series_number_offset=series_number_offset, new_rs=new_rs, clipping=clipping, issues=issues,
-    )
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Pruefung ohne RTSTRUCT-Kopie (Vorschau einer Oberflaeche)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContourCache:
+    """
+    Konturen des Original-RTSTRUCT als Arrays, einmal gelesen
+    (``contour_cache``), fuer ``check_transform``: die Pruefung braucht so weder
+    eine Kopie des Datasets noch DS-Werte.  ``rois``: je ROIContour mit
+    ``ContourSequence`` ``(roi_name, [(punkte | None, is_point, abstand_vorher), ...])``,
+    ``abstand_vorher`` = Abstand zur naechsten Schichtebene vor der Bewegung.
+    """
+    rois: list
+    normal: np.ndarray
+    planes: np.ndarray
+    results: dict = field(default_factory=dict, repr=False)    # T (Bytes) -> (align, clipping)
+
+
+CHECK_RESULTS_KEPT = 16
+
+
+def contour_cache(pre: CasePreflight) -> ContourCache:
+    """Liest alle Konturen einmal; Namen wie im transformierten RS (mit dessen Drehpunkt-Nummer)."""
+    normal, planes = _slice_planes(pre.ct_headers)
+    names = _roi_names(pre.rs_ds)
+    names[_next_roi_number(pre.rs_ds)] = "Drehpunkt"
+    rois = []
+    for rc in pre.rs_ds.get("ROIContourSequence", []):
+        if not hasattr(rc, "ContourSequence"):
+            continue
+        contours = []
+        for c in rc.ContourSequence:
+            if "ContourData" not in c:
+                contours.append((None, False, None))
+                continue
+            pts, is_point = contour_points(c), _is_point(c)
+            before = None if is_point or not pts.size else _nearest_plane(pts @ normal, planes)[1]
+            contours.append((pts, is_point, before))
+        rois.append((_roi_name(rc, names), contours))
+    return ContourCache(rois=rois, normal=normal, planes=planes)
+
+
+@dataclass
+class TransformCheck:
+    """``check_transform``: was ``plan_transform`` vor dem Schreiben feststellt."""
+    T: np.ndarray
+    center: np.ndarray
+    center_label: str
+    drehpunkt_pos: np.ndarray
+    clipping: list                 # [(roi_name, n_outside, n_total, frac)]
+    align: "dict | None"           # Konturen ausserhalb der Schichtebenen (nur resample)
+    issues: list = field(default_factory=list)
+
+
+def check_transform(pre: CasePreflight, cache: ContourCache, tx: float, ty: float, tz: float,
+                    rx: float, ry: float, rz: float, *, method: str = "resample",
+                    center: "np.ndarray | None" = None, center_label: str = "Volumenmitte",
+                    new_frame_of_reference: bool = False) -> TransformCheck:
+    """
+    Dieselben Zahlen und Befunde wie ``plan_transform`` (Matrix, Zentrum,
+    Drehpunkt, Schichtebenen, Clipping), aber aus dem Konturcache: ohne Kopie
+    des RTSTRUCT, ohne UIDs, still.  Die Konturen werden wie beim Schreiben je
+    Kontur transformiert und auf 6 Nachkommastellen gerundet; gezaehlt wird mit
+    denselben Funktionen wie im Lauf.  Ergebnisse je T bleiben im Cache.
+    """
+    _check_method(method)
+    T, center, resolved_label, drehpunkt_pos = _motion(pre, tx, ty, tz, rx, ry, rz, center, center_label)
+    align, clipping = None, []
+    if method == "resample":
+        key = T.tobytes()
+        if key not in cache.results:
+            if len(cache.results) >= CHECK_RESULTS_KEPT:
+                cache.results.pop(next(iter(cache.results)))
+            cache.results[key] = _moved_contour_checks(cache, T, pre.geom)
+        align, clipping = cache.results[key]
+    for_strategy = "new" if new_frame_of_reference else "keep"
+    return TransformCheck(T=T, center=center, center_label=resolved_label, drehpunkt_pos=drehpunkt_pos,
+                          clipping=clipping, align=align,
+                          issues=_plan_issues(align, clipping, for_strategy, pre.geom["dz"]))
+
+
+def _moved_contour_checks(cache: ContourCache, T: np.ndarray, geom: dict,
+                          tol: float = PLANE_TOL_MM) -> tuple:
+    """
+    ``(align, clipping)`` wie ``align_contour_images`` und ``check_contour_clipping``:
+    je Kontur transformiert (wie beim Schreiben), gerundet in einem Zug
+    (elementweise, also dasselbe), dann je Kontur gezaehlt.
+    """
+    raw = [_transform_points(pts, T) for _name, contours in cache.rois
+           for pts, _p, _b in contours if pts is not None]
+    flat = _round_like_ds(np.concatenate(raw)) if raw else np.empty((0, 3))
+    parts = iter(np.split(flat, np.cumsum([len(r) for r in raw])[:-1]) if raw else [])
+    stats, bounds = _off_plane_stats(), _plane_bounds(cache.planes, tol)
+    rois = []
+    for name, contours in cache.rois:
+        moved = []
+        for pts, is_point, before in contours:
+            if pts is None:
+                continue
+            new = next(parts).copy()                 # eigenes Array wie im Lauf
+            pos = new @ cache.normal
+            _k, offset, mean = _nearest_plane(pos, cache.planes)
+            if not is_point:
+                _count_off_plane(stats, pos, mean, offset, before, bounds, tol)
+            moved.append(new)
+        rois.append((name, moved))
+    return stats, _clipping(rois, geom)
 
 
 def print_dry_run(pre: CasePreflight, plan: TransformPlan) -> dict:

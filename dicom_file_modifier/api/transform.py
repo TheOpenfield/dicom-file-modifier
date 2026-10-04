@@ -2,9 +2,11 @@
 Workflow Transformation: starre Bewegung von CT + RTSTRUCT (``case_modifier``)
 oder nur des CT (``modifier``), je nachdem ob die Auswahl ein RTSTRUCT enthaelt.
 
-``inspect`` prueft nur Header (Geometrie, Orientierung, FoR, Marker);
-``preview`` rechnet die Matrix, den Drehpunkt, das transformierte RTSTRUCT
-(Clipping) und die Speicherschaetzung, ohne etwas zu schreiben.
+``inspect`` prueft Header (Geometrie, Orientierung, FoR, Marker) und die
+CT-Verweise des RTSTRUCT und liest die Konturen einmal als Arrays;
+``preview`` rechnet daraus Matrix, Drehpunkt, Schichtebenen, Clipping und die
+Speicherschaetzung (``case_modifier.check_transform``, ohne RTSTRUCT-Kopie),
+ohne etwas zu schreiben.
 CLI-Entsprechung: ``dfm case-transform`` bzw. ``dfm ct-transform``.
 """
 
@@ -153,6 +155,7 @@ class TransformCaseInfo:
     has_rs: bool = False
     case_id: str = ""
     preflight: Optional[cm.CasePreflight] = field(default=None, repr=False)   # mit RTSTRUCT
+    contours: Optional[cm.ContourCache] = field(default=None, repr=False)     # mit RTSTRUCT
     ct_headers: Optional[list] = field(default=None, repr=False)              # nur CT
     geom: Optional[dict] = field(default=None, repr=False)
     ct: dict = field(default_factory=dict)
@@ -204,6 +207,12 @@ def inspect(selection: CaseSelection) -> TransformCaseInfo:
                "series_description": str(h0.get("SeriesDescription", "")),
                "series_uid": str(h0.get("SeriesInstanceUID", "")),
                "frame_of_reference_uid": str(h0.get("FrameOfReferenceUID", ""))}
+    if info.has_rs:
+        try:                                    # was der Lauf beim Planen pruefen wuerde
+            cm.check_rs_references(info.preflight.rs_ds, info.ct_headers)
+            info.contours = cm.contour_cache(info.preflight)
+        except Exception as exc:  # noqa: BLE001 - Befund statt Absturz
+            info.issues.append(issue_from_exception(exc))
     return info
 
 
@@ -241,24 +250,25 @@ def preview(info: TransformCaseInfo, settings: TransformSettings) -> TransformPr
     if info.has_rs:
         pre = info.preflight
         try:
-            center, center_label = cm.resolve_center(s.center, pre.rs_ds, vol_c, interactive=False)
-            plan = cm.plan_transform(pre, s.tx, s.ty, s.tz, s.rx, s.ry, s.rz, out_dir=".",
-                                     method=s.method, order=s.order, label=s.label, center=center,
-                                     center_label=center_label,
-                                     new_frame_of_reference=s.new_frame_of_reference, quiet=True)
-        except UserInputError as exc:
-            issues.append(exc.issue)
-            return pv
+            center, center_label = cm.resolve_center(s.center, pre.rs_ds, vol_c, interactive=False,
+                                                     markers=pre.markers)
         except Exception as exc:  # noqa: BLE001 - z.B. unbekannter Marker
             issue = issue_from_exception(exc, field="center")
             if not s.center.strip().lower().startswith(("marker:", "volume")):
                 issue = replace(issue, hint_de="Koordinate als x,y,z in mm (LPS) angeben, z. B. 12.5,-3,0.")
             issues.append(issue)
             return pv
-        issues += plan.issues
-        pv.T, pv.center_mm, pv.center_label = plan.T.tolist(), plan.center.tolist(), plan.center_label
-        pv.drehpunkt_mm = plan.drehpunkt_pos.tolist()
-        pv.clipping = cm._clipping_dicts(plan.clipping)
+        try:
+            chk = cm.check_transform(pre, info.contours, s.tx, s.ty, s.tz, s.rx, s.ry, s.rz,
+                                     method=s.method, center=center, center_label=center_label,
+                                     new_frame_of_reference=s.new_frame_of_reference)
+        except Exception as exc:  # noqa: BLE001 - z.B. leere Kontur
+            issues.append(issue_from_exception(exc))
+            return pv
+        issues += chk.issues
+        pv.T, pv.center_mm, pv.center_label = chk.T.tolist(), chk.center.tolist(), chk.center_label
+        pv.drehpunkt_mm = chk.drehpunkt_pos.tolist()
+        pv.clipping = cm._clipping_dicts(chk.clipping)
         pv.planned = {"ct_dir": "CT", "rs": f"RS{s.label}.dcm"}
     else:
         T = mod.build_rigid_transform(s.rx, s.ry, s.rz, s.tx, s.ty, s.tz, vol_c)

@@ -43,7 +43,7 @@ from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 
-from .dicom_utils import find_point_markers, get_rs_frame_of_references
+from .dicom_utils import contour_points, find_point_markers, get_rs_frame_of_references
 from .issues import Issue
 
 # Fester Zufallsgenerator: Distanz-/Subsample-Operationen sollen reproduzierbar
@@ -214,8 +214,7 @@ def extract_contours(ds: pydicom.Dataset, roi_number: int) -> list[np.ndarray]:
         if not hasattr(roi_contour, "ContourSequence"):
             continue
         for contour in roi_contour.ContourSequence:
-            pts = np.array(contour.ContourData).reshape(-1, 3)
-            contours.append(pts)
+            contours.append(contour_points(contour))
     return contours
 
 
