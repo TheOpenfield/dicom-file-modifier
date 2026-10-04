@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import importlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -256,6 +257,21 @@ def test_transform_preview(demo):
     ct_only = transform.inspect(selection.from_ct_dir(str(demo.ct_dir)))
     codes = [i.code for i in transform.preview(ct_only, transform.Settings(center="1,2,3")).issues]
     assert "TRANSFORM.CENTER_NEEDS_RS" in codes
+
+
+def test_transform_inspection_checks_the_ct_references(demo, tmp_path):
+    case = tmp_path / "case"
+    shutil.copytree(demo.root, case)
+    rs_file = next(case.glob("RS*.dcm"))
+    ds = pydicom.dcmread(str(rs_file))
+    c = next(c for rc in ds.ROIContourSequence for c in rc.get("ContourSequence", [])
+             if "ContourImageSequence" in c)
+    c.ContourImageSequence[0].ReferencedSOPInstanceUID = "1.2.826.0.1.3680043.8.498.97"
+    ds.save_as(str(rs_file))
+    info = transform.inspect(selection.for_transform(str(case)))
+    errors = [i for i in info.issues if i.level == "error"]
+    assert [i.code for i in errors] == ["INPUT.MISSING_KEY"] and "unbekannte CT-SOP" in errors[0].message_de
+    assert info.ct and not transform.preview(info, transform.Settings(tx=1.0)).ok
 
 
 # -- API = CLI -------------------------------------------------------------------

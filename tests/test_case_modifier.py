@@ -171,6 +171,71 @@ def test_metadata_keeps_the_slice_of_each_contour(demo):
     assert n > 100
 
 
+# -- Pruefung ohne RTSTRUCT-Kopie (Vorschau) ---------------------------------
+
+@pytest.mark.parametrize("motion, method", [
+    ((0, 0, 0, 0, 0, 0), "resample"),                   # Identitaet
+    ((3, -2, 0.5, 0, 0, 5), "resample"),                # zwischen zwei Schichten
+    ((3, -2, 0, 2, 0, 5), "resample"),                  # gekippt
+    ((120, 0, 0, 0, 0, 0), "resample"),                 # ragt seitlich aus dem CT
+    ((0, 0, 30, 0, 0, 0), "resample"),                  # ragt oben aus dem CT
+    ((1.25, -0.75, 1, 0.5, -0.3, 7.3), "resample"),
+    ((3, -2, 0.5, 2, 0, 5), "metadata"),
+])
+def test_check_transform_equals_plan_transform(demo, motion, method):
+    pre = cm.preflight_case(str(demo.root), quiet=True)
+    cache = cm.contour_cache(pre)
+    center, label = pre.markers[0][1], f"Marker '{pre.markers[0][0]}'"
+    chk = cm.check_transform(pre, cache, *motion, method=method, center=center, center_label=label)
+    plan = cm.plan_transform(pre, *motion, out_dir=".", method=method, center=center, center_label=label,
+                             quiet=True)
+    assert chk.clipping == plan.clipping and chk.center_label == plan.center_label
+    assert [i.to_dict() for i in chk.issues] == [i.to_dict() for i in plan.issues]
+    assert np.array_equal(chk.T, plan.T) and np.array_equal(chk.drehpunkt_pos, plan.drehpunkt_pos)
+    if method == "resample":
+        assert chk.align == cm.align_contour_images(pre.rs_ds, plan.new_rs, pre.ct_headers, plan.sop_map)
+    assert cm.check_transform(pre, cache, *motion, method=method, center=center,
+                              center_label=label).clipping == chk.clipping      # aus dem Cache
+
+
+def test_check_transform_leaves_the_rtstruct_raw(demo):
+    pre = cm.preflight_case(str(demo.root), quiet=True)
+    cm.check_transform(pre, cm.contour_cache(pre), 3, -2, 0.5, 2, 0, 5)
+    for rc in pre.rs_ds.ROIContourSequence:
+        for c in rc.get("ContourSequence", []):
+            assert isinstance(c.get_item(0x30060050), pydicom.dataelem.RawDataElement)
+
+
+def test_rounding_matches_the_written_text():
+    rng = np.random.default_rng(0)
+    halves = (rng.integers(-10**8, 10**8, 20000) + 0.5) / 1e6        # viele davon genau auf ,5
+    vals = np.concatenate([rng.uniform(-400, 400, 20000), rng.uniform(-1e-5, 1e-5, 2000), halves,
+                           [5e-7, -5e-7, 2.5e-6, -2.5e-6, 0.0, -0.0]])
+    assert np.count_nonzero((vals * 1e6 - np.floor(vals * 1e6)) == 0.5) > 1000
+    want = np.array([float(f"{v:.6f}") for v in vals])
+    assert np.array_equal(cm._round_like_ds(vals).view(np.int64), want.view(np.int64))
+    assert np.array_equal(cm._round_like_ds(vals.reshape(-1, 3)[:, :2]).ravel(),
+                          want.reshape(-1, 3)[:, :2].ravel())      # nicht zusammenhaengende Eingabe
+
+
+def test_check_rs_references_reports_like_the_run(demo, tmp_path):
+    case = _copy_case(demo, tmp_path)
+    rs_file = next(case.glob("RS*.dcm"))
+    ds = pydicom.dcmread(str(rs_file))
+    c = next(c for rc in ds.ROIContourSequence for c in rc.get("ContourSequence", [])
+             if "ContourImageSequence" in c)
+    c.ContourImageSequence[0].ReferencedSOPInstanceUID = "1.2.826.0.1.3680043.8.498.97"
+    ds.save_as(str(rs_file))
+    pre = cm.preflight_case(str(case), quiet=True)
+    with pytest.raises(KeyError) as checked:
+        cm.check_rs_references(pre.rs_ds, pre.ct_headers)
+    with pytest.raises(KeyError) as planned:
+        cm.plan_transform(pre, 1, 0, 0, 0, 0, 0, out_dir=".", quiet=True)
+    assert str(checked.value) == str(planned.value)
+    ok = cm.preflight_case(str(demo.root), quiet=True)
+    cm.check_rs_references(ok.rs_ds, ok.ct_headers)                  # unveraendertes RS: still
+
+
 # -- Ausfuehren ---------------------------------------------------------------
 
 def test_metadata_run_writes_series_number_offset_in_one_pass(demo, tmp_path):
