@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dicom-file-modifier"
-version = "1.2.0"
+version = "1.2.1"
 description = "Research toolkit for DICOM RT: RTSTRUCT analysis, rigid CT + RTSTRUCT transforms and dose indices (CI, GI, HI). Not a medical device."
 readme = "README.md"
 requires-python = ">=3.12"
