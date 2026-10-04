@@ -59,7 +59,7 @@ from pydicom.uid import generate_uid
 from . import _runtime
 from . import modifier as mod
 from .modifier import load_ct_headers, validate_ct_geometry
-from .dicom_utils import (_label_with_suffix, _truncate, find_point_markers,
+from .dicom_utils import (_label_with_suffix, _truncate, contour_points, find_point_markers,
                           get_rs_frame_of_references)
 from .issues import Issue, UserInputError
 
@@ -207,7 +207,7 @@ def check_contour_clipping(
         for c in rc.ContourSequence:
             if not hasattr(c, "ContourData"):
                 continue
-            pts = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
+            pts = contour_points(c)
             if pts.size:
                 all_pts.append(pts)
         if not all_pts:
@@ -480,7 +480,7 @@ def transform_rtstruct(
             for contour in roi_contour.ContourSequence:
                 if not hasattr(contour, "ContourData"):
                     continue
-                contour.ContourData = _apply_T_to_flat_coords(contour.ContourData, T)
+                contour.ContourData = _apply_T_to_flat_coords(contour_points(contour), T)
                 if hasattr(contour, "ContourImageSequence"):
                     _rewrite_referenced_sops(contour.ContourImageSequence, sop_map)
 
@@ -578,7 +578,7 @@ def align_contour_images(orig_ds: pydicom.Dataset, new_ds: pydicom.Dataset, ct_h
                                 strict=True):
             if "ContourData" not in c_new:
                 continue
-            pos = np.asarray(c_new.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
+            pos = contour_points(c_new) @ normal
             k, offset = nearest(pos)
             refs = c_new.get("ContourImageSequence")
             if refs:
@@ -586,7 +586,7 @@ def align_contour_images(orig_ds: pydicom.Dataset, new_ds: pydicom.Dataset, ct_h
             if str(c_new.get("ContourGeometricType", "")).upper() == "POINT":
                 continue
             stats["n_contours"] += 1
-            before = np.asarray(c_old.ContourData, dtype=np.float64).reshape(-1, 3) @ normal
+            before = contour_points(c_old) @ normal
             inside = planes.min() - tol <= pos.mean() <= planes.max() + tol
             if offset <= tol or not inside or nearest(before)[1] > tol:
                 continue

@@ -54,6 +54,31 @@ def _label_with_suffix(orig: str, suffix: str, max_len: int) -> str:
     return (orig[:keep] + suffix)[:max_len]
 
 
+CONTOUR_DATA_TAG = 0x30060050
+
+
+def contour_points(contour: pydicom.Dataset) -> np.ndarray:
+    """
+    ``ContourData`` einer Kontur als ``(N, 3)``-float64-Array, bitgleich zu
+    ``np.asarray(contour.ContourData, dtype=np.float64)``.  Solange das Element
+    noch roh ist, werden die Bytes direkt gelesen: pydicom legt sonst je Wert ein
+    ``DSfloat``-Objekt an (langsam, viel Speicher) und behaelt es im Dataset.
+    Alles Unerwartete (keine ASCII-Bytes, ungueltige Werte, Anzahl kein
+    Vielfaches von 3) nimmt den pydicom-Weg; ein fehlendes Element wirft wie dort
+    ``AttributeError``.
+    """
+    elem = contour.get_item(CONTOUR_DATA_TAG)
+    raw = elem.value if elem is not None else None
+    if isinstance(raw, (bytes, bytearray)) and raw:
+        try:
+            vals = np.array(raw.decode("ascii").split("\\"), dtype=np.float64)
+        except (UnicodeDecodeError, ValueError):
+            vals = None
+        if vals is not None and vals.size % 3 == 0:
+            return vals.reshape(-1, 3)
+    return np.asarray(contour.ContourData, dtype=np.float64).reshape(-1, 3)
+
+
 def find_point_markers(rs_ds: pydicom.Dataset) -> list[tuple[str, np.ndarray]]:
     """
     Liefert ``[(roi_name, position_lps), ...]`` fuer alle ROIs, deren
@@ -73,7 +98,7 @@ def find_point_markers(rs_ds: pydicom.Dataset) -> list[tuple[str, np.ndarray]]:
         for c in rc.ContourSequence:
             if str(getattr(c, "ContourGeometricType", "")) != "POINT":
                 continue
-            pts = np.array(c.ContourData, dtype=np.float64).reshape(-1, 3)
+            pts = contour_points(c)
             if pts.shape[0] == 0:
                 continue
             roi_num = int(getattr(rc, "ReferencedROINumber", -1))

@@ -32,7 +32,7 @@ from scipy.integrate import trapezoid
 
 from . import _runtime
 from . import analyzer as ana
-from .dicom_utils import get_rs_frame_of_references
+from .dicom_utils import contour_points, get_rs_frame_of_references
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +601,7 @@ def closed_planar_contours(rs_ds: pydicom.Dataset, roi_number: int) -> list:
             gt = str(c.get("ContourGeometricType", "")).upper()
             if not gt.startswith("CLOSED_PLANAR"):
                 continue
-            pts = np.asarray(c.ContourData, dtype=float).reshape(-1, 3)
+            pts = contour_points(c)
             if len(pts) >= 3:
                 out.append(pts)
     return out
