@@ -205,7 +205,8 @@ def roi_table(rs_ds: pydicom.Dataset) -> list:
     return out
 
 
-def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None) -> dict:
+def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None,
+                      table: Optional[list] = None) -> dict:
     """
     Zielvorschlag ohne Abbruch, fuer die Auswahl in einer Oberflaeche:
     ``{'rois': roi_table, 'targets': TARGET-ROIs, 'ptvs': PTVs darunter,
@@ -213,8 +214,9 @@ def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None) ->
     ``default`` ist die Auto-Auswahl von ``select_targets``: alle PTVs; passt
     eine RTPLAN-``DoseReferenceDescription`` (SH, 16 Zeichen) als Praefix auf
     genau eines von mehreren, nur dieses.  Ohne PTV ist ``default`` leer.
+    ``table``: schon berechnete ``roi_table(rs_ds)``.
     """
-    table = roi_table(rs_ds)
+    table = roi_table(rs_ds) if table is None else table
     targets = [r for r in table if r[3] == ana.CAT_TARGET]
     ptvs = [r for r in targets if r[1].upper().startswith("PTV")]
     chosen, notes = ptvs, []
@@ -238,14 +240,15 @@ def target_candidates(rs_ds: pydicom.Dataset, rp_refs: Optional[list] = None) ->
 
 
 def select_targets(rs_ds: pydicom.Dataset, target_arg: Optional[str],
-                   rp_refs: Optional[list] = None) -> tuple:
+                   rp_refs: Optional[list] = None, table: Optional[list] = None) -> tuple:
     """
     Liefert ``([(roi_number, name), ...], hinweise)``.
     ``--target``: exakter Name, sonst eindeutiger case-insensitiver Teilstring.
     Auto: ``target_candidates()['default']``; ohne PTV -> ``ValueError``.
+    ``table``: schon berechnete ``roi_table(rs_ds)``.
     """
     if target_arg:
-        table = roi_table(rs_ds)
+        table = roi_table(rs_ds) if table is None else table
         chosen = []
         for token in [t.strip() for t in target_arg.split(",") if t.strip()]:
             exact = [r for r in table if r[1] == token]
@@ -263,7 +266,7 @@ def select_targets(rs_ds: pydicom.Dataset, target_arg: Optional[str],
                 chosen.append(exact[0])
         return [(r[0], r[1]) for r in chosen], []
 
-    cand = target_candidates(rs_ds, rp_refs)
+    cand = target_candidates(rs_ds, rp_refs, table)
     if not cand["ptvs"]:
         listing = ", ".join(f"{r[1]!r}" for r in cand["targets"]) or "keine"
         raise ValueError(
@@ -606,11 +609,12 @@ def parse_eclipse_values(spec: str, target_names: list, rx_gy: Optional[float]) 
 
 
 def eclipse_reference_from_dvh(dvh_map: dict, rs_ds: Optional[pydicom.Dataset],
-                               targets: list, rx_gy: float) -> EclipseReference:
+                               targets: list, rx_gy: float, table: Optional[list] = None) -> EclipseReference:
     """
     Eclipse-DVHs -> Referenz: je Ziel mit DVH ``tv_cm3``, ``tv_piv_cm3`` (V(Rx)),
     D98/D50/D2/Dmean/Dmin/Dmax; ein DVH der EXTERNAL-ROI (Body) liefert fuer
     alle Ziele ``piv_cm3`` = V(Rx) und ``piv50_cm3`` = V(Rx/2).  Quelle ``dvh``.
+    ``table``: schon berechnete ``roi_table(rs_ds)``.
     """
     ref = EclipseReference()
     if not dvh_map:
@@ -618,7 +622,7 @@ def eclipse_reference_from_dvh(dvh_map: dict, rs_ds: Optional[pydicom.Dataset],
     names = {int(n): nm for n, nm in targets}
     body = None
     if rs_ds is not None:
-        for num, name, _rt, cat in roi_table(rs_ds):
+        for num, name, _rt, cat in (roi_table(rs_ds) if table is None else table):
             if cat == ana.CAT_EXTERNAL and num in dvh_map:
                 body = (num, name)
                 break
@@ -681,18 +685,20 @@ def derive_eclipse_values(ref: EclipseReference, target: str) -> None:
 def build_eclipse_reference(rd_ds: Optional[pydicom.Dataset], rs_ds: Optional[pydicom.Dataset],
                             targets: list, rx_gy: float, json_path=None,
                             cli_string: Optional[str] = None, use_dvh: bool = True,
-                            dose: Optional[dm.DoseGrid] = None) -> tuple:
+                            dose: Optional[dm.DoseGrid] = None, *, table: Optional[list] = None,
+                            dvh: Optional[tuple] = None) -> tuple:
     """
     Alle Quellen zusammenfuehren (Vorrang ``cli > json > dvh``), dann Luecken
     ableiten.  Liefert ``(EclipseReference, dvh_map, hinweise)``; ``dvh_map``
     ist leer, wenn die DVHs nicht zu diesem RTSTRUCT gehoeren (dann zeigt auch
-    die Validierungsansicht kein Eclipse-DVH).
+    die Validierungsansicht kein Eclipse-DVH).  ``table``/``dvh``: schon
+    berechnete ``roi_table(rs_ds)`` bzw. ``read_dvh_sequence(rd_ds)``.
     """
     ref = EclipseReference()
     dvh_map = {}
     names = [n for _, n in targets]
     if use_dvh and rd_ds is not None:
-        dvh_map, d_notes = dm.read_dvh_sequence(rd_ds)
+        dvh_map, d_notes = dm.read_dvh_sequence(rd_ds) if dvh is None else dvh
         ref.notes.extend(d_notes)
         trusted = True
         if dose is not None and rs_ds is not None:
@@ -702,7 +708,7 @@ def build_eclipse_reference(rd_ds: Optional[pydicom.Dataset], rs_ds: Optional[py
                 ref.notes.append("RTDOSE-DVHs referenzieren ein anderes Structure Set; ROI-Nummern "
                                  "nicht uebertragbar, DVH-Quelle uebersprungen.")
         if dvh_map and trusted:
-            ref.merge(eclipse_reference_from_dvh(dvh_map, rs_ds, targets, rx_gy))
+            ref.merge(eclipse_reference_from_dvh(dvh_map, rs_ds, targets, rx_gy, table))
         elif not dvh_map:
             ref.notes.append("Keine DVHSequence in der RTDOSE (kein automatischer Eclipse-DVH-Abgleich).")
         if not trusted:
@@ -1628,6 +1634,20 @@ class DoseInputs:
     ct_error: Optional[Exception]     # CT vorhanden, aber nicht verwendbar
     warnings: list                    # Dosisgitter und Objektverweise
     ct_warnings: list                 # fehlende CT-Schichten (validate_index_against_rs)
+    _rois: Optional[list] = field(default=None, repr=False, compare=False)
+    _dvh: Optional[tuple] = field(default=None, repr=False, compare=False)
+
+    def rois(self) -> list:
+        """``roi_table(rs_ds)``, beim ersten Gebrauch berechnet (jede neue Planung nutzt sie wieder)."""
+        if self._rois is None:
+            self._rois = roi_table(self.rs_ds)
+        return self._rois
+
+    def dvh(self) -> tuple:
+        """``read_dvh_sequence(rd_ds)`` = ``(dvh_map, hinweise)``, beim ersten Gebrauch gelesen."""
+        if self._dvh is None:
+            self._dvh = dm.read_dvh_sequence(self.rd_ds)
+        return self._dvh
 
 
 def load_dose_inputs(files: dict, quiet: bool = False) -> DoseInputs:
@@ -1692,7 +1712,7 @@ def plan_dose_run(inputs: DoseInputs, *, target: Optional[str] = None, rx: Optio
                                           inputs.dose, inputs.rp_refs)
     warns = list(inputs.warnings)
     notes = []                                       # informative Hinweise
-    targets, t_notes = select_targets(rs_ds, target, rp_refs)
+    targets, t_notes = select_targets(rs_ds, target, rp_refs, inputs.rois())
     notes += t_notes
     rx_gy, rx_source, rx_detail = resolve_prescription(
         rx, rx_pct_of_max, rp_refs, dose, [n for _, n in targets])
@@ -1702,9 +1722,11 @@ def plan_dose_run(inputs: DoseInputs, *, target: Optional[str] = None, rx: Optio
     say(f"  Rx: {rx_gy:.2f} Gy ({rx_source}: {rx_detail})")
 
     # Eclipse-Referenz: DVHSequence (auto) + eclipse_ref.json + --eclipse-values
+    use_dvh = not no_eclipse_dvh
     ecl_ref, dvh_map, e_notes = build_eclipse_reference(
         rd_ds, rs_ds, targets, rx_gy, json_path=files.get("eclipse_ref"),
-        cli_string=eclipse_values, use_dvh=not no_eclipse_dvh, dose=dose)
+        cli_string=eclipse_values, use_dvh=use_dvh, dose=dose, table=inputs.rois(),
+        dvh=inputs.dvh() if use_dvh and rd_ds is not None else None)
     notes += e_notes
     src_bits = []
     if ecl_ref.meta.get("dvh_rois"):

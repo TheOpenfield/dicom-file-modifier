@@ -216,9 +216,9 @@ def inspect(selection: CaseSelection) -> DoseCaseInfo:
     rs_ds, dose = inputs.rs_ds, inputs.dose
     info.issues += [Issue("warning", "DOSE.INPUT_WARNING", w) for w in inputs.warnings]
 
-    table = di.roi_table(rs_ds)
+    table = inputs.rois()
     info.rois = [{"number": n, "name": nm, "rt_type": rt, "category": cat} for n, nm, rt, cat in table]
-    cand = di.target_candidates(rs_ds, inputs.rp_refs)
+    cand = di.target_candidates(rs_ds, inputs.rp_refs, table)
     info.targets = {"default": [nm for _, nm in cand["default"]], "reason": cand["reason"],
                     "ptvs": [r[1] for r in cand["ptvs"]], "all": [r[1] for r in cand["targets"]],
                     "notes": list(cand["notes"])}
@@ -239,7 +239,7 @@ def inspect(selection: CaseSelection) -> DoseCaseInfo:
     info.labels = {"rs": str(rs_ds.get("StructureSetLabel", "") or ""),
                    "rp": str(rp_ds.get("RTPlanLabel", "") or "") if rp_ds is not None else ""}
 
-    dvh_map, dvh_notes = dm.read_dvh_sequence(inputs.rd_ds)
+    dvh_map, dvh_notes = inputs.dvh()
     rs_uid = str(rs_ds.get("SOPInstanceUID", ""))
     trusted = not (dose.referenced_rtstruct_uid and rs_uid and dose.referenced_rtstruct_uid != rs_uid)
     names = {n: nm for n, nm, _, _ in table}
@@ -348,7 +348,8 @@ def preview(info: DoseCaseInfo, settings: DoseIndexSettings) -> DosePreview:
     inputs = info.inputs
     kw = plan_kwargs(settings)
     # Einzelschritte zuerst, damit ein Fehler am richtigen Feld steht
-    picked = _step(issues, "target", di.select_targets, inputs.rs_ds, kw["target"], inputs.rp_refs)
+    picked = _step(issues, "target", di.select_targets, inputs.rs_ds, kw["target"], inputs.rp_refs,
+                   inputs.rois())
     if picked is _FAILED:
         return pv
     names = [nm for _, nm in picked[0]]
