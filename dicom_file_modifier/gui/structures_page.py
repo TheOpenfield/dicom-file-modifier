@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QComboBox, QGroupBox, QLabel, QTabWidget, QVBoxLay
 
 from ..api import selection, structures
 from .page import WorkflowPage, names_text
-from .widgets import ImageViewer, SettingsForm, fill_table, make_table, report_view
+from .widgets import ImageViewer, SettingsForm, fill_table, guard_wheel, make_table, report_view
 
 CATEGORY_DE = {"TARGET": "Zielvolumen", "OAR_SERIAL": "Risikoorgan (seriell)",
                "OAR_PARALLEL": "Risikoorgan (parallel)", "HELPER": "Hilfsstruktur",
@@ -36,7 +36,7 @@ class StructuresPage(WorkflowPage):
 
     def __init__(self, main):
         super().__init__(main)
-        self.rs_combo = QComboBox()
+        self.rs_combo = guard_wheel(QComboBox())
         self.rs_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.rs_combo.setMinimumContentsLength(20)              # lange UID-Dateinamen
         self.rs_combo.currentIndexChanged.connect(lambda _i: self.inspect())

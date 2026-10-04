@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QGroupBox, QHB
 from ..api import selection, transform
 from ..api.sysinfo import format_bytes
 from .page import WorkflowPage
-from .widgets import ImageViewer, SettingsForm, open_path, report_view
+from .widgets import ImageViewer, SettingsForm, guard_wheel, open_path, report_view
 
 SHIFTS, ROTATIONS = ("tx", "ty", "tz"), ("rx", "ry", "rz")
 AXES = ("X  (+ links)", "Y  (+ posterior)", "Z  (+ superior)")
@@ -53,7 +53,7 @@ class TransformPage(WorkflowPage):
     def __init__(self, main):
         super().__init__(main)
         self._center_before = ""
-        self.rs_combo = QComboBox()
+        self.rs_combo = guard_wheel(QComboBox())
         self.rs_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.rs_combo.setMinimumContentsLength(20)
         self.rs_combo.currentIndexChanged.connect(lambda _i: self.inspect())
@@ -105,7 +105,7 @@ class TransformPage(WorkflowPage):
                 if suffix == " mm":
                     w.setRange(-MAX_SHIFT_MM, MAX_SHIFT_MM)
                 grid.addWidget(w, i + 1, j + 1)
-        self.center_combo = QComboBox()
+        self.center_combo = guard_wheel(QComboBox())
         self.center_combo.currentIndexChanged.connect(self._center_mode)
         self.center_edit = form.widget("center")
         self.center_edit.setPlaceholderText("x,y,z in mm (LPS)")

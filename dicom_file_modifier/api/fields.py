@@ -13,6 +13,7 @@ Formulare, ``run.json`` und "Befehl kopieren" nutzen dieselben Metadaten.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import subprocess
 import types
@@ -71,6 +72,12 @@ def setting(default=dataclasses.MISSING, *, default_factory=dataclasses.MISSING,
 
 def _is_union(hint) -> bool:
     return typing.get_origin(hint) in (typing.Union, types.UnionType)
+
+
+@functools.cache
+def _type_hints(cls) -> dict:
+    """``typing.get_type_hints`` je Klasse einmal (wertet die Annotationstexte jedes Mal neu aus)."""
+    return typing.get_type_hints(cls)
 
 
 def _coerce(name: str, value, hint):
@@ -155,7 +162,7 @@ class SettingsBase:
         unknown = cls.unknown_keys(d)
         if unknown and strict:
             raise ValueError(f"Unbekannte Einstellungen fuer {cls.__name__}: {', '.join(unknown)}")
-        hints = typing.get_type_hints(cls)
+        hints = _type_hints(cls)
         kw = {f.name: _coerce(f.name, d[f.name], hints[f.name])
               for f in dataclasses.fields(cls) if f.name in d}
         return cls(**kw)
