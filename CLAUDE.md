@@ -88,7 +88,8 @@ There is no lint config yet; `pyproject.toml` declares ruff as a dependency grou
     - every module, including `api/*`, imports first in a fresh interpreter.
   - These tests use the demo case:
     - `tests/test_dose_indices.py`: candidates, fixes, stages, progress and cancel;
-    - `tests/test_case_modifier.py`: stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify;
+    - `tests/test_case_modifier.py`: stages, header-only preflight, nothing half-written, label and orientation guard, issues, verify, `check_transform` = `plan_transform`, the exact DS rounding, the RS stays raw;
+    - `tests/test_dicom_utils.py`: `contour_points` = pydicom (bit for bit), unusual values fall back to pydicom;
     - `tests/test_modifier.py`: CT loader filters, `run_ct_transform`, resample progress and cancel, no browser, exit 2;
     - `tests/test_analyzer_viz.py`: silent analyzer core, RNG per run, issues, `inspect_rtstruct`, plot report, no pyplot;
     - `tests/test_cli.py`: `dfm` forwards argv unchanged, one version everywhere, `dfm selftest`;
@@ -144,7 +145,7 @@ Five runnable modules plus three libraries, and the synthetic test-case generato
 **Import rule:**
 - No package module imports the orchestrators `case_modifier` or `dose_indices`.
 - Helpers used by several modules live in two modules that import nothing from the package (except the package version):
-  - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`;
+  - `dicom_utils.py`: `get_rs_frame_of_references`, `set_sop_instance_uid`, `_truncate`, `_label_with_suffix`, `find_point_markers`, `contour_points`;
   - `dose_constants.py`: `TOOL_NAME`, `TOOL_VERSION` (= `__version__`), `LEVEL_COLORS`, `HELPER_COLORS`.
 - `_runtime.py` (`JobContext`, `JobCancelled`, `current()`, `use()`) also imports nothing from the package. It carries progress and cancel from long loops to the worker, without changing core signatures.
 - The remaining lazy imports are not cycles:
@@ -208,7 +209,7 @@ The layer sits above the core; the core never imports it (only `cli` does), and 
 - **`sysinfo`:** `available_memory_bytes()` (Windows `GlobalMemoryStatusEx`) and `format_bytes`.
 - **Previews:**
   - dose: effective values and locked fields (`resolve_effective`, `ECLIPSE_LOCKED`), targets, Rx, levels, ROI names (`rtstruct_writer.planned_roi_names`), fine grid with a memory estimate (`DOSE.GRID_TOO_LARGE` above `dose.MAX_FINE_VOXELS`, `SYSTEM.MEMORY_LOW` against free RAM) and the Eclipse sources. Errors carry the field they belong to (`target`, `rx`, `isodose`, `eclipse_values`, `append_csv`, `grid_mm`).
-  - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`).
+  - transform: `T`, centre and `Drehpunkt`, clipping, planned paths, memory estimate, and a plain-text line from `describe_motion` (e.g. `10 mm nach links · +15° um die Kopf-Fuss-Achse`). With an RTSTRUCT, `inspect` runs `case_modifier.check_rs_references` and builds `contour_cache` once; `preview` then calls `check_transform` instead of `plan_transform` (no RS copy, about 0.1 s for 600 000 contour points, results kept per `T`).
 - **Result layout:** the CT-only transform writes `<out>/CT/` plus `visualization_3d.html`, so every transform result is again a case folder.
 - **Jobs (`api/jobs.py`):** a `Job` is a JSON file (workflow, settings, selection, output). `execute_job` works in four steps:
   1. validate, writing nothing on errors (exit 2);
@@ -232,7 +233,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 | `icons.py` | `assets/`: `app.png`/`app.ico` (window, taskbar, both EXEs) and SVG symbols for the sidebar pages and the toolbar (`page_icon`, `icon`); the brand colours of the app icon (`NAVY`, `TEAL`, `CORAL`, …); `placeholder_pixmap` for the empty state of an `ImageViewer`. It imports `PySide6.QtSvg` so PyInstaller bundles Qt6Svg |
 | `config.py` | `AppConfig`: result root (QSettings, default `%USERPROFILE%\DICOM-RT-Toolkit\Ergebnisse`) and the job folder under `%LOCALAPPDATA%` |
 | `jobs.py` | `JobRunner` and `run_in_background` (thread-pool reads such as `inspect`, results delivered in the GUI thread) |
-| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`; `set_placeholder_icon` shows the page symbol over "Noch kein Ergebnis", `WorkflowPage.build` sets it), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
+| `widgets.py` | `SettingsForm` (widgets from `FieldMeta` and the type hints, collapsible `advanced` fields, value texts in `CHOICE_LABELS`, examples in `SPEC_EXAMPLES`, a "…" button for `kind="path"`; error marks without stylesheets on inputs, to keep the native Windows style; `gui_text` turns CLI options in core texts into field names; `external` fields are created by the form but placed by the page, `add_top` puts such a block above the rows), `DecimalSpinBox` (decimal point like reports and CLI, a typed comma counts as a point), `StateLine`, `IssueList` (wrapped rows, height from the content, double-click shows details; an unchanged list is not rebuilt), `guard_wheel` (spin boxes and combos change by mouse wheel only with focus, otherwise the column scrolls; the form and the page combos use it), `ImageViewer` (large preview plus strip, titles in `IMAGE_TITLES`; `set_placeholder_icon` shows the page symbol over "Noch kein Ergebnis", `WorkflowPage.build` sets it), `make_table`/`fill_table` (numeric cells as `(text, value)`), `report_view` |
 | `window.py` | `Case` (folder plus `RS*`/`RD*`/`RP*`/`CT` by the CLI name convention; the DICOM scanner was dropped for v1) and `MainWindow` (toolbar with SVG icons, sidebar with page icons and the selection in the icon's navy via a stylesheet on the list only, progress with cancel, log dock) |
 | `page.py` | `WorkflowPage`, the shared skeleton: inputs → settings → check → start → result |
 | `structures_page.py` | RS combo; sortable ROI table with colour and a "Rolle im Lauf" column from the preview; "Plots" and "Statistik" tabs |
@@ -246,7 +247,7 @@ The GUI uses only `api`. Every computation runs in the worker, and the GUI proce
 
 `WorkflowPage` behaviour:
 - `inspect` runs in the thread pool with a token, so stale results are dropped.
-- `preview` runs synchronously on every form change (the dose preview takes about 30 ms on a real case).
+- The check (`preview`) runs `CHECK_DELAY_MS` (200 ms) after the last form change, once per burst of keystrokes, spin-box steps or wheel notches. Until then the state line says "Wird geprüft …" and Start is locked; `flush_check()` runs a pending check at once (`_start` calls it, tests too). Inspection results, a finished job and a new result root check directly. The checks themselves take milliseconds (dose about 2 ms, transform about 0.1 s on a real case).
 - The form greys out `disabled_fields(info)` with the reason and frames fields with error issues.
 - The result header has a state line (status and folder name, full path in the tooltip), the summary, a row with the page's buttons, "Ordner öffnen" and a small "…" menu ("dfm-Befehl kopieren" via `command_string`, "run.json öffnen"; kept out of sight on purpose, user decision), and the run line: duration plus the settings that differ from the defaults.
 - The check warns when the result folder is too long for `MAX_PATH`, and the form is locked while a job runs.
@@ -295,7 +296,7 @@ Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_gr
 **Orchestration.** `run_dose_indices` runs three stages:
 - `prepare_dose_run` → `DoseRunPlan` runs three steps:
   - discovery (or `files=` from `dose_files`: explicit files, CT as a folder or a file list);
-  - `load_dose_inputs` → `DoseInputs`: RS/RD/RP, dose grid, reference checks and CT index. An unusable CT is only recorded as `ct_error`.
+  - `load_dose_inputs` → `DoseInputs`: RS/RD/RP, dose grid, reference checks and CT index. An unusable CT is only recorded as `ct_error`. `rois()` (`roi_table`) and `dvh()` (`read_dvh_sequence`) are computed on first use and reused by every plan, so a preview does not walk all contours again.
   - `plan_dose_run`: targets, Rx, levels, Eclipse reference, the CT decision (error with RS export or Eclipse mode, else a warning) and `eclipse_compat_settings`.
 
   `out_dir=` sets the exact result folder instead of `<output>/<case_id><label>`.
@@ -304,7 +305,7 @@ Pipeline: `discover_dose_case` (RS*/RD*/RP*.dcm, CT/ optional) → `dose.dose_gr
 
 Supporting pieces:
 - `run_dose_indices_ex` returns `(report, artifacts)`.
-- `plan_fine_grid` builds the target specs and the fine grid without sampling. The API preview uses it for the voxel count, with `max_voxels=inf` to measure even an oversized grid.
+- `plan_fine_grid` builds the target specs and the fine grid without sampling. The API preview uses it for the voxel count, with `max_voxels=inf` to measure even an oversized grid. `native_level_bbox` reads the per-axis maxima that `DoseGrid.axis_maxima()` computes once per array.
 - `rtstruct_writer.build_ct_slice_index` accepts a folder or a list of files.
 
 **Candidates without aborting**, for a GUI:
@@ -353,7 +354,7 @@ Pipeline: `load_rtstruct` → `extract_contours` per ROI → metric functions �
 - `run_analysis(return_info=True)` also returns `info`, including the issues.
 
 Key conventions:
-- Contours are kept as a `list[np.ndarray]`, one (N,3) array per contour (a slice may hold several: islands and holes). `contours_to_points` flattens them when a unified point cloud is needed.
+- Contours are kept as a `list[np.ndarray]`, one (N,3) array per contour (a slice may hold several: islands and holes). `contours_to_points` flattens them when a unified point cloud is needed. All ContourData reads go through `dicom_utils.contour_points`: it parses the raw DS bytes with numpy (bit-identical to pydicom, about 6× faster) and leaves the dataset raw, so no millions of `DSfloat` objects stay in memory; anything unusual falls back to pydicom.
 - Contours are grouped into slices (`_group_slices`, z within 0.05 mm) and all contours of a slice are XOR-combined (`_slice_geometries`: Shapely `symmetric_difference` after `make_valid`), so a nested contour is a hole (DICOM `CLOSED_PLANAR_XOR` / Eclipse semantics; duplicate contours cancel). Volume is planimetric: XOR area × nominal slice spacing (`_nominal_slice_spacing` = median of the smallest cluster of z-differences; larger differences are reported as `n_gaps` and are never bridged). Sphericity/solidity rasterise each structure onto its own local voxel grid via `rasterize_contours` (XOR per nearest z-plane, bbox-cropped `matplotlib.path`; reusable for any grid, e.g. a future dose grid) and take volume + surface from that one mask (surface via `skimage.measure.marching_cubes`); solidity divides that mask volume by the convex hull of the contour vertices, and the hull is also the sphericity fallback.
 - Distance computations are exact and deterministic (one `cKDTree` query pair yields min/Hausdorff/HD95/ASSD); only clouds > 50,000 points are thinned to that cap with a fixed seed — see the README "Performance Notes" section.
 - Structure classification into Target / serial-OAR / parallel-OAR / helper / external / marker is done by `classify_structure` (ROI name + `RTROIInterpretedType` + contour geometry; name rules override mistagged DICOM types).
@@ -390,6 +391,7 @@ Orchestrator that takes a case folder of the form `data/<id>/CT/*.dcm` + `data/<
   - For `resample` the grid stays fixed, so `align_contour_images` then re-points each contour's `ContourImageSequence` to the output slice at its new position (the nearest plane along the slice normal); `metadata` keeps the index mapping, because its slices move with the contours.
   - It counts the non-POINT contours that were in a slice plane before and are not afterwards (tolerance `PLANE_TOL_MM`). These are contours tilted by an X/Y rotation, or between two slices after a z-shift that is not a multiple of the slice spacing; contours beyond the first or last slice count as clipping instead.
   - Any such contour produces the warning `CASE.CONTOURS_OFF_PLANE` and one console line.
+- **`check_transform(pre, contour_cache(pre), …)` → `TransformCheck`** gives the same `T`, centre, `Drehpunkt`, off-plane counts, clipping and issues as `plan_transform`, without copying the RS and without UIDs (the GUI check). It transforms each contour like `_apply_T_to_flat_coords` (one large matrix product is not bit-identical under rotation), `_round_like_ds` reproduces the written 6-decimal DS text exactly, and the counts use the same helpers as the run (`_clipping`, `_nearest_plane`, `_count_off_plane`). Results are kept per `T`. `check_rs_references` raises the run's `KeyError` for references to CT slices outside the series.
 - **`execute_transform`** loads exactly the checked files with pixels (`modifier.load_ct_series_files`; the SOP list must equal the preflight's) and computes HU only for resample or the CT surface. It writes the CT in one pass through `save_ct_series(series_uid=, sop_map=, series_number_offset=1000)`, then the finished RS, clipping report, `--verify` and viz.
 - The result dict adds these keys:
   - `issues` (`issues.Issue.to_dict()`): `CASE.SIBLINGS_NOT_TRANSFORMED`, `CASE.FOR_KEPT`, `CASE.CONTOUR_CLIPPING`, `CASE.CONTOURS_OFF_PLANE`, `CASE.VERIFY_FAILED`, `CASE.VIZ_FAILED`. `CASE.FOR_KEPT` is only an info (user decision): keeping the FoR is the intended default, because it lets the TPS show the original plan on the moved anatomy (a simulated setup error). The console box stays;
